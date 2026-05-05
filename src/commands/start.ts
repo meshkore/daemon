@@ -98,6 +98,20 @@ export async function startCmd(opts: StartOptions): Promise<void> {
   handleSignals(async () => {
     log.info('shutting down');
     await server.close();
+    // Auto-generate today's daily log on clean shutdown
+    try {
+      const { spawn } = await import('node:child_process');
+      const script = path.join(meshkoreDir, 'scripts', 'daily-log.py');
+      if (existsSync(script)) {
+        await new Promise<void>((resolve) => {
+          const p = spawn('python3', [script, '--meshkore', meshkoreDir, '--quiet'], { stdio: 'ignore' });
+          p.on('exit', () => resolve());
+          p.on('error', () => resolve());
+          setTimeout(() => resolve(), 5000); // hard cap
+        });
+        log.info('daily log refreshed');
+      }
+    } catch {}
     runtime.clearAgentPid(identity!);
     runtime.clearServerLock();
   });

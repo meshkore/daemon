@@ -241,6 +241,28 @@ async function route(
     return sendJson(res, 201, ev);
   }
 
+  if (method === 'POST' && p === '/tasks') {
+    const body = await readBody(req);
+    const data = JSON.parse(body || '{}');
+    if (!data.title) return sendJson(res, 400, { error: 'title required' });
+    if (!data.module) return sendJson(res, 400, { error: 'module required' });
+    try {
+      const result = await createTask(opts.meshkoreDir, data, opts.identity);
+      const ev = appendTimelineEvent(opts.meshkoreDir, {
+        type: 'task.created',
+        id: result.id,
+        title: data.title,
+        module: data.module,
+        priority: data.priority || 'medium',
+        conv: data.conv,
+        files: data.files,
+      });
+      broadcast(ev);
+      return sendJson(res, 201, { ...ev, path: result.path });
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
   if (method === 'POST' && /^\/tasks\/[^/]+\/transition$/.test(p)) {
     const id = p.split('/')[2] ?? '';
     if (!id) return sendJson(res, 400, { error: 'task id required' });
@@ -344,6 +366,73 @@ function makeConvSlug(text: string): string {
     .join('-')
     .slice(0, 30);
   return `${ts}-${slug || 'msg'}`;
+}
+
+async function createTask(meshkoreDir: string, data: Record<string, any>, defaultOwner: string): Promise<{ id: string; path: string }> {
+  const moduleId = String(data.module).replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+  const today = new Date().toISOString().slice(0, 10);
+  const tasksDir = path.join(meshkoreDir, 'roadmap', 'tasks', moduleId);
+  mkdirSync(tasksDir, { recursive: true });
+
+  // Pick next available ID. Prefer T<n>, scan existing tasks/log for the highest number.
+  const id = data.id || pickNextId(meshkoreDir, data.id_prefix || 'T');
+
+  const slug = String(data.title).toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 6)
+    .join('-')
+    .slice(0, 50) || 'task';
+
+  const filePath = path.join(tasksDir, `${id}-${slug}.md`);
+  if (existsSync(filePath)) throw new Error(`file already exists: ${filePath}`);
+
+  const fm = [
+    '---',
+    `id: ${id}`,
+    `title: "${(data.title as string).replace(/"/g, "'")}"`,
+    `status: ${data.status || 'next'}`,
+    `priority: ${data.priority || 'medium'}`,
+    `owner: ${data.owner || defaultOwner}`,
+    `category: ${moduleId}`,
+    `created: ${today}`,
+    `updated: ${today}`,
+    `tags: ${JSON.stringify(data.tags || [])}`,
+    ...(data.depends_on ? [`depends_on: ${JSON.stringify(data.depends_on)}`] : []),
+    ...(data.effort ? [`effort: "${data.effort}"`] : []),
+    ...(data.files ? [`files: ${JSON.stringify(data.files)}`] : []),
+    '---',
+    '',
+    `# ${id} — ${data.title}`,
+    '',
+    data.description || data.body || '_No description provided._',
+    '',
+  ].join('\n');
+
+  writeFileSync(filePath, fm);
+  return { id, path: path.relative(path.join(meshkoreDir, 'roadmap'), filePath) };
+}
+
+function pickNextId(meshkoreDir: string, prefix: string): string {
+  const roadmapDir = path.join(meshkoreDir, 'roadmap');
+  let max = 0;
+  const re = new RegExp(`^${prefix}(\\d+)`);
+  const scan = (dir: string) => {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) scan(path.join(dir, entry.name));
+      else if (entry.isFile() && entry.name.endsWith('.md')) {
+        const m = re.exec(entry.name);
+        if (m && m[1]) {
+          const n = parseInt(m[1], 10);
+          if (n > max) max = n;
+        }
+      }
+    }
+  };
+  scan(roadmapDir);
+  return `${prefix}${max + 1}`;
 }
 
 async function transitionTask(meshkoreDir: string, id: string, to: string, by: string): Promise<{ from: string; path: string }> {

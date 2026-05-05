@@ -10,6 +10,8 @@ import { stopCmd } from './commands/stop.js';
 import { tasksCmd } from './commands/tasks.js';
 import { sendCmd } from './commands/send.js';
 import { peekCmd } from './commands/peek.js';
+import { logCmd } from './commands/log.js';
+import { installHooksCmd } from './commands/hooks.js';
 import { agentCmd } from './commands/agent.js';
 import { log } from './lib/log.js';
 
@@ -71,6 +73,19 @@ program
   .command('peek')
   .description('Stream events from the local daemon WebSocket')
   .action(peekCmd);
+
+program
+  .command('log')
+  .description('Generate the daily log .md from .meshkore/timeline/')
+  .option('--date <YYYY-MM-DD>', 'specific UTC date (default: today)')
+  .option('--since <YYYY-MM-DD>', 'start of range')
+  .option('--until <YYYY-MM-DD>', 'end of range')
+  .action(logCmd);
+
+program
+  .command('install-hooks')
+  .description('Symlink .meshkore/scripts/git-hooks/* into .git/hooks/ (post-commit auto-logs to timeline)')
+  .action(installHooksCmd);
 
 const agent = program.command('agent').description('Manage agent identities');
 agent
