@@ -1,6 +1,6 @@
 {
   "name": "@meshkore/cli",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Local daemon CLI that turns a machine into a participant of a MeshKore cluster",
   "license": "MIT",
   "bin": {
@@ -16,7 +16,8 @@
     "build:bin": "bun build src/cli.ts --compile --outfile=bin/meshcore",
     "dev": "tsx src/cli.ts",
     "test": "node --test test/",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "check": "tsc --noEmit"
   },
   "dependencies": {
     "commander": "^12.0.0",
@@ -24,7 +25,8 @@
     "yaml": "^2.6.0",
     "zod": "^3.23.0",
     "simple-git": "^3.27.0",
-    "chalk": "^5.3.0"
+    "chalk": "^5.3.0",
+    "chokidar": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
