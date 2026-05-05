@@ -147,6 +147,13 @@ export async function initCmd(opts: InitOptions): Promise<void> {
   console.log(`    meshcore agent create --client claude-code --identity $(hostname)-claude --role developer`);
   console.log(`    meshcore start`);
   console.log(`    open .meshkore/portal/index.html  # or https://portal.meshkore.com\n`);
+  console.log(`  ⚡ One thing to do once:\n`);
+  console.log(`    Drop the right rules file at the repo root so any AI`);
+  console.log(`    session in this repo follows the operator's manual:\n`);
+  console.log(`      curl -fsSL https://meshkore.com/reference/cluster/editor-rules/CLAUDE.md     -o CLAUDE.md       # Claude Code`);
+  console.log(`      curl -fsSL https://meshkore.com/reference/cluster/editor-rules/.cursorrules  -o .cursorrules    # Cursor`);
+  console.log(`      curl -fsSL https://meshkore.com/reference/cluster/editor-rules/.windsurfrules -o .windsurfrules # Windsurf`);
+  console.log(`\n  Operator manual:  https://meshkore.com/cluster/operate\n`);
 }
 
 async function ensureGitignore(cwd: string) {
