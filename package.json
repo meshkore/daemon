@@ -1,6 +1,6 @@
 {
   "name": "@meshkore/cli",
-  "version": "0.0.2",
+  "version": "0.3.0",
   "description": "Local daemon CLI that turns a machine into a participant of a MeshKore cluster",
   "license": "MIT",
   "bin": {
