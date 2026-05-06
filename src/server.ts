@@ -35,6 +35,7 @@ import path from 'node:path';
 import { log } from './lib/log.js';
 import { StateManager } from './state.js';
 import { Runtime } from './runtime.js';
+import { Admission, AdmissionRequestSchema } from './admission.js';
 
 const ALLOWED_ORIGINS = [
   /^https:\/\/portal\.meshkore\.com$/,
@@ -77,6 +78,15 @@ export async function startServer(opts: ServerOptions): Promise<DaemonServer> {
     () => broadcast({ type: 'state.rebuilt', ts: new Date().toISOString() }),
   );
 
+  const admission = new Admission({
+    meshkoreDir: opts.meshkoreDir,
+    onEvent: (ev) => {
+      broadcast(ev);
+      // Also append to timeline so the daily log captures it
+      try { appendTimelineEvent(opts.meshkoreDir, ev); } catch {}
+    },
+  });
+
   // Initial state load
   try {
     await state.rebuild();
@@ -96,7 +106,7 @@ export async function startServer(opts: ServerOptions): Promise<DaemonServer> {
       return;
     }
     try {
-      await route(req, res, opts, runtime, state, broadcast);
+      await route(req, res, opts, runtime, state, broadcast, admission);
     } catch (err: any) {
       log.error('route error', { url: req.url, err: err?.message });
       sendJson(res, 500, { error: 'internal' });
@@ -157,6 +167,7 @@ async function route(
   runtime: Runtime,
   state: StateManager,
   broadcast: (ev: Record<string, unknown>) => void,
+  admission: Admission,
 ) {
   const url = new URL(req.url ?? '/', 'http://x');
   const p = url.pathname;
@@ -263,6 +274,78 @@ async function route(
       return sendJson(res, 400, { error: err.message });
     }
   }
+  // ─── Admission endpoints ─────────────────────────────────────────────
+  if (method === 'GET' && p === '/admission/policy') {
+    return sendJson(res, 200, admission.getPolicy());
+  }
+  if (method === 'GET' && p === '/admission/list') {
+    return sendJson(res, 200, {
+      members: admission.listMembers(),
+      pending: admission.listPending(),
+    });
+  }
+  if (method === 'GET' && p === '/admission/pending') {
+    return sendJson(res, 200, admission.listPending());
+  }
+  if (method === 'GET' && p === '/admission/challenge') {
+    return sendJson(res, 200, admission.issueChallenge());
+  }
+  if (method === 'POST' && p === '/admission/issue-token') {
+    const body = await readBody(req);
+    const data = JSON.parse(body || '{}');
+    if (!data.identity || !data.role) return sendJson(res, 400, { error: 'identity + role required' });
+    const t = admission.issueToken({
+      identity: data.identity,
+      role: data.role,
+      agent_role: data.agent_role,
+      bound_pubkey_fingerprint: data.bound_pubkey_fingerprint ?? null,
+      github_user: data.github_user ?? null,
+      issued_by: opts.identity,
+      multi_use: data.multi_use ?? false,
+      max_uses: data.max_uses ?? 1,
+    });
+    return sendJson(res, 201, t);
+  }
+  if (method === 'POST' && p === '/admission/request') {
+    const body = await readBody(req);
+    let parsed;
+    try { parsed = AdmissionRequestSchema.parse(JSON.parse(body || '{}')); }
+    catch (err: any) { return sendJson(res, 400, { error: 'bad request', details: err.message }); }
+    const result = await admission.processRequest(parsed, 'curl');
+    return sendJson(res, result.decision === 'rejected' ? 401 : 200, result);
+  }
+  if (method === 'POST' && /^\/admission\/approve\/[^/]+$/.test(p)) {
+    const id = p.split('/').pop()!;
+    const r = admission.approve(id, opts.identity);
+    return sendJson(res, r.ok ? 200 : 400, r);
+  }
+  if (method === 'POST' && /^\/admission\/reject\/[^/]+$/.test(p)) {
+    const id = p.split('/').pop()!;
+    const body = await readBody(req);
+    const data = JSON.parse(body || '{}');
+    const r = admission.reject(id, opts.identity, data.reason || '');
+    return sendJson(res, r.ok ? 200 : 400, r);
+  }
+  if (method === 'POST' && /^\/admission\/revoke\/[^/]+$/.test(p)) {
+    const id = p.split('/').pop()!;
+    const body = await readBody(req);
+    const data = JSON.parse(body || '{}');
+    const r = admission.revoke(id, opts.identity, data.reason || '');
+    return sendJson(res, r.ok ? 200 : 400, r);
+  }
+  if (method === 'GET' && p.startsWith('/admission/github-keys')) {
+    const url = new URL(req.url ?? '/', 'http://x');
+    const user = url.searchParams.get('user');
+    if (!user) return sendJson(res, 400, { error: 'user query param required' });
+    try {
+      const { fetchGithubKeys } = await import('./identity.js');
+      const keys = await fetchGithubKeys(user);
+      return sendJson(res, 200, keys.map(k => ({ algo: k.algo, fingerprint: k.fingerprint, ssh: k.ssh, comment: k.comment })));
+    } catch (err: any) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
   if (method === 'POST' && /^\/tasks\/[^/]+\/transition$/.test(p)) {
     const id = p.split('/')[2] ?? '';
     if (!id) return sendJson(res, 400, { error: 'task id required' });

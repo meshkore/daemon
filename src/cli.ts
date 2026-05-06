@@ -12,6 +12,7 @@ import { sendCmd } from './commands/send.js';
 import { peekCmd } from './commands/peek.js';
 import { logCmd } from './commands/log.js';
 import { installHooksCmd } from './commands/hooks.js';
+import { migrateFromLegacyCmd } from './commands/migrate-legacy.js';
 import { agentCmd } from './commands/agent.js';
 import { log } from './lib/log.js';
 
@@ -81,6 +82,14 @@ program
   .option('--since <YYYY-MM-DD>', 'start of range')
   .option('--until <YYYY-MM-DD>', 'end of range')
   .action(logCmd);
+
+program
+  .command('migrate-from-legacy')
+  .description('Convert a legacy `.meshkore` single-file repo to the new folder layout')
+  .option('--keep-old', 'keep legacy files in place (default: rename to .legacy.json)', false)
+  .option('--yes', 'skip confirmation prompt', false)
+  .option('--dry-run', 'print plan, do not modify anything', false)
+  .action(migrateFromLegacyCmd);
 
 program
   .command('install-hooks')
