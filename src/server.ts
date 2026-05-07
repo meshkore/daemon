@@ -37,6 +37,9 @@ import { StateManager } from './state.js';
 import { Runtime } from './runtime.js';
 import { Admission, AdmissionRequestSchema } from './admission.js';
 import { runClaudeCode, type RunHandle } from './runners/claude-code.js';
+import { createAgentIdentity } from './commands/agent.js';
+import { spawn } from 'node:child_process';
+import { writeFileSync as fsWriteFileSync, mkdirSync as fsMkdirSync } from 'node:fs';
 
 // Active runs keyed by task id. One run per task at a time (later: queue).
 const activeRuns = new Map<string, RunHandle>();
@@ -334,10 +337,80 @@ async function route(
     return sendJson(res, 202, { task: taskId, cancelled: true });
   }
   if (method === 'POST' && p === '/chat/dispatch') {
-    return sendJson(res, 501, {
-      error: 'chat dispatch (intent → task pick → run) is the next step of V17',
-      hint: 'For now, run a specific task with POST /tasks/<id>/dispatch.',
+    // Coordinator chat: every user query is routed through the master
+    // daemon's primary identity. We log the chat.user event, then spawn
+    // a claude-code runner with the chat text as the prompt and a short
+    // briefing about what it has access to (repo, .meshkore/, the
+    // operator manual). No LLM lives in the portal — the agent thinks.
+    const body = await readBody(req);
+    let data: Record<string, unknown> = {};
+    try { data = JSON.parse(body || '{}'); } catch {}
+    const text = String(data.text || '').trim();
+    if (!text) return sendJson(res, 400, { error: 'text required' });
+    const author = String(data.author || opts.identity);
+    const conv = String(data.conv || `chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-').toLowerCase()}`);
+    // 1) Append the chat.user event
+    const userEv = appendTimelineEvent(opts.meshkoreDir, {
+      type: 'chat.user', author, text, conv,
     });
+    broadcast(userEv);
+    // 2) Spawn the coordinator runner
+    const dispatchId = `chat_${Date.now().toString(36)}`;
+    try {
+      const handle = spawnCoordinatorChat({
+        meshkoreDir: opts.meshkoreDir,
+        identity: opts.identity,
+        prompt: text,
+        conv,
+        emit: (ev) => broadcast(ev),
+      });
+      activeRuns.set(dispatchId, handle);
+      handle.done.then(() => activeRuns.delete(dispatchId)).catch(() => activeRuns.delete(dispatchId));
+      return sendJson(res, 202, {
+        dispatch_id: dispatchId,
+        conv,
+        runner: 'claude-code',
+        identity: opts.identity,
+        pid: handle.pid,
+      });
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
+  }
+  if (method === 'POST' && p === '/agents') {
+    // Create an agent identity from the portal wizard. Same logic as
+    // `meshcore agent create`, accepts the credential inline.
+    const raw = await readBody(req);
+    let data: Record<string, unknown> = {};
+    try { data = JSON.parse(raw || '{}'); } catch {}
+    try {
+      const out = createAgentIdentity({
+        meshkoreDir: opts.meshkoreDir,
+        identity: String(data.identity || ''),
+        client:   String(data.client || ''),
+        agentRole: data.agent_role ? String(data.agent_role) : undefined,
+        credentialValue: data.credential ? String(data.credential) : undefined,
+      });
+      // Tell the world a new identity was added — portal repaints Network
+      const ev = appendTimelineEvent(opts.meshkoreDir, {
+        type: 'agent.created',
+        identity: data.identity,
+        client: data.client,
+        agent_role: data.agent_role,
+      });
+      broadcast(ev);
+      // Force a state rebuild so members[] picks up the new agents/<id>.yaml
+      state.rebuild().catch(() => {});
+      return sendJson(res, 201, {
+        ok: true,
+        identity: data.identity,
+        client: data.client,
+        yaml: path.relative(opts.meshkoreDir, out.yamlPath),
+        creds: out.credsPath ? path.relative(opts.meshkoreDir, out.credsPath) : null,
+      });
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
   }
   if (method === 'GET' && p === '/runners') {
     const list = Array.from(activeRuns.entries()).map(([taskId, h]) => ({
@@ -527,6 +600,112 @@ function makeConvSlug(text: string): string {
     .join('-')
     .slice(0, 30);
   return `${ts}-${slug || 'msg'}`;
+}
+
+/**
+ * Spawn a coordinator chat session. Currently shares the same runner as
+ * task dispatch (claude-code headless), but with a different prompt
+ * shape: the chat text becomes the user turn, and we hand the agent
+ * the cluster's operator URL + the local repo path so it can read
+ * tasks/docs and modify them. Output streams as `chat.assistant`
+ * progress events tagged with the same conv id.
+ */
+function spawnCoordinatorChat(opts: {
+  meshkoreDir: string;
+  identity: string;
+  prompt: string;
+  conv: string;
+  emit: (ev: Record<string, unknown>) => void;
+}): RunHandle {
+  const repoRoot = path.dirname(opts.meshkoreDir);
+  const startedAt = new Date().toISOString();
+  const briefing = [
+    `You are the coordinator agent for a MeshKore cluster running at ${repoRoot}.`,
+    `The user is talking to you through the portal chat. They expect you to plan, write code, modify tasks, or answer questions about this repo.`,
+    `You have full read/write access to the repo and to .meshkore/. Read the operator manual at https://meshkore.com/cluster/operate before doing destructive work.`,
+    `Tasks live under .meshkore/modules/<module>/tasks/. Don't push to git unless explicitly asked.`,
+    ``,
+    `User said:`,
+    opts.prompt,
+  ].join('\n');
+  const child = spawn('claude', ['-p', briefing], {
+    cwd: repoRoot,
+    env: { ...process.env, MESHKORE_IDENTITY: opts.identity, MESHKORE_CONV: opts.conv },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  opts.emit({
+    type: 'task.started', // routed to the project status dot
+    id: `chat:${opts.conv}`,
+    agent: opts.identity,
+    ts: startedAt,
+    runner: 'claude-code',
+    conv: opts.conv,
+  });
+  let buf = '';
+  let stderrTail = '';
+  child.stdout?.on('data', (c: Buffer) => {
+    const text = c.toString('utf8');
+    buf += text;
+    // Stream as chat.assistant chunks (one per non-empty line)
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      opts.emit({
+        type: 'chat.assistant',
+        author: opts.identity,
+        conv: opts.conv,
+        text: t.slice(0, 1000),
+        ts: new Date().toISOString(),
+      });
+    }
+  });
+  child.stderr?.on('data', (c: Buffer) => { stderrTail = (stderrTail + c.toString('utf8')).slice(-2000); });
+  const startMs = Date.now();
+  const done = new Promise<{ exitCode: number; durationMs: number }>((resolve) => {
+    child.on('exit', (code, signal) => {
+      const exitCode = code ?? (signal ? 130 : 1);
+      const durationMs = Date.now() - startMs;
+      if (exitCode === 0) {
+        opts.emit({
+          type: 'task.completed',
+          id: `chat:${opts.conv}`,
+          agent: opts.identity,
+          ts: new Date().toISOString(),
+          summary: buf.split(/\r?\n/).filter(Boolean).slice(-1)[0]?.slice(0, 300) || 'chat done',
+          conv: opts.conv,
+        });
+      } else {
+        opts.emit({
+          type: 'task.failed',
+          id: `chat:${opts.conv}`,
+          agent: opts.identity,
+          ts: new Date().toISOString(),
+          exit_code: exitCode,
+          error: stderrTail.slice(-300) || `exit ${exitCode}`,
+          conv: opts.conv,
+        });
+      }
+      resolve({ exitCode, durationMs });
+    });
+    child.on('error', (err) => {
+      opts.emit({
+        type: 'task.failed',
+        id: `chat:${opts.conv}`,
+        agent: opts.identity,
+        ts: new Date().toISOString(),
+        error: `spawn claude: ${err.message}`,
+        conv: opts.conv,
+      });
+      resolve({ exitCode: 127, durationMs: Date.now() - startMs });
+    });
+  });
+  return {
+    taskId: `chat:${opts.conv}`,
+    pid: child.pid ?? -1,
+    startedAt,
+    cancel() { try { child.kill('SIGTERM'); } catch { /* noop */ } },
+    done,
+  };
 }
 
 async function createTask(meshkoreDir: string, data: Record<string, any>, defaultOwner: string): Promise<{ id: string; path: string }> {
