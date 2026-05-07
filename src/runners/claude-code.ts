@@ -61,6 +61,10 @@ export interface RunOptions {
   /** model alias (e.g. 'sonnet', 'opus', 'haiku'). 'auto' / undefined
    *  lets claude pick its default. */
   model?: string;
+  /** how strict the CLI is with tool-call prompts. 'unrestricted' is
+   *  required for headless dispatches; otherwise claude blocks waiting
+   *  for a human "approve write" answer that never arrives. */
+  permissions?: 'safe' | 'edits' | 'unrestricted';
   /** sink for progress events. Master daemon should pass broadcast(). */
   emit: (event: Record<string, unknown>) => void;
 }
@@ -93,10 +97,20 @@ export function runClaudeCode(opts: RunOptions): RunHandle {
 
   const startedAt = new Date().toISOString();
   // Build CLI args. --session-id makes consecutive calls resume the same
-  // claude conversation; --model pins the model the worker should use.
+  // claude conversation; --model pins the model the worker should use;
+  // --permission-mode controls how prompts are answered headlessly.
   const args: string[] = [promptFlag];
   if (opts.sessionId) args.push('--session-id', opts.sessionId);
   if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
+  // Map worker.permissions → claude --permission-mode value.
+  // - 'unrestricted' → bypassPermissions (headless default; cwd-bound)
+  // - 'edits'        → acceptEdits (auto edits, prompts for Bash etc.)
+  // - 'safe'         → no flag → claude's default (prompts everything;
+  //                    only useful when a human is at the other end)
+  const permMode = opts.permissions === 'edits'        ? 'acceptEdits'
+                 : opts.permissions === 'safe'         ? null
+                 :                                       'bypassPermissions';
+  if (permMode) args.push('--permission-mode', permMode);
   args.push(prompt);
   // Merge credentials from .meshkore/credentials/claude-code.env (and
   // optionally from a per-worker file <identity>.env) into the child

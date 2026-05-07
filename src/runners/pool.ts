@@ -29,6 +29,20 @@ import { log } from '../lib/log.js';
 export type WorkerKind = 'claude-code' | 'codex' | 'cursor' | 'deepseek' | 'qwen' | 'custom';
 export type WorkerRole = 'coordinator' | 'worker';
 
+/**
+ * Permission policy passed to the underlying CLI:
+ *  - 'safe'        : ask for every tool call. Useful when a human is
+ *                    watching live (interactive). In headless dispatch
+ *                    this WILL hang because no one can answer.
+ *  - 'edits'       : auto-accept Edit/Write inside cwd; ask for the
+ *                    rest (Bash, fetch, …). Reasonable middle ground.
+ *  - 'unrestricted': skip every prompt — the agent operates fully
+ *                    autonomously inside the repo cwd. Default for
+ *                    headless workers; the cwd boundary is the
+ *                    security envelope.
+ */
+export type WorkerPermissions = 'safe' | 'edits' | 'unrestricted';
+
 export interface WorkerSpec {
   /** stable id (slug, lowercase) — e.g. "coordinator", "api-worker" */
   id: string;
@@ -42,6 +56,8 @@ export interface WorkerSpec {
   module: string | null;
   /** coordinator (triages + delegates) or worker (executes) */
   role: WorkerRole;
+  /** how the underlying CLI handles tool prompts */
+  permissions?: WorkerPermissions;
   /** human-readable label for the portal */
   name?: string;
   /** epoch ms of the last dispatch this worker handled */
@@ -83,6 +99,7 @@ export class WorkerPool {
             session_id: crypto.randomUUID(),
             module: null,
             role: 'coordinator',
+            permissions: 'unrestricted',
             name: 'Coordinator',
           },
         ],
@@ -93,6 +110,14 @@ export class WorkerPool {
     try {
       const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as WorkerPoolFile;
       if (!parsed.workers) throw new Error('missing workers[]');
+      // Forward-compat: legacy workers had no `permissions` field. Fill
+      // in 'unrestricted' (the only value that makes headless work) and
+      // persist so the file matches what the runtime expects.
+      let migrated = false;
+      for (const w of parsed.workers) {
+        if (!w.permissions) { w.permissions = 'unrestricted'; migrated = true; }
+      }
+      if (migrated) writeFileSync(this.file, JSON.stringify(parsed, null, 2), { mode: 0o600 });
       return parsed;
     } catch (err) {
       log.warn('workers.json malformed; resetting to defaults', { err: String(err) });
@@ -136,6 +161,10 @@ export class WorkerPool {
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(spec.id)) throw new Error('id must be lowercase slug');
     if (this.data.workers.some(w => w.id === spec.id)) throw new Error(`worker ${spec.id} already exists`);
     const w: WorkerSpec = {
+      // Default to 'unrestricted' — headless dispatches need to skip
+      // prompts; the cwd boundary is the security envelope. The user can
+      // tighten via the portal's worker edit dialog.
+      permissions: 'unrestricted',
       ...spec,
       session_id: spec.session_id || crypto.randomUUID(),
     };

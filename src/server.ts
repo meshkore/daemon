@@ -64,6 +64,8 @@ const activeRuns = new Map<string, RunHandle>();
 
 const ALLOWED_ORIGINS = [
   /^https:\/\/portal\.meshkore\.com$/,
+  /^https:\/\/meshkore-portal\.pages\.dev$/,
+  /^https:\/\/[a-f0-9]+\.meshkore-portal\.pages\.dev$/,
   /^https:\/\/meshkore-web\.pages\.dev$/,
   /^https:\/\/[a-f0-9]+\.meshkore-web\.pages\.dev$/,
   /^https:\/\/meshkore\.com$/,
@@ -352,6 +354,7 @@ async function route(
         bin: (body.bin as string) || undefined,
         sessionId: worker.session_id,
         model: worker.model,
+        permissions: worker.permissions || 'unrestricted',
         emit: (ev) => broadcast(ev),
       });
       workers.touch(worker.id);
@@ -510,6 +513,7 @@ async function route(
         model: String(data.model || 'auto'),
         module: data.module ? String(data.module) : null,
         role: (data.role || 'worker') as any,
+        permissions: (data.permissions || 'unrestricted') as any,
         name: data.name ? String(data.name) : undefined,
         notes: data.notes ? String(data.notes) : undefined,
       });
@@ -523,7 +527,7 @@ async function route(
     const id = p.split('/')[2]!;
     try {
       const data = JSON.parse(await readBody(req) || '{}');
-      const allowed = (({ kind, model, module, role, name, notes }) => ({ kind, model, module, role, name, notes }))(data) as any;
+      const allowed = (({ kind, model, module, role, name, notes, permissions }) => ({ kind, model, module, role, name, notes, permissions }))(data) as any;
       const w = workers.update(id, allowed);
       broadcast({ type: 'worker.updated', worker: w, ts: new Date().toISOString() });
       return sendJson(res, 200, w);
@@ -795,6 +799,11 @@ function spawnCoordinatorChat(opts: {
   const args: string[] = ['-p'];
   if (opts.worker?.session_id) args.push('--session-id', opts.worker.session_id);
   if (opts.worker?.model && opts.worker.model !== 'auto') args.push('--model', opts.worker.model);
+  const perm = opts.worker?.permissions || 'unrestricted';
+  const permMode = perm === 'edits' ? 'acceptEdits'
+                 : perm === 'safe'  ? null
+                 :                    'bypassPermissions';
+  if (permMode) args.push('--permission-mode', permMode);
   args.push(briefing);
   const credEnv = {
     ...loadCredEnv(opts.meshkoreDir, opts.worker?.kind || 'claude-code'),
