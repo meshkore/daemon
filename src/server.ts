@@ -377,6 +377,26 @@ async function route(
       return sendJson(res, 400, { error: err.message || String(err) });
     }
   }
+  // ─── Version coordinator (V20 — stub) ───────────────────────────────
+  // The shape is locked so agents and the portal can call it today;
+  // concrete file-locked monotonic counter lands with V20.
+  if (method === 'GET' && p === '/version/current') {
+    return sendJson(res, 200, {
+      current: 'unknown',
+      hint: 'V20 — version coordinator not implemented yet. ' +
+            'See .meshkore/docs/conventions/versioning.md and ' +
+            'modules/daemon/tasks/V20-version-coordinator.md.',
+    });
+  }
+  if (method === 'POST' && p === '/version/next') {
+    return sendJson(res, 501, {
+      error: 'version coordinator not implemented yet',
+      hint: 'V20 — until then, bump versions manually following ' +
+            '.meshkore/docs/conventions/versioning.md (SemVer 2.0.0). ' +
+            'Coordinate with the human if multiple agents are active.',
+    });
+  }
+
   if (method === 'POST' && p === '/agents') {
     // Create an agent identity from the portal wizard. Same logic as
     // `meshcore agent create`, accepts the credential inline.
