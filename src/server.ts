@@ -426,6 +426,12 @@ async function route(
         runner: 'claude-code',
         identity: opts.identity,
         pid: handle.pid,
+        worker: coord ? {
+          id: coord.id,
+          model: coord.model,
+          session_id: coord.session_id,
+          permissions: coord.permissions || 'unrestricted',
+        } : null,
       });
     } catch (err: any) {
       return sendJson(res, 400, { error: err.message || String(err) });
