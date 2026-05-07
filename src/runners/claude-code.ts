@@ -24,6 +24,13 @@ export interface RunOptions {
   bin?: string;
   /** flag passed before the prompt; defaults to `-p` */
   promptFlag?: string;
+  /** stable claude session id — same UUID across dispatches keeps the
+   *  conversation context (claude resumes it). When omitted the runner
+   *  falls back to a fresh session per call. */
+  sessionId?: string;
+  /** model alias (e.g. 'sonnet', 'opus', 'haiku'). 'auto' / undefined
+   *  lets claude pick its default. */
+  model?: string;
   /** sink for progress events. Master daemon should pass broadcast(). */
   emit: (event: Record<string, unknown>) => void;
 }
@@ -52,11 +59,17 @@ export function runClaudeCode(opts: RunOptions): RunHandle {
   const taskMd = readFileSync(taskFile, 'utf8');
   const prompt = buildPrompt(opts.taskId, taskMd, repoRoot);
 
-  log.info('runner.claude-code spawning', { taskId: opts.taskId, bin, cwd: repoRoot, taskFile });
+  log.info('runner.claude-code spawning', { taskId: opts.taskId, bin, cwd: repoRoot, taskFile, sessionId: opts.sessionId, model: opts.model });
 
   const startedAt = new Date().toISOString();
+  // Build CLI args. --session-id makes consecutive calls resume the same
+  // claude conversation; --model pins the model the worker should use.
+  const args: string[] = [promptFlag];
+  if (opts.sessionId) args.push('--session-id', opts.sessionId);
+  if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
+  args.push(prompt);
   // Spawn detached so the daemon doesn't get tangled in claude's TTY
-  const child = spawn(bin, [promptFlag, prompt], {
+  const child = spawn(bin, args, {
     cwd: repoRoot,
     env: { ...process.env, MESHKORE_TASK: opts.taskId, MESHKORE_IDENTITY: opts.identity },
     stdio: ['ignore', 'pipe', 'pipe'],

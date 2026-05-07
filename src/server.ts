@@ -37,6 +37,7 @@ import { StateManager } from './state.js';
 import { Runtime } from './runtime.js';
 import { Admission, AdmissionRequestSchema } from './admission.js';
 import { runClaudeCode, type RunHandle } from './runners/claude-code.js';
+import { WorkerPool, type WorkerSpec } from './runners/pool.js';
 import { createAgentIdentity } from './commands/agent.js';
 import { spawn } from 'node:child_process';
 import { writeFileSync as fsWriteFileSync, mkdirSync as fsMkdirSync } from 'node:fs';
@@ -85,6 +86,11 @@ export async function startServer(opts: ServerOptions): Promise<DaemonServer> {
     () => broadcast({ type: 'state.rebuilt', ts: new Date().toISOString() }),
   );
 
+  // Persistent worker pool — one coordinator + N module-bound workers.
+  // Each worker has a stable session_id so consecutive dispatches resume
+  // the same Claude/Codex/etc. conversation instead of starting fresh.
+  const workers = new WorkerPool(opts.meshkoreDir);
+
   const admission = new Admission({
     meshkoreDir: opts.meshkoreDir,
     onEvent: (ev) => {
@@ -113,7 +119,7 @@ export async function startServer(opts: ServerOptions): Promise<DaemonServer> {
       return;
     }
     try {
-      await route(req, res, opts, runtime, state, broadcast, admission);
+      await route(req, res, opts, runtime, state, broadcast, admission, workers);
     } catch (err: any) {
       log.error('route error', { url: req.url, err: err?.message });
       sendJson(res, 500, { error: 'internal' });
@@ -175,6 +181,7 @@ async function route(
   state: StateManager,
   broadcast: (ev: Record<string, unknown>) => void,
   admission: Admission,
+  workers: WorkerPool,
 ) {
   const url = new URL(req.url ?? '/', 'http://x');
   const p = url.pathname;
@@ -305,14 +312,28 @@ async function route(
       return sendJson(res, 400, { error: `runner '${runnerKind}' not implemented (only claude-code right now)` });
     }
     try {
+      // Pick the worker that owns the module this task lives under.
+      // Falls back to the coordinator if no module-specific worker.
+      const tasks = (state.lastBundle as any)?.roadmap?.tasks || [];
+      const task = tasks.find((t: any) => t.id === taskId);
+      const moduleId: string | null = task?.category || null;
+      const workerOverride = body.worker as string | undefined;
+      const worker = workerOverride
+        ? workers.get(workerOverride)
+        : workers.pickForModule(moduleId);
+      if (!worker) return sendJson(res, 400, { error: 'no worker available — declare one in the portal Network panel' });
+
       const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
       const handle = runClaudeCode({
         meshkoreDir: opts.meshkoreDir,
         taskId,
-        identity: (body.identity as string) || opts.identity,
+        identity: worker.id,
         bin: (body.bin as string) || undefined,
+        sessionId: worker.session_id,
+        model: worker.model,
         emit: (ev) => broadcast(ev),
       });
+      workers.touch(worker.id);
       activeRuns.set(taskId, handle);
       // Don't await; let the response return immediately and the portal
       // sees task.* events on the WebSocket as they happen.
@@ -321,6 +342,8 @@ async function route(
         run_id: runId,
         task: taskId,
         runner: runnerKind,
+        worker: worker.id,
+        model: worker.model,
         identity: (body.identity as string) || opts.identity,
         pid: handle.pid,
         started_at: handle.startedAt,
@@ -357,14 +380,17 @@ async function route(
     // 2) Spawn the coordinator runner
     const dispatchId = `chat_${Date.now().toString(36)}`;
     try {
+      const coord = workers.coordinator();
       const handle = spawnCoordinatorChat({
         meshkoreDir: opts.meshkoreDir,
-        identity: opts.identity,
+        identity: coord?.id || opts.identity,
         prompt: text,
         conv,
         state,
+        worker: coord,
         emit: (ev) => broadcast(ev),
       });
+      if (coord) workers.touch(coord.id);
       activeRuns.set(dispatchId, handle);
       handle.done.then(() => activeRuns.delete(dispatchId)).catch(() => activeRuns.delete(dispatchId));
       return sendJson(res, 202, {
@@ -444,6 +470,61 @@ async function route(
       remote: false,
     }));
     return sendJson(res, 200, { runners: list });
+  }
+
+  // ─── Worker pool (persistent sessions) ────────────────────────────────
+  if (method === 'GET' && p === '/workers') {
+    return sendJson(res, 200, { workers: workers.list() });
+  }
+  if (method === 'POST' && p === '/workers') {
+    try {
+      const data = JSON.parse(await readBody(req) || '{}');
+      const w = workers.add({
+        id: String(data.id || ''),
+        kind: (data.kind || 'claude-code') as any,
+        model: String(data.model || 'auto'),
+        module: data.module ? String(data.module) : null,
+        role: (data.role || 'worker') as any,
+        name: data.name ? String(data.name) : undefined,
+        notes: data.notes ? String(data.notes) : undefined,
+      });
+      broadcast({ type: 'worker.added', worker: w, ts: new Date().toISOString() });
+      return sendJson(res, 201, w);
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
+  }
+  if (method === 'PATCH' && /^\/workers\/[^/]+$/.test(p)) {
+    const id = p.split('/')[2]!;
+    try {
+      const data = JSON.parse(await readBody(req) || '{}');
+      const allowed = (({ kind, model, module, role, name, notes }) => ({ kind, model, module, role, name, notes }))(data) as any;
+      const w = workers.update(id, allowed);
+      broadcast({ type: 'worker.updated', worker: w, ts: new Date().toISOString() });
+      return sendJson(res, 200, w);
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
+  }
+  if (method === 'DELETE' && /^\/workers\/[^/]+$/.test(p)) {
+    const id = p.split('/')[2]!;
+    try {
+      workers.remove(id);
+      broadcast({ type: 'worker.removed', id, ts: new Date().toISOString() });
+      return sendJson(res, 204, {});
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
+  }
+  if (method === 'POST' && /^\/workers\/[^/]+\/reset-session$/.test(p)) {
+    const id = p.split('/')[2]!;
+    try {
+      const w = workers.resetSession(id);
+      broadcast({ type: 'worker.session_reset', worker: w, ts: new Date().toISOString() });
+      return sendJson(res, 200, w);
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
   }
 
   // ─── Admission endpoints ─────────────────────────────────────────────
@@ -637,6 +718,7 @@ function spawnCoordinatorChat(opts: {
   prompt: string;
   conv: string;
   state: StateManager;
+  worker?: WorkerSpec;            // when set, uses --session-id + --model
   emit: (ev: Record<string, unknown>) => void;
 }): RunHandle {
   const repoRoot = path.dirname(opts.meshkoreDir);
@@ -685,7 +767,11 @@ function spawnCoordinatorChat(opts: {
     `If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you're picking and why before doing the work.`,
   ].filter(s => s !== '').join('\n');
 
-  const child = spawn('claude', ['-p', briefing], {
+  const args: string[] = ['-p'];
+  if (opts.worker?.session_id) args.push('--session-id', opts.worker.session_id);
+  if (opts.worker?.model && opts.worker.model !== 'auto') args.push('--model', opts.worker.model);
+  args.push(briefing);
+  const child = spawn('claude', args, {
     cwd: repoRoot,
     env: { ...process.env, MESHKORE_IDENTITY: opts.identity, MESHKORE_CONV: opts.conv },
     stdio: ['ignore', 'pipe', 'pipe'],
