@@ -362,6 +362,7 @@ async function route(
         identity: opts.identity,
         prompt: text,
         conv,
+        state,
         emit: (ev) => broadcast(ev),
       });
       activeRuns.set(dispatchId, handle);
@@ -635,63 +636,136 @@ function spawnCoordinatorChat(opts: {
   identity: string;
   prompt: string;
   conv: string;
+  state: StateManager;
   emit: (ev: Record<string, unknown>) => void;
 }): RunHandle {
   const repoRoot = path.dirname(opts.meshkoreDir);
   const startedAt = new Date().toISOString();
+  // One stream id per coordinator run — the portal merges every
+  // chat.assistant.delta with the same stream_id into one bubble.
+  const streamId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
+  // Pull recent chat history from STATE so the agent has context.
+  // Without this, "continúa con las tareas del chat" has nothing to
+  // continue — the coordinator process is fresh every dispatch.
+  const recentTurns: string[] = [];
+  try {
+    const cached = opts.state.lastBundle;
+    const events: any[] = (cached as any)?.timeline?.recent_events || [];
+    const convTurns = events
+      .filter(e => e.conv === opts.conv && (e.type === 'chat.user' || e.type === 'chat.assistant.final' || e.type === 'chat.assistant'))
+      .slice(-12);
+    for (const t of convTurns) {
+      const who = t.type === 'chat.user' ? 'USER' : 'YOU (last turn)';
+      const text = String(t.text || '').slice(0, 800);
+      if (text) recentTurns.push(`${who}: ${text}`);
+    }
+  } catch { /* state may be empty on first boot */ }
+
   const briefing = [
-    `You are the coordinator agent for a MeshKore cluster running at ${repoRoot}.`,
-    `The user is talking to you through the portal chat. They expect you to plan, write code, modify tasks, or answer questions about this repo.`,
-    `You have full read/write access to the repo and to .meshkore/. Read the operator manual at https://meshkore.com/cluster/operate before doing destructive work.`,
-    `Tasks live under .meshkore/modules/<module>/tasks/. Don't push to git unless explicitly asked.`,
+    `You are the coordinator agent for a MeshKore cluster at ${repoRoot}.`,
+    `Identity: ${opts.identity}. Conversation id: ${opts.conv}.`,
     ``,
-    `User said:`,
+    `Read these before deciding what to do (in order, only what you need):`,
+    `  • https://meshkore.com/cluster/operate — operator manual`,
+    `  • .meshkore/docs/conventions/versioning.md — commits + versions`,
+    `  • .meshkore/docs/conventions/context-workflow.md — every-change checklist`,
+    `  • .meshkore/modules/<module>/{README.md,tasks/,log/} — per-module work`,
+    ``,
+    `Hard rules:`,
+    `  • Don't push to git unless the user explicitly asks.`,
+    `  • Don't invent version numbers; ask POST localhost:5570/version/next.`,
+    `  • Never edit .meshkore/credentials/, .meshkore/.runtime/ or generated state.json.`,
+    `  • Reply concisely. The portal renders your stdout as the chat answer.`,
+    ``,
+    recentTurns.length ? `Recent turns in this conversation:\n${recentTurns.join('\n')}\n` : '',
+    `User just said:`,
     opts.prompt,
-  ].join('\n');
+    ``,
+    `If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you're picking and why before doing the work.`,
+  ].filter(s => s !== '').join('\n');
+
   const child = spawn('claude', ['-p', briefing], {
     cwd: repoRoot,
     env: { ...process.env, MESHKORE_IDENTITY: opts.identity, MESHKORE_CONV: opts.conv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   opts.emit({
-    type: 'task.started', // routed to the project status dot
+    type: 'task.started',
     id: `chat:${opts.conv}`,
     agent: opts.identity,
     ts: startedAt,
     runner: 'claude-code',
     conv: opts.conv,
+    stream_id: streamId,
   });
+  // Open an empty assistant bubble immediately so the user sees something.
+  opts.emit({
+    type: 'chat.assistant.delta',
+    author: opts.identity,
+    conv: opts.conv,
+    stream_id: streamId,
+    text: '',
+    ts: startedAt,
+  });
+
   let buf = '';
   let stderrTail = '';
+  let lastEmittedLen = 0;
+  let throttle: ReturnType<typeof setTimeout> | null = null;
+
+  const flushDelta = () => {
+    if (buf.length === lastEmittedLen) return;
+    lastEmittedLen = buf.length;
+    // Cap text we ship to the portal; the portal will request the full
+    // text from /timeline if it ever needs it.
+    opts.emit({
+      type: 'chat.assistant.delta',
+      author: opts.identity,
+      conv: opts.conv,
+      stream_id: streamId,
+      text: buf.slice(0, 16000),
+      ts: new Date().toISOString(),
+    });
+    throttle = null;
+  };
+
   child.stdout?.on('data', (c: Buffer) => {
-    const text = c.toString('utf8');
-    buf += text;
-    // Stream as chat.assistant chunks (one per non-empty line)
-    for (const line of text.split(/\r?\n/)) {
-      const t = line.trim();
-      if (!t) continue;
-      opts.emit({
-        type: 'chat.assistant',
-        author: opts.identity,
-        conv: opts.conv,
-        text: t.slice(0, 1000),
-        ts: new Date().toISOString(),
-      });
-    }
+    buf += c.toString('utf8');
+    // Throttle to ~5 fps so we stream live without flooding the WS.
+    if (!throttle) throttle = setTimeout(flushDelta, 200);
   });
   child.stderr?.on('data', (c: Buffer) => { stderrTail = (stderrTail + c.toString('utf8')).slice(-2000); });
+
   const startMs = Date.now();
   const done = new Promise<{ exitCode: number; durationMs: number }>((resolve) => {
     child.on('exit', (code, signal) => {
+      // Final flush + final event with the complete text.
+      if (throttle) { clearTimeout(throttle); throttle = null; }
       const exitCode = code ?? (signal ? 130 : 1);
       const durationMs = Date.now() - startMs;
+      const fullText = buf.trim();
       if (exitCode === 0) {
+        // Persist the assistant turn so future dispatches in this conv
+        // can read it from state.timeline.recent_events.
+        try {
+          const persisted = appendTimelineEvent(opts.meshkoreDir, {
+            type: 'chat.assistant.final',
+            author: opts.identity,
+            conv: opts.conv,
+            stream_id: streamId,
+            text: fullText.slice(0, 16000),
+            duration_ms: durationMs,
+          });
+          opts.emit(persisted);
+        } catch { /* fall through */ }
         opts.emit({
           type: 'task.completed',
           id: `chat:${opts.conv}`,
           agent: opts.identity,
           ts: new Date().toISOString(),
-          summary: buf.split(/\r?\n/).filter(Boolean).slice(-1)[0]?.slice(0, 300) || 'chat done',
+          stream_id: streamId,
+          summary: fullText.split(/\r?\n/).filter(Boolean).slice(-1)[0]?.slice(0, 300) || 'chat done',
           conv: opts.conv,
         });
       } else {
@@ -700,6 +774,7 @@ function spawnCoordinatorChat(opts: {
           id: `chat:${opts.conv}`,
           agent: opts.identity,
           ts: new Date().toISOString(),
+          stream_id: streamId,
           exit_code: exitCode,
           error: stderrTail.slice(-300) || `exit ${exitCode}`,
           conv: opts.conv,
@@ -713,6 +788,7 @@ function spawnCoordinatorChat(opts: {
         id: `chat:${opts.conv}`,
         agent: opts.identity,
         ts: new Date().toISOString(),
+        stream_id: streamId,
         error: `spawn claude: ${err.message}`,
         conv: opts.conv,
       });

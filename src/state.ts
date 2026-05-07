@@ -33,6 +33,8 @@ export interface StateBundle {
 
 export class StateManager {
   private cache: StateBundle | null = null;
+  /** Read-only peek at the last cached state without forcing a rebuild. */
+  get lastBundle(): StateBundle | null { return this.cache; }
   private buildPromise: Promise<StateBundle> | null = null;
   private debounceTimer: NodeJS.Timeout | null = null;
 
