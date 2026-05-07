@@ -41,6 +41,23 @@ import { WorkerPool, type WorkerSpec } from './runners/pool.js';
 import { createAgentIdentity } from './commands/agent.js';
 import { spawn } from 'node:child_process';
 import { writeFileSync as fsWriteFileSync, mkdirSync as fsMkdirSync } from 'node:fs';
+import os from 'node:os';
+
+// Per-host info shared with the portal so workers can display where
+// they live (one Mac vs. another, hostname-aware). Read once at boot
+// — hostname doesn't change frequently and we don't want syscalls
+// on every request.
+let _device: { hostname: string; platform: string; arch: string; os_release: string } | null = null;
+function deviceInfo() {
+  if (_device) return _device;
+  _device = {
+    hostname: os.hostname() || 'unknown',
+    platform: os.platform(),
+    arch: os.arch(),
+    os_release: os.release(),
+  };
+  return _device;
+}
 
 // Active runs keyed by task id. One run per task at a time (later: queue).
 const activeRuns = new Map<string, RunHandle>();
@@ -191,6 +208,9 @@ async function route(
   if (p === '/health' && method === 'GET') {
     // Include cluster identity so the portal's project switcher can
     // distinguish daemons running on different ports without auth.
+    // Also surface the host info so the portal can show "running on
+    // <device-name>" next to each worker — the user wanted that
+    // visible in the Network view.
     let cluster_id: string | undefined;
     let cluster_name: string | undefined;
     let cluster_type: string | undefined;
@@ -208,6 +228,7 @@ async function route(
       cluster_id,
       cluster_name,
       cluster_type,
+      device: deviceInfo(),
       ts: new Date().toISOString(),
     });
   }
@@ -474,7 +495,11 @@ async function route(
 
   // ─── Worker pool (persistent sessions) ────────────────────────────────
   if (method === 'GET' && p === '/workers') {
-    return sendJson(res, 200, { workers: workers.list() });
+    // Decorate each worker with the host it lives on, so the portal's
+    // Network view can label "this worker runs on <device-name>".
+    const dev = deviceInfo();
+    const list = workers.list().map(w => ({ ...w, device: dev }));
+    return sendJson(res, 200, { workers: list, device: dev });
   }
   if (method === 'POST' && p === '/workers') {
     try {
