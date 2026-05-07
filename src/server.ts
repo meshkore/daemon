@@ -40,7 +40,6 @@ import { runClaudeCode, type RunHandle, loadCredEnv } from './runners/claude-cod
 import { WorkerPool, type WorkerSpec } from './runners/pool.js';
 import { createAgentIdentity } from './commands/agent.js';
 import { spawn } from 'node:child_process';
-import { writeFileSync as fsWriteFileSync, mkdirSync as fsMkdirSync } from 'node:fs';
 import os from 'node:os';
 
 // Per-host info shared with the portal so workers can display where
