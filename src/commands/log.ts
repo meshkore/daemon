@@ -6,8 +6,6 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
-import { log } from '../lib/log.js';
-
 interface LogOptions {
   date?: string;
   since?: string;

@@ -207,7 +207,7 @@ export async function sshKeygenSign(opts: {
   const tmpFile = path.join(os.tmpdir(), `mk-sign-${randomBytes(6).toString('hex')}`);
   writeFileSync(tmpFile, opts.payload);
   try {
-    const { stdout } = await execFileP('ssh-keygen', [
+    await execFileP('ssh-keygen', [
       '-Y', 'sign',
       '-n', namespace,
       '-f', opts.privKeyPath,

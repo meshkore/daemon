@@ -7,7 +7,6 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
-  appendFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';

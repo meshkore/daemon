@@ -1003,7 +1003,7 @@ function pickNextId(meshkoreDir: string, prefix: string): string {
   return `${prefix}${max + 1}`;
 }
 
-async function transitionTask(meshkoreDir: string, id: string, to: string, by: string): Promise<{ from: string; path: string }> {
+async function transitionTask(meshkoreDir: string, id: string, to: string, _by: string): Promise<{ from: string; path: string }> {
   const valid = ['backlog', 'next', 'in_progress', 'blocked', 'done', 'cancelled'];
   if (!valid.includes(to)) throw new Error(`invalid status: ${to}`);
 

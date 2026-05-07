@@ -2,7 +2,7 @@
  * `meshcore install-hooks` — symlink .meshkore/scripts/git-hooks/* into .git/hooks/.
  */
 import path from 'node:path';
-import { existsSync, readdirSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { existsSync, readdirSync, statSync, symlinkSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 
 import { log } from '../lib/log.js';

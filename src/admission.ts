@@ -31,7 +31,6 @@ import {
   readdirSync,
   rmSync,
   writeFileSync,
-  statSync,
 } from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
@@ -41,7 +40,6 @@ import {
   ParsedSshPubkey,
   parseSshEd25519Pubkey,
   fetchGithubKeys,
-  fingerprintSha256,
   generateAdmissionToken,
   admissionChallenge,
   sshKeygenVerify,
