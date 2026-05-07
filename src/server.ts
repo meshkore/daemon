@@ -258,6 +258,9 @@ async function route(
   if (method === 'GET' && p.startsWith('/docs/')) {
     return serveFile(res, path.join(opts.meshkoreDir, 'docs', decodeURIComponent(p.slice('/docs/'.length))));
   }
+  if (method === 'GET' && p.startsWith('/modules/')) {
+    return serveFile(res, path.join(opts.meshkoreDir, 'modules', decodeURIComponent(p.slice('/modules/'.length))));
+  }
   if (method === 'GET' && p.startsWith('/tasks/')) {
     return serveFile(res, path.join(opts.meshkoreDir, 'roadmap', decodeURIComponent(p.slice('/tasks/'.length))));
   }
