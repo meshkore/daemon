@@ -36,6 +36,10 @@ import { log } from './lib/log.js';
 import { StateManager } from './state.js';
 import { Runtime } from './runtime.js';
 import { Admission, AdmissionRequestSchema } from './admission.js';
+import { runClaudeCode, type RunHandle } from './runners/claude-code.js';
+
+// Active runs keyed by task id. One run per task at a time (later: queue).
+const activeRuns = new Map<string, RunHandle>();
 
 const ALLOWED_ORIGINS = [
   /^https:\/\/portal\.meshkore\.com$/,
@@ -288,32 +292,64 @@ async function route(
       return sendJson(res, 400, { error: err.message });
     }
   }
-  // ─── Dispatch endpoints (V17 — orchestrator stubs) ───────────────────
-  // The shape is locked so the portal can call them today; the runner
-  // implementation lands in V17. For now they 501 with a clear message
-  // and an empty runners list, so the UI can reflect "not yet" gracefully.
+  // ─── Dispatch endpoints (V17 — minimal claude-code runner) ────────────
   if (method === 'POST' && /^\/tasks\/[^/]+\/dispatch$/.test(p)) {
-    const taskId = p.split('/')[2];
-    return sendJson(res, 501, {
-      error: 'dispatcher not implemented yet',
-      task: taskId,
-      hint: 'See .meshkore/modules/daemon/tasks/V17-master-orchestrator.md. ' +
-            'For now, run the task in your interactive AI session and ' +
-            'transition status via POST /tasks/<id>/transition.',
-    });
+    const taskId = p.split('/')[2]!;
+    let body: Record<string, unknown> = {};
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+    const runnerKind = (body.runner as string) || 'claude-code';
+    if (runnerKind !== 'claude-code') {
+      return sendJson(res, 400, { error: `runner '${runnerKind}' not implemented (only claude-code right now)` });
+    }
+    try {
+      const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      const handle = runClaudeCode({
+        meshkoreDir: opts.meshkoreDir,
+        taskId,
+        identity: (body.identity as string) || opts.identity,
+        bin: (body.bin as string) || undefined,
+        emit: (ev) => broadcast(ev),
+      });
+      activeRuns.set(taskId, handle);
+      // Don't await; let the response return immediately and the portal
+      // sees task.* events on the WebSocket as they happen.
+      handle.done.then(() => activeRuns.delete(taskId)).catch(() => activeRuns.delete(taskId));
+      return sendJson(res, 202, {
+        run_id: runId,
+        task: taskId,
+        runner: runnerKind,
+        identity: (body.identity as string) || opts.identity,
+        pid: handle.pid,
+        started_at: handle.startedAt,
+      });
+    } catch (err: any) {
+      return sendJson(res, 400, { error: err.message || String(err) });
+    }
   }
   if (method === 'POST' && /^\/tasks\/[^/]+\/cancel$/.test(p)) {
-    return sendJson(res, 501, { error: 'cancel needs the dispatcher (V17)' });
+    const taskId = p.split('/')[2]!;
+    const h = activeRuns.get(taskId);
+    if (!h) return sendJson(res, 404, { error: `no active run for ${taskId}` });
+    h.cancel();
+    return sendJson(res, 202, { task: taskId, cancelled: true });
   }
   if (method === 'POST' && p === '/chat/dispatch') {
     return sendJson(res, 501, {
-      error: 'chat dispatch needs the dispatcher (V17)',
-      hint: 'Use POST /messages to log the chat event; agents pick up tasks manually.',
+      error: 'chat dispatch (intent → task pick → run) is the next step of V17',
+      hint: 'For now, run a specific task with POST /tasks/<id>/dispatch.',
     });
   }
   if (method === 'GET' && p === '/runners') {
-    // No runners registered yet — empty list is the truthful answer.
-    return sendJson(res, 200, { runners: [] });
+    const list = Array.from(activeRuns.entries()).map(([taskId, h]) => ({
+      identity: opts.identity,
+      kind: 'claude-code',
+      state: 'busy',
+      current_task: taskId,
+      started_at: h.startedAt,
+      pid: h.pid,
+      remote: false,
+    }));
+    return sendJson(res, 200, { runners: list });
   }
 
   // ─── Admission endpoints ─────────────────────────────────────────────
