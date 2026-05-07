@@ -36,7 +36,7 @@ import { log } from './lib/log.js';
 import { StateManager } from './state.js';
 import { Runtime } from './runtime.js';
 import { Admission, AdmissionRequestSchema } from './admission.js';
-import { runClaudeCode, type RunHandle } from './runners/claude-code.js';
+import { runClaudeCode, type RunHandle, loadCredEnv } from './runners/claude-code.js';
 import { WorkerPool, type WorkerSpec } from './runners/pool.js';
 import { createAgentIdentity } from './commands/agent.js';
 import { spawn } from 'node:child_process';
@@ -796,9 +796,13 @@ function spawnCoordinatorChat(opts: {
   if (opts.worker?.session_id) args.push('--session-id', opts.worker.session_id);
   if (opts.worker?.model && opts.worker.model !== 'auto') args.push('--model', opts.worker.model);
   args.push(briefing);
+  const credEnv = {
+    ...loadCredEnv(opts.meshkoreDir, opts.worker?.kind || 'claude-code'),
+    ...loadCredEnv(opts.meshkoreDir, opts.identity),
+  };
   const child = spawn('claude', args, {
     cwd: repoRoot,
-    env: { ...process.env, MESHKORE_IDENTITY: opts.identity, MESHKORE_CONV: opts.conv },
+    env: { ...process.env, ...credEnv, MESHKORE_IDENTITY: opts.identity, MESHKORE_CONV: opts.conv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   opts.emit({

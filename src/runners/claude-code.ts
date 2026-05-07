@@ -16,6 +16,36 @@ import path from 'node:path';
 
 import { log } from '../lib/log.js';
 
+/**
+ * Read `.meshkore/credentials/<file>.env` (KEY=value, one per line) and
+ * return it as a plain object suitable to merge into `process.env`.
+ * Comments (`#`) and blank lines are ignored. Quoted values are
+ * unquoted. Returns {} when the file doesn't exist.
+ *
+ * This is how worker spawns pick up `ANTHROPIC_API_KEY` for users
+ * who haven't exported it globally — they put it in
+ * `.meshkore/credentials/claude-code.env` and it travels into the
+ * child process automatically.
+ */
+export function loadCredEnv(meshkoreDir: string, fileBase: string): Record<string, string> {
+  const file = path.join(meshkoreDir, 'credentials', `${fileBase}.env`);
+  if (!existsSync(file)) return {};
+  const out: Record<string, string> = {};
+  for (const raw of readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (key) out[key] = val;
+  }
+  return out;
+}
+
 export interface RunOptions {
   meshkoreDir: string;                       // .../.meshkore
   taskId: string;                            // e.g. "V17"
@@ -68,10 +98,18 @@ export function runClaudeCode(opts: RunOptions): RunHandle {
   if (opts.sessionId) args.push('--session-id', opts.sessionId);
   if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
   args.push(prompt);
+  // Merge credentials from .meshkore/credentials/claude-code.env (and
+  // optionally from a per-worker file <identity>.env) into the child
+  // env. Without this, users who store ANTHROPIC_API_KEY in the env
+  // file (instead of exporting it) get auth failures.
+  const credEnv = {
+    ...loadCredEnv(opts.meshkoreDir, 'claude-code'),
+    ...loadCredEnv(opts.meshkoreDir, opts.identity),
+  };
   // Spawn detached so the daemon doesn't get tangled in claude's TTY
   const child = spawn(bin, args, {
     cwd: repoRoot,
-    env: { ...process.env, MESHKORE_TASK: opts.taskId, MESHKORE_IDENTITY: opts.identity },
+    env: { ...process.env, ...credEnv, MESHKORE_TASK: opts.taskId, MESHKORE_IDENTITY: opts.identity },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
