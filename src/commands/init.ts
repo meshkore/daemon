@@ -67,13 +67,17 @@ export async function initCmd(opts: InitOptions): Promise<void> {
   const description = opts.description || (rl ? await ask('description', `${repoName} cluster`) : `${repoName} cluster`);
   rl?.close();
 
-  // 2. Create directory structure
+  // 2. Create directory structure (module-centric v2 layout)
   for (const d of [
-    'public', 'docs', 'roadmap/tasks', 'roadmap/log',
+    'public', 'docs', 'modules', 'roadmap',
     'agents', 'credentials', 'scripts', 'portal',
-    'timeline', 'diagrams', '.runtime/agents',
+    'timeline', 'log', '.runtime/agents',
   ]) {
     mkdirSync(path.join(meshkoreDir, d), { recursive: true });
+  }
+  // Seed a `general` catch-all module so the user can write tasks immediately
+  for (const sub of ['tasks', 'log']) {
+    mkdirSync(path.join(meshkoreDir, 'modules', 'general', sub), { recursive: true });
   }
 
   // 3. Pull templates from catalog → fill placeholders → write public/cluster.yaml

@@ -8,11 +8,11 @@
  *
  * Watched paths:
  *   .meshkore/timeline/*.jsonl    → triggers WS event broadcast (immediate)
- *   .meshkore/roadmap/tasks/      → triggers state rebuild (debounced)
- *   .meshkore/roadmap/log/        → triggers state rebuild (debounced)
- *   .meshkore/docs/               → triggers state rebuild (debounced)
- *   .meshkore/public/cluster.yaml → triggers state rebuild (debounced)
- *   .meshkore/agents/             → triggers state rebuild (debounced)
+ *   .meshkore/modules/            → triggers state rebuild (per-module tasks/log/diagrams/README)
+ *   .meshkore/docs/               → triggers state rebuild (cross-cutting context)
+ *   .meshkore/public/cluster.yaml → triggers state rebuild (modules block, identity)
+ *   .meshkore/agents/             → triggers state rebuild (declared identities)
+ *   (legacy) .meshkore/roadmap/tasks|log/  also watched for backward compat
  */
 import { existsSync, openSync, readSync, closeSync, readFileSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -90,11 +90,13 @@ export class StateManager {
 
   startWatcher() {
     const watch = [
-      path.join(this.meshkoreDir, 'roadmap', 'tasks'),
-      path.join(this.meshkoreDir, 'roadmap', 'log'),
-      path.join(this.meshkoreDir, 'docs'),
+      path.join(this.meshkoreDir, 'modules'),               // new layout: per-module folders
+      path.join(this.meshkoreDir, 'docs'),                  // cross-cutting context
       path.join(this.meshkoreDir, 'agents'),
       path.join(this.meshkoreDir, 'public', 'cluster.yaml'),
+      // Backward compat with the pre-v2 layout (still supported by the build script)
+      path.join(this.meshkoreDir, 'roadmap', 'tasks'),
+      path.join(this.meshkoreDir, 'roadmap', 'log'),
     ];
     const timelineDir = path.join(this.meshkoreDir, 'timeline');
 
