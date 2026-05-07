@@ -175,11 +175,25 @@ async function route(
 
   // Public: health
   if (p === '/health' && method === 'GET') {
+    // Include cluster identity so the portal's project switcher can
+    // distinguish daemons running on different ports without auth.
+    let cluster_id: string | undefined;
+    let cluster_name: string | undefined;
+    let cluster_type: string | undefined;
+    try {
+      const s = await state.getState();
+      cluster_id = (s.cluster as any)?.id;
+      cluster_name = (s.cluster as any)?.name;
+      cluster_type = (s.cluster as any)?.type;
+    } catch {}
     return sendJson(res, 200, {
       ok: true,
       identity: opts.identity,
       port: opts.port,
       mode: 'server',
+      cluster_id,
+      cluster_name,
+      cluster_type,
       ts: new Date().toISOString(),
     });
   }
