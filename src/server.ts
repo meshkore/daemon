@@ -274,6 +274,34 @@ async function route(
       return sendJson(res, 400, { error: err.message });
     }
   }
+  // ─── Dispatch endpoints (V17 — orchestrator stubs) ───────────────────
+  // The shape is locked so the portal can call them today; the runner
+  // implementation lands in V17. For now they 501 with a clear message
+  // and an empty runners list, so the UI can reflect "not yet" gracefully.
+  if (method === 'POST' && /^\/tasks\/[^/]+\/dispatch$/.test(p)) {
+    const taskId = p.split('/')[2];
+    return sendJson(res, 501, {
+      error: 'dispatcher not implemented yet',
+      task: taskId,
+      hint: 'See .meshkore/modules/daemon/tasks/V17-master-orchestrator.md. ' +
+            'For now, run the task in your interactive AI session and ' +
+            'transition status via POST /tasks/<id>/transition.',
+    });
+  }
+  if (method === 'POST' && /^\/tasks\/[^/]+\/cancel$/.test(p)) {
+    return sendJson(res, 501, { error: 'cancel needs the dispatcher (V17)' });
+  }
+  if (method === 'POST' && p === '/chat/dispatch') {
+    return sendJson(res, 501, {
+      error: 'chat dispatch needs the dispatcher (V17)',
+      hint: 'Use POST /messages to log the chat event; agents pick up tasks manually.',
+    });
+  }
+  if (method === 'GET' && p === '/runners') {
+    // No runners registered yet — empty list is the truthful answer.
+    return sendJson(res, 200, { runners: [] });
+  }
+
   // ─── Admission endpoints ─────────────────────────────────────────────
   if (method === 'GET' && p === '/admission/policy') {
     return sendJson(res, 200, admission.getPolicy());
