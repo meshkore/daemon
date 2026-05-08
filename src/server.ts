@@ -355,6 +355,7 @@ async function route(
         identity: worker.id,
         bin: (body.bin as string) || undefined,
         sessionId: worker.session_id,
+        sessionExists: !!(worker.last_used && worker.last_used > 0),
         model: worker.model,
         permissions: worker.permissions || 'unrestricted',
         emit: (ev) => broadcast(ev),
@@ -805,7 +806,15 @@ function spawnCoordinatorChat(opts: {
   ].filter(s => s !== '').join('\n');
 
   const args: string[] = ['-p'];
-  if (opts.worker?.session_id) args.push('--session-id', opts.worker.session_id);
+  // Session continuity: claude CLI rejects --session-id for an existing
+  // UUID ("Session ID is already in use"). For first-ever use we mint
+  // the session with --session-id; for every subsequent dispatch we
+  // resume it with --resume. We use last_used as the marker — workers
+  // that have been touched by the pool already have a session on disk.
+  if (opts.worker?.session_id) {
+    const flag = opts.worker.last_used && opts.worker.last_used > 0 ? '--resume' : '--session-id';
+    args.push(flag, opts.worker.session_id);
+  }
   if (opts.worker?.model && opts.worker.model !== 'auto') args.push('--model', opts.worker.model);
   const perm = opts.worker?.permissions || 'unrestricted';
   const permMode = perm === 'edits' ? 'acceptEdits'

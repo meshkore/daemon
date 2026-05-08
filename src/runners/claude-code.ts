@@ -58,6 +58,12 @@ export interface RunOptions {
    *  conversation context (claude resumes it). When omitted the runner
    *  falls back to a fresh session per call. */
   sessionId?: string;
+  /** Whether the session UUID has already been minted on disk by claude.
+   *  - false / undefined → use --session-id <uuid> (creates it)
+   *  - true              → use --resume <uuid> (continues existing)
+   *  Required because claude rejects --session-id for an existing UUID
+   *  with "Session ID is already in use". */
+  sessionExists?: boolean;
   /** model alias (e.g. 'sonnet', 'opus', 'haiku'). 'auto' / undefined
    *  lets claude pick its default. */
   model?: string;
@@ -100,7 +106,9 @@ export function runClaudeCode(opts: RunOptions): RunHandle {
   // claude conversation; --model pins the model the worker should use;
   // --permission-mode controls how prompts are answered headlessly.
   const args: string[] = [promptFlag];
-  if (opts.sessionId) args.push('--session-id', opts.sessionId);
+  if (opts.sessionId) {
+    args.push(opts.sessionExists ? '--resume' : '--session-id', opts.sessionId);
+  }
   if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
   // Map worker.permissions → claude --permission-mode value.
   // - 'unrestricted' → bypassPermissions (headless default; cwd-bound)
