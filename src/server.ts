@@ -806,11 +806,17 @@ function spawnCoordinatorChat(opts: {
   ].filter(s => s !== '').join('\n');
 
   const args: string[] = ['-p'];
+  // Stream-json gets us real-time text_delta + tool_use events so the
+  // portal can render the agent thinking instead of waiting for the
+  // whole reply at exit time. Required flags per claude --help:
+  //   --output-format stream-json   one JSON event per line on stdout
+  //   --verbose                     mandatory companion of stream-json
+  //   --include-partial-messages    enables incremental content_block_delta
+  args.push('--output-format', 'stream-json', '--verbose', '--include-partial-messages');
   // Session continuity: claude CLI rejects --session-id for an existing
   // UUID ("Session ID is already in use"). For first-ever use we mint
   // the session with --session-id; for every subsequent dispatch we
-  // resume it with --resume. We use last_used as the marker — workers
-  // that have been touched by the pool already have a session on disk.
+  // resume it with --resume. last_used > 0 is the marker.
   if (opts.worker?.session_id) {
     const flag = opts.worker.last_used && opts.worker.last_used > 0 ? '--resume' : '--session-id';
     args.push(flag, opts.worker.session_id);
@@ -850,31 +856,95 @@ function spawnCoordinatorChat(opts: {
     ts: startedAt,
   });
 
-  let buf = '';
+  // ── stream-json parser ────────────────────────────────────────────
+  // claude emits one JSON event per line. We accumulate text from
+  // text_delta blocks (real-time) into `text`, and surface tool_use
+  // calls as separate `tool.use` events so the portal can show them
+  // in the Working pane next to the chat transcript.
+  let text = '';            // cumulative assistant text
+  let lineBuf = '';         // partial line carry-over
+  let resultText = '';      // final result (set on type==='result')
   let stderrTail = '';
   let lastEmittedLen = 0;
   let throttle: ReturnType<typeof setTimeout> | null = null;
 
   const flushDelta = () => {
-    if (buf.length === lastEmittedLen) return;
-    lastEmittedLen = buf.length;
-    // Cap text we ship to the portal; the portal will request the full
-    // text from /timeline if it ever needs it.
+    if (text.length === lastEmittedLen) return;
+    lastEmittedLen = text.length;
     opts.emit({
       type: 'chat.assistant.delta',
       author: opts.identity,
       conv: opts.conv,
       stream_id: streamId,
-      text: buf.slice(0, 16000),
+      text: text.slice(0, 16000),
       ts: new Date().toISOString(),
     });
     throttle = null;
   };
 
+  const handleEvent = (ev: any) => {
+    if (!ev || typeof ev !== 'object') return;
+    // Real-time text deltas → cumulative text + throttled emit.
+    if (ev.type === 'stream_event' && ev.event?.type === 'content_block_delta'
+        && ev.event.delta?.type === 'text_delta'
+        && typeof ev.event.delta.text === 'string') {
+      text += ev.event.delta.text;
+      if (!throttle) throttle = setTimeout(flushDelta, 200);
+      return;
+    }
+    // Tool calls — emit as a sidecar event so the Working pane can show
+    // "→ Edit foo.ts" / "→ Bash …" lines while the agent works.
+    if (ev.type === 'stream_event' && ev.event?.type === 'content_block_start'
+        && ev.event.content_block?.type === 'tool_use') {
+      const t = ev.event.content_block;
+      opts.emit({
+        type: 'tool.use',
+        author: opts.identity,
+        conv: opts.conv,
+        stream_id: streamId,
+        tool: t.name,
+        input: t.input,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+    // Tool results — keep it terse; the portal just needs to know one ran.
+    if (ev.type === 'user' && Array.isArray(ev.message?.content)) {
+      for (const c of ev.message.content) {
+        if (c?.type === 'tool_result') {
+          opts.emit({
+            type: 'tool.result',
+            author: opts.identity,
+            conv: opts.conv,
+            stream_id: streamId,
+            ok: !c.is_error,
+            ts: new Date().toISOString(),
+          });
+        }
+      }
+      return;
+    }
+    // Final result — capture the canonical text. The exit handler emits
+    // chat.assistant.final using either resultText or our accumulated text.
+    if (ev.type === 'result' && typeof ev.result === 'string') {
+      resultText = ev.result;
+      return;
+    }
+  };
+
+  const consumeLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try { handleEvent(JSON.parse(trimmed)); } catch { /* not JSON, skip */ }
+  };
+
   child.stdout?.on('data', (c: Buffer) => {
-    buf += c.toString('utf8');
-    // Throttle to ~5 fps so we stream live without flooding the WS.
-    if (!throttle) throttle = setTimeout(flushDelta, 200);
+    lineBuf += c.toString('utf8');
+    let nl;
+    while ((nl = lineBuf.indexOf('\n')) >= 0) {
+      consumeLine(lineBuf.slice(0, nl));
+      lineBuf = lineBuf.slice(nl + 1);
+    }
   });
   child.stderr?.on('data', (c: Buffer) => { stderrTail = (stderrTail + c.toString('utf8')).slice(-2000); });
 
@@ -885,7 +955,12 @@ function spawnCoordinatorChat(opts: {
       if (throttle) { clearTimeout(throttle); throttle = null; }
       const exitCode = code ?? (signal ? 130 : 1);
       const durationMs = Date.now() - startMs;
-      const fullText = buf.trim();
+      // Drain any trailing partial line that didn't end with \n.
+      if (lineBuf.trim()) consumeLine(lineBuf);
+      // Prefer the canonical 'result' text emitted by the stream-json
+      // protocol; fall back to the accumulated text deltas if for some
+      // reason the result event never landed.
+      const fullText = (resultText || text).trim();
       if (exitCode === 0) {
         // Persist the assistant turn so future dispatches in this conv
         // can read it from state.timeline.recent_events.
