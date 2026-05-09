@@ -96,6 +96,8 @@ export class StateManager {
       path.join(this.meshkoreDir, 'docs'),                  // cross-cutting context
       path.join(this.meshkoreDir, 'agents'),
       path.join(this.meshkoreDir, 'public', 'cluster.yaml'),
+      // Roadmap-level entities: initiatives (cross-module capability bundles).
+      path.join(this.meshkoreDir, 'roadmap', 'initiatives'),
       // Backward compat with the pre-v2 layout (still supported by the build script)
       path.join(this.meshkoreDir, 'roadmap', 'tasks'),
       path.join(this.meshkoreDir, 'roadmap', 'log'),
