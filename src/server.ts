@@ -61,6 +61,26 @@ function deviceInfo() {
 // Active runs keyed by task id. One run per task at a time (later: queue).
 const activeRuns = new Map<string, RunHandle>();
 
+/**
+ * Chat sessions — one per conversation. While a coordinator turn is
+ * running, additional `/chat/dispatch` calls for the same `conv` do NOT
+ * spawn a second claude process; they buffer the prompt and the daemon
+ * automatically chains a fresh `claude --resume` turn the moment the
+ * current one exits, feeding the concatenated buffer as the next user
+ * message. This matches the operator's mental model: "keep adding
+ * instructions while it's working; the final summary at the bottom
+ * absorbs everything I sent during the turn."
+ *
+ * Cancel = SIGTERM on the live child + drain the buffer + emit
+ * `chat.cancelled`. The portal's Stop button calls `POST /chat/cancel`.
+ */
+interface ChatSession {
+  handle: RunHandle;       // current live claude child
+  pending: string[];        // user prompts queued during the current turn
+  cancelled: boolean;       // operator pressed Stop — don't auto-respawn
+}
+const chatSessions = new Map<string, ChatSession>();
+
 const ALLOWED_ORIGINS = [
   /^https:\/\/portal\.meshkore\.com$/,
   /^https:\/\/meshkore-portal\.pages\.dev$/,
@@ -387,11 +407,11 @@ async function route(
     return sendJson(res, 202, { task: taskId, cancelled: true });
   }
   if (method === 'POST' && p === '/chat/dispatch') {
-    // Coordinator chat: every user query is routed through the master
-    // daemon's primary identity. We log the chat.user event, then spawn
-    // a claude-code runner with the chat text as the prompt and a short
-    // briefing about what it has access to (repo, .meshkore/, the
-    // operator manual). No LLM lives in the portal — the agent thinks.
+    // Coordinator chat — see the `chatSessions` doc-block at the top of
+    // this file for the buffer + auto-respawn pattern. Short version:
+    //   • first user msg per conv → spawn claude
+    //   • subsequent msgs while running → queue, chained as next turn
+    //   • POST /chat/cancel stops the chain
     const body = await readBody(req);
     let data: Record<string, unknown> = {};
     try { data = JSON.parse(body || '{}'); } catch {}
@@ -399,33 +419,76 @@ async function route(
     if (!text) return sendJson(res, 400, { error: 'text required' });
     const author = String(data.author || opts.identity);
     const conv = String(data.conv || `chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-').toLowerCase()}`);
-    // 1) Append the chat.user event
+
+    // 1) Always emit the user event immediately so the cockpit shows it
+    //    above the live coordinator bubble without waiting for the next
+    //    turn to spawn.
     const userEv = appendTimelineEvent(opts.meshkoreDir, {
       type: 'chat.user', author, text, conv,
     });
     broadcast(userEv);
-    // 2) Spawn the coordinator runner
-    const dispatchId = `chat_${Date.now().toString(36)}`;
+
+    // 2) If a turn is already running for this conv, buffer and return.
+    const running = chatSessions.get(conv);
+    if (running) {
+      running.pending.push(text);
+      log.info('chat queued (turn already running)', { conv, pending: running.pending.length });
+      return sendJson(res, 202, {
+        queued: true,
+        conv,
+        pending: running.pending.length,
+        message: 'turn in progress — your prompt will be merged into the next turn',
+      });
+    }
+
+    // 3) No active turn → spawn one and wire the auto-respawn chain.
     try {
       const coord = workers.coordinator();
-      const handle = spawnCoordinatorChat({
-        meshkoreDir: opts.meshkoreDir,
-        identity: coord?.id || opts.identity,
-        prompt: text,
-        conv,
-        state,
-        worker: coord,
-        emit: (ev) => broadcast(ev),
-      });
-      if (coord) workers.touch(coord.id);
-      activeRuns.set(dispatchId, handle);
-      handle.done.then(() => activeRuns.delete(dispatchId)).catch(() => activeRuns.delete(dispatchId));
+      const spawnTurn = (prompt: string): RunHandle => {
+        const h = spawnCoordinatorChat({
+          meshkoreDir: opts.meshkoreDir,
+          identity: coord?.id || opts.identity,
+          prompt,
+          conv,
+          state,
+          worker: coord,
+          emit: (ev) => broadcast(ev),
+        });
+        if (coord) workers.touch(coord.id);
+        return h;
+      };
+
+      const session: ChatSession = {
+        handle: spawnTurn(text),
+        pending: [],
+        cancelled: false,
+      };
+      chatSessions.set(conv, session);
+
+      const onTurnDone = () => {
+        if (session.cancelled || session.pending.length === 0) {
+          chatSessions.delete(conv);
+          return;
+        }
+        // Concatenate buffered prompts as the next turn's user message.
+        // Separator makes it clear to the coordinator that these are
+        // sequential adds, not one big paragraph.
+        const merged = session.pending.length === 1
+          ? session.pending[0]!
+          : 'Several follow-up instructions while you were working:\n\n'
+            + session.pending.map((t, i) => `${i + 1}. ${t}`).join('\n\n');
+        session.pending = [];
+        log.info('chat chain — spawning next turn', { conv, mergedLen: merged.length });
+        session.handle = spawnTurn(merged);
+        session.handle.done.then(onTurnDone).catch(onTurnDone);
+      };
+      session.handle.done.then(onTurnDone).catch(onTurnDone);
+
       return sendJson(res, 202, {
-        dispatch_id: dispatchId,
         conv,
         runner: 'claude-code',
         identity: opts.identity,
-        pid: handle.pid,
+        pid: session.handle.pid,
         worker: coord ? {
           id: coord.id,
           model: coord.model,
@@ -436,6 +499,34 @@ async function route(
     } catch (err: any) {
       return sendJson(res, 400, { error: err.message || String(err) });
     }
+  }
+
+  if (method === 'POST' && p === '/chat/cancel') {
+    // Stop the active turn for a conversation: SIGTERM the child, drain
+    // the buffer, emit `chat.cancelled` so the cockpit can mark the
+    // bubble as halted. Idempotent — calling twice is safe.
+    const body = await readBody(req);
+    let data: Record<string, unknown> = {};
+    try { data = JSON.parse(body || '{}'); } catch {}
+    const conv = String(data.conv || '');
+    if (!conv) return sendJson(res, 400, { error: 'conv required' });
+    const sess = chatSessions.get(conv);
+    if (!sess) {
+      return sendJson(res, 200, { ok: true, cancelled: false, reason: 'no active turn for that conv' });
+    }
+    sess.cancelled = true;
+    const droppedPending = sess.pending.length;
+    sess.pending = [];
+    try { sess.handle.cancel(); } catch { /* noop */ }
+    chatSessions.delete(conv);
+    broadcast({
+      type: 'chat.cancelled',
+      conv,
+      ts: new Date().toISOString(),
+      dropped_pending: droppedPending,
+    });
+    log.info('chat cancelled', { conv, dropped: droppedPending });
+    return sendJson(res, 200, { ok: true, cancelled: true, dropped_pending: droppedPending });
   }
   // ─── Version coordinator (V20 — stub) ───────────────────────────────
   // The shape is locked so agents and the portal can call it today;
