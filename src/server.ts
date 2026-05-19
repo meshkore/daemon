@@ -5,16 +5,27 @@
  * localhost:*, and file:// origins.
  *
  * REST routes:
- *   GET  /health
+ *   GET  /health                 (public — no auth required)
  *   GET  /state
  *   GET  /state/{roadmap|docs|cluster|modules|timeline}
  *   GET  /docs/*                 raw markdown by path
  *   GET  /tasks/*                raw markdown by path
- *   POST /messages               append chat.user, broadcast
- *   POST /tasks/{id}/transition  update frontmatter, append task.transitioned
+ *   GET  /modules/*              raw markdown by path
  *   GET  /agents                 declared local agents
  *   GET  /credentials            metadata only (filenames)
  *   GET  /reload                 force state rebuild
+ *   POST /messages               append chat.user, broadcast
+ *   POST /tasks                  create task (writes a new .md frontmatter)
+ *   POST /tasks/{id}/transition  update frontmatter, append task.transitioned
+ *   POST /tasks/{id}/dispatch    spawn worker for a task
+ *   POST /tasks/{id}/cancel      SIGTERM the live run for a task
+ *   POST /chat/dispatch          coordinator chat — buffers if a turn is
+ *                                already running for the same conv;
+ *                                chains the next turn via --resume + the
+ *                                concatenated buffered prompts
+ *   POST /chat/cancel { conv }   SIGTERM the live coordinator child for
+ *                                a conv + drop the pending buffer +
+ *                                broadcast chat.cancelled
  *
  * WS:
  *   /events    streams cluster events as JSON lines
