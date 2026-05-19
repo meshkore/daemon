@@ -630,6 +630,357 @@ class Hub:
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Chat coordinator runner (U-DAEMON-05 + 06)
+#
+# Replaces the Node spawnCoordinatorChat + chatSessions pair from
+# `daemon/src/server.ts`. Same protocol on the wire — the cockpit's
+# `daemon-client.ts` is unchanged. Differences from the Node port:
+# explicit, no worker pool yet (sessions don't carry --session-id /
+# --resume across turns yet; that lands with U-DAEMON-07 worker pool
+# port). Conversation history is rebuilt from the timeline file on
+# each turn so context survives daemon restarts.
+
+
+def _find_claude() -> Optional[str]:
+    """Locate the `claude` CLI. Heuristic — try shell PATH, then the
+    nvm + Homebrew locations we expect on a typical operator laptop."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    import glob
+    for pattern in [
+        os.path.expanduser("~/.nvm/versions/node/v*/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]:
+        hits = sorted(glob.glob(pattern), reverse=True)
+        if hits and os.access(hits[0], os.X_OK):
+            return hits[0]
+    return None
+
+
+def _conversation_history(paths: "Paths", conv: str, limit: int = 12) -> List[str]:
+    """Walk timeline files newest→oldest, return last `limit` turns of
+    `conv` formatted as 'USER: …' / 'YOU (last turn): …'."""
+    if not paths.timeline_dir.exists():
+        return []
+    turns: List[Tuple[str, str]] = []
+    for f in sorted(paths.timeline_dir.glob("*.jsonl"), reverse=True):
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("conv") != conv:
+                continue
+            t = ev.get("type")
+            if t not in ("chat.user", "chat.assistant", "chat.assistant.final"):
+                continue
+            who = "USER" if t == "chat.user" else "YOU (last turn)"
+            text = str(ev.get("text") or "").strip()
+            if not text:
+                continue
+            turns.append((who, text[:800]))
+            if len(turns) >= limit:
+                break
+        if len(turns) >= limit:
+            break
+    turns.reverse()
+    return [f"{w}: {t}" for w, t in turns]
+
+
+def _append_timeline(paths: "Paths", event: Dict[str, Any]) -> Dict[str, Any]:
+    """Append one JSON-line event to today's timeline file.
+    Returns the event enriched with `ts` if it wasn't already set."""
+    paths.timeline_dir.mkdir(parents=True, exist_ok=True)
+    if "ts" not in event:
+        event = {**event, "ts": _iso_now()}
+    date = event["ts"][:10]
+    f = paths.timeline_dir / f"{date}.jsonl"
+    with open(f, "a", encoding="utf-8") as out:
+        out.write(json.dumps(event, separators=(",", ":")) + "\n")
+    return event
+
+
+class ChatRunner:
+    """One coordinator turn = one ChatRunner. Spawns `claude -p` with
+    stream-json output, parses each line into chat.assistant.delta /
+    tool.use / tool.result events on the WS, and emits a final
+    `chat.assistant.final` when the child exits.
+
+    Cancel-safe: cancel() sends SIGTERM to the process group; if still
+    alive after 30 s, SIGKILL."""
+
+    def __init__(
+        self,
+        *,
+        paths: "Paths",
+        cluster: "Cluster",
+        hub: "Hub",
+        identity: str,
+        conv: str,
+        prompt: str,
+    ):
+        self.paths = paths
+        self.cluster = cluster
+        self.hub = hub
+        self.identity = identity
+        self.conv = conv
+        self.prompt = prompt
+        self.stream_id = f"s_{int(time.time()*1000):x}_{secrets.token_hex(2)}"
+        self.pid: Optional[int] = None
+        self.proc: Any = None  # subprocess.Popen
+        self.done = threading.Event()
+        self.cancelled = False
+        self._cumulative_text = ""
+
+    def _briefing(self) -> str:
+        history = _conversation_history(self.paths, self.conv)
+        history_block = ("Recent turns in this conversation:\n"
+                         + "\n".join(history) + "\n") if history else ""
+        try:
+            port = int(self.paths.port_file.read_text().strip())
+        except (OSError, ValueError):
+            port = 5570
+        return "\n".join([
+            f"You are the coordinator agent for a MeshKore cluster at {self.paths.root}.",
+            f"Identity: {self.identity}. Conversation id: {self.conv}.",
+            "",
+            "Read these before deciding what to do (in order, only what you need):",
+            "  • https://meshkore.com/cluster/operate — operator manual",
+            "  • .meshkore/docs/conventions/versioning.md — commits + versions",
+            "  • .meshkore/docs/conventions/context-workflow.md — every-change checklist",
+            "  • .meshkore/modules/<module>/{README.md,tasks/,log/} — per-module work",
+            "",
+            "Hard rules:",
+            "  • Don't push to git unless the user explicitly asks.",
+            f"  • Don't invent version numbers; ask POST localhost:{port}/version/next.",
+            "  • Never edit .meshkore/credentials/, .meshkore/.runtime/ or generated state.json.",
+            "  • Reply concisely. The portal renders your stdout as the chat answer.",
+            "",
+            history_block,
+            "User just said:",
+            self.prompt,
+            "",
+            'If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you\'re picking and why before doing the work.',
+        ])
+
+    def spawn(self) -> None:
+        import subprocess
+        claude_bin = _find_claude()
+        if not claude_bin:
+            err = "claude CLI not found — install via `npm i -g @anthropic-ai/claude-code`"
+            _log(err)
+            self.hub.broadcast(_append_timeline(self.paths, {
+                "type": "chat.assistant.final",
+                "author": self.identity,
+                "conv": self.conv,
+                "stream_id": self.stream_id,
+                "text": f"[runner error] {err}",
+            }))
+            self.done.set()
+            return
+        args = [
+            claude_bin, "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--permission-mode", "bypassPermissions",
+            self._briefing(),
+        ]
+        env = {**os.environ,
+               "MESHKORE_IDENTITY": self.identity,
+               "MESHKORE_CONV": self.conv}
+        self.proc = subprocess.Popen(
+            args,
+            cwd=str(self.paths.root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.pid = self.proc.pid
+        self.hub.broadcast({
+            "type": "task.started",
+            "id": f"chat:{self.conv}",
+            "agent": self.identity,
+            "ts": _iso_now(),
+            "runner": "claude-code",
+            "conv": self.conv,
+            "stream_id": self.stream_id,
+        })
+        # Empty assistant bubble so the cockpit shows progress immediately.
+        self.hub.broadcast({
+            "type": "chat.assistant.delta",
+            "author": self.identity,
+            "conv": self.conv,
+            "stream_id": self.stream_id,
+            "text": "",
+            "ts": _iso_now(),
+        })
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+
+    def cancel(self) -> None:
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            def _hard_kill():
+                if self.proc and self.proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+            threading.Timer(30.0, _hard_kill).start()
+
+    def _reader_loop(self) -> None:
+        assert self.proc and self.proc.stdout
+        last_emit_at = 0.0
+        result_text = ""
+        for raw in self.proc.stdout:
+            try:
+                line = raw.decode("utf-8", "replace").strip()
+            except Exception:
+                continue
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            ev_type = ev.get("type")
+            if ev_type == "stream_event":
+                inner = ev.get("event") or {}
+                if (inner.get("type") == "content_block_delta"
+                        and (inner.get("delta") or {}).get("type") == "text_delta"):
+                    delta = (inner.get("delta") or {}).get("text") or ""
+                    if delta:
+                        self._cumulative_text += delta
+                        now = time.monotonic()
+                        if now - last_emit_at > 0.2:
+                            last_emit_at = now
+                            self.hub.broadcast({
+                                "type": "chat.assistant.delta",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "text": self._cumulative_text[:16000],
+                                "ts": _iso_now(),
+                            })
+                elif (inner.get("type") == "content_block_start"
+                      and (inner.get("content_block") or {}).get("type") == "tool_use"):
+                    cb = inner.get("content_block") or {}
+                    self.hub.broadcast({
+                        "type": "tool.use",
+                        "author": self.identity,
+                        "conv": self.conv,
+                        "stream_id": self.stream_id,
+                        "tool": cb.get("name"),
+                        "input": cb.get("input"),
+                        "ts": _iso_now(),
+                    })
+                continue
+            if ev_type == "user":
+                for c in (ev.get("message") or {}).get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        self.hub.broadcast({
+                            "type": "tool.result",
+                            "author": self.identity,
+                            "conv": self.conv,
+                            "stream_id": self.stream_id,
+                            "ok": not c.get("is_error"),
+                            "ts": _iso_now(),
+                        })
+                continue
+            if ev_type == "result" and isinstance(ev.get("result"), str):
+                result_text = ev["result"]
+        # Finalize
+        final_text = result_text or self._cumulative_text
+        self.hub.broadcast(_append_timeline(self.paths, {
+            "type": "chat.assistant.final",
+            "author": self.identity,
+            "conv": self.conv,
+            "stream_id": self.stream_id,
+            "text": final_text,
+        }))
+        self.hub.broadcast({
+            "type": "task.finished",
+            "id": f"chat:{self.conv}",
+            "ts": _iso_now(),
+            "exit": self.proc.wait() if self.proc else None,
+            "conv": self.conv,
+        })
+        self.done.set()
+
+
+class ChatSessions:
+    """conv → active runner + pending buffer. Same mid-turn-merge
+    protocol as Node's chatSessions: a second prompt while running
+    gets concatenated and runs as the next turn automatically."""
+
+    def __init__(self) -> None:
+        self._s: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def has(self, conv: str) -> bool:
+        with self._lock:
+            return conv in self._s
+
+    def queue(self, conv: str, text: str) -> int:
+        with self._lock:
+            sess = self._s.get(conv)
+            if not sess:
+                return 0
+            sess["pending"].append(text)
+            return len(sess["pending"])
+
+    def start(self, conv: str, runner: ChatRunner, on_chain) -> None:
+        with self._lock:
+            self._s[conv] = {"runner": runner, "pending": [], "cancelled": False}
+        def _wait():
+            runner.done.wait()
+            with self._lock:
+                sess = self._s.get(conv)
+                if not sess:
+                    return
+                if sess["cancelled"] or not sess["pending"]:
+                    self._s.pop(conv, None)
+                    return
+                pending = sess["pending"]
+                sess["pending"] = []
+            merged = (pending[0] if len(pending) == 1
+                      else "Several follow-up instructions while you were working:\n\n"
+                           + "\n\n".join(f"{i+1}. {t}" for i, t in enumerate(pending)))
+            on_chain(conv, merged)
+        threading.Thread(target=_wait, daemon=True).start()
+
+    def cancel(self, conv: str) -> Tuple[bool, int]:
+        with self._lock:
+            sess = self._s.pop(conv, None)
+        if not sess:
+            return False, 0
+        sess["cancelled"] = True
+        dropped = len(sess["pending"])
+        try:
+            sess["runner"].cancel()
+        except Exception:
+            pass
+        return True, dropped
+
+
+# ───────────────────────────────────────────────────────────────────────
 # State manager — caches state + polls FS for changes
 
 
@@ -831,7 +1182,65 @@ def make_handler(daemon: "Daemon"):
                 self._json(200, {"ok": True, "shutting_down": True, "ts": _iso_now()})
                 threading.Thread(target=daemon.request_shutdown, daemon=True).start()
                 return
+
+            # All other POSTs need auth.
+            if self._need_auth(): return
+
+            # U-DAEMON-06: chat dispatch + cancel.
+            if p == "/chat/dispatch":
+                return self._json(*daemon.chat_dispatch(self._read_json_body()))
+            if p == "/chat/cancel":
+                return self._json(*daemon.chat_cancel(self._read_json_body()))
+
+            # U-DAEMON-09: simple message append + version stubs.
+            if p == "/messages":
+                return self._json(*daemon.append_message(self._read_json_body()))
+            if p == "/version/next":
+                return self._json(501, {
+                    "error": "version coordinator not implemented yet",
+                    "see": "modules/daemon/tasks/V20-version-coordinator.md",
+                })
+
+            # U-DAEMON-04: task lifecycle.
+            if p == "/tasks":
+                return self._json(*daemon.task_create(self._read_json_body()))
+            if p.startswith("/tasks/") and p.endswith("/transition"):
+                tid = p[len("/tasks/"):-len("/transition")]
+                return self._json(*daemon.task_transition(tid, self._read_json_body()))
+            if p.startswith("/tasks/") and p.endswith("/cancel"):
+                tid = p[len("/tasks/"):-len("/cancel")]
+                return self._json(*daemon.task_cancel(tid))
+            if p.startswith("/tasks/") and p.endswith("/dispatch"):
+                # U-DAEMON-07 territory — spawn a runner for a task.
+                # Stub for now: return 501 so cockpit shows a clear error.
+                return self._json(501, {
+                    "error": "task dispatch (runner) not implemented yet",
+                    "hint": "follows U-DAEMON-07 worker pool port",
+                })
+
+            # U-DAEMON-03 finish: declare a new agent.
+            if p == "/agents":
+                return self._json(*daemon.agent_create(self._read_json_body()))
+
+            # U-DAEMON-07 + 08: workers + admission stubs.
+            if p == "/workers":
+                return self._json(501, {"error": "worker pool not implemented yet"})
+            if p.startswith("/admission/"):
+                return self._json(501, {"error": "admission flow not implemented yet"})
+
             return self._json(404, {"error": "not found", "path": p})
+
+        # ── helpers used by do_POST handlers ───────────────────────────
+        def _read_json_body(self) -> Dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > MAX_BODY_BYTES:
+                return {}
+            try:
+                raw = self.rfile.read(length).decode("utf-8")
+                data = json.loads(raw) if raw else {}
+                return data if isinstance(data, dict) else {}
+            except (json.JSONDecodeError, OSError):
+                return {}
 
         # ── WebSocket handshake + run-loop ─────────────────────────────
         def _handle_ws(self) -> None:
@@ -917,8 +1326,170 @@ class Daemon:
         self.port            = _pick_port(paths, requested_port or self.cluster.architect_port)
         self.hub             = Hub()
         self.state_manager   = StateManager(paths, self.cluster, self.hub)
+        self.chat_sessions   = ChatSessions()
         self.stopping        = threading.Event()
         self.server: Optional[ThreadingHTTPServer] = None
+
+    # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
+    def _spawn_chat_turn(self, conv: str, prompt: str) -> ChatRunner:
+        """Start one chat turn. Wires the chain so a buffered next
+        prompt re-spawns automatically when the current turn finishes."""
+        runner = ChatRunner(
+            paths=self.paths, cluster=self.cluster, hub=self.hub,
+            identity=self.identity, conv=conv, prompt=prompt,
+        )
+        runner.spawn()
+        self.chat_sessions.start(conv, runner, on_chain=self._spawn_chat_turn)
+        return runner
+
+    def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return 400, {"error": "text required"}
+        author = str(body.get("author") or self.identity)
+        conv = str(body.get("conv") or f"chat-{_iso_now()[:16].replace(':', '-').replace('T', '-').lower()}")
+        # 1) Emit + persist the user event right away.
+        ev = _append_timeline(self.paths, {
+            "type": "chat.user", "author": author, "text": text, "conv": conv,
+        })
+        self.hub.broadcast(ev)
+        # 2) Queue if a turn is already running for this conv.
+        if self.chat_sessions.has(conv):
+            pending = self.chat_sessions.queue(conv, text)
+            return 202, {
+                "queued": True, "conv": conv, "pending": pending,
+                "message": "turn in progress — your prompt will be merged into the next turn",
+            }
+        # 3) New turn.
+        try:
+            runner = self._spawn_chat_turn(conv, text)
+        except Exception as e:
+            return 400, {"error": str(e)}
+        return 202, {
+            "conv": conv, "runner": "claude-code",
+            "identity": self.identity, "pid": runner.pid,
+            "stream_id": runner.stream_id,
+        }
+
+    def chat_cancel(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        conv = str(body.get("conv") or "").strip()
+        if not conv:
+            return 400, {"error": "conv required"}
+        cancelled, dropped = self.chat_sessions.cancel(conv)
+        if not cancelled:
+            return 200, {"ok": True, "cancelled": False,
+                         "reason": "no active turn for that conv"}
+        self.hub.broadcast({
+            "type": "chat.cancelled", "conv": conv,
+            "ts": _iso_now(), "dropped_pending": dropped,
+        })
+        return 200, {"ok": True, "cancelled": True, "dropped_pending": dropped}
+
+    # ── U-DAEMON-09: message append + version stubs ────────────────────
+    def append_message(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return 400, {"error": "text required"}
+        author = str(body.get("author") or self.identity)
+        conv = str(body.get("conv") or "general")
+        ev = _append_timeline(self.paths, {
+            "type": "message", "author": author, "text": text, "conv": conv,
+        })
+        self.hub.broadcast(ev)
+        return 201, ev
+
+    # ── U-DAEMON-04: task lifecycle ────────────────────────────────────
+    def task_create(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        module = str(body.get("module") or "general").strip().replace("/", "")
+        title = str(body.get("title") or "").strip()
+        if not title:
+            return 400, {"error": "title required"}
+        status = str(body.get("status") or "next")
+        priority = str(body.get("priority") or "medium")
+        category = str(body.get("category") or module)
+        tags = body.get("tags") or []
+        depends_on = body.get("depends_on") or []
+        body_md = str(body.get("body") or f"# {title}\n\n_New task — fill in._\n")
+        # Pick the next id in the module.
+        tasks_dir = self.paths.modules_dir / module / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        # Heuristic id: T{N} where N is the highest existing + 1.
+        max_n = 0
+        for f in tasks_dir.glob("T*.md"):
+            m = re.match(r"T(\d+)", f.name)
+            if m:
+                try:
+                    max_n = max(max_n, int(m.group(1)))
+                except ValueError:
+                    pass
+        tid = f"T{max_n + 1:03d}"
+        slug = re.sub(r"[^a-z0-9-]+", "-", title.lower())[:60].strip("-")
+        fname = f"{tid}-{slug}.md" if slug else f"{tid}.md"
+        target = tasks_dir / fname
+        frontmatter = "\n".join([
+            "---",
+            f"id: {tid}",
+            f'title: "{title}"',
+            f"status: {status}",
+            f"priority: {priority}",
+            f"category: {category}",
+            f"owner: {self.identity}",
+            f"created: {_iso_now()[:10]}",
+            f"updated: {_iso_now()[:10]}",
+            f"tags: {json.dumps(tags)}",
+            f"depends_on: {json.dumps(depends_on)}",
+            "---",
+            "",
+            body_md,
+        ])
+        target.write_text(frontmatter)
+        self.state_manager.rebuild(broadcast=True)
+        return 201, {"id": tid, "path": str(target.relative_to(self.paths.root))}
+
+    def task_transition(self, tid: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        to = str(body.get("to") or "").strip()
+        valid = {"backlog", "next", "in_progress", "active", "blocked", "done"}
+        if to not in valid:
+            return 400, {"error": f"to must be one of {sorted(valid)}"}
+        path = self._find_task(tid)
+        if not path:
+            return 404, {"error": f"task {tid} not found"}
+        text = path.read_text()
+        new = re.sub(r"^status:\s*\S+\s*$", f"status: {to}", text, count=1, flags=re.M)
+        if new == text:
+            new = re.sub(r"^---\s*$\n", f"---\nstatus: {to}\n", text, count=1, flags=re.M)
+        path.write_text(new)
+        self.state_manager.rebuild(broadcast=True)
+        return 200, {"id": tid, "from": "?", "to": to, "path": str(path.relative_to(self.paths.root))}
+
+    def task_cancel(self, tid: str) -> Tuple[int, Dict[str, Any]]:
+        # No active runner yet (dispatch is stubbed); this just transitions to blocked.
+        return self.task_transition(tid, {"to": "blocked"})
+
+    def _find_task(self, tid: str) -> Optional[Path]:
+        for f in self.paths.modules_dir.rglob(f"{tid}*.md"):
+            return f
+        return None
+
+    # ── U-DAEMON-03 finish: declare a new agent identity ───────────────
+    def agent_create(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        aid = str(body.get("id") or "").strip()
+        if not re.match(r"^[a-z][a-z0-9-]{1,40}$", aid):
+            return 400, {"error": "id must be lowercase kebab, 2-41 chars"}
+        self.paths.agents_dir.mkdir(parents=True, exist_ok=True)
+        target = self.paths.agents_dir / f"{aid}.yaml"
+        if target.exists():
+            return 409, {"error": f"agent {aid} already declared"}
+        kind = str(body.get("kind") or "operator")
+        permissions = str(body.get("permissions") or "edits")
+        target.write_text(
+            f"# Declared via POST /agents on {_iso_now()}\n"
+            f"id: {aid}\n"
+            f"kind: {kind}\n"
+            f"permissions: {permissions}\n"
+        )
+        self.state_manager.rebuild(broadcast=True)
+        return 201, {"id": aid, "path": str(target.relative_to(self.paths.root))}
 
     # ── HTTP body for /health and /info ────────────────────────────────
     def health(self) -> Dict[str, Any]:
@@ -947,18 +1518,24 @@ class Daemon:
             "health",
             "state", "state.subset",            # U-DAEMON-02
             "reload",
-            "agents",                            # basic listing
-            "events",                            # WS heartbeats + state.rebuilt
-            "files.docs", "files.modules", "files.tasks",  # U-DAEMON-02 file serve
-            "credentials",                       # U-DAEMON-02 (list-only, no contents)
+            "agents", "agents.create",          # U-DAEMON-02 + 03
+            "events",                            # WS hub + chat.* + task.* + tool.*
+            "files.docs", "files.modules", "files.tasks",  # U-DAEMON-02
+            "credentials",                       # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
+            # U-DAEMON-04 task lifecycle (dispatch is stubbed, marked separately)
+            "tasks.create", "tasks.transition", "tasks.cancel",
+            # U-DAEMON-05 + 06 chat coordinator
+            "chat", "chat.cancel",
+            # U-DAEMON-09 misc
+            "messages",
         ]
-        # Cron schema is present (D-CRON-01); scheduler tick / API
-        # comes with D-CRON-02..04. Advertise the schema-level feature
-        # so the cockpit knows the cluster.yaml validation is live.
         if hasattr(self.cluster, "crons"):
             feats.append("cron.schema")
+        # Stubs — advertised separately so the cockpit can show
+        # "not yet" badges without trying the endpoint.
+        feats.extend(["stub.workers", "stub.admission", "stub.tasks.dispatch", "stub.version.next"])
         return feats
 
     def info(self) -> Dict[str, Any]:
