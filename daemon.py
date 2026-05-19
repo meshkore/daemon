@@ -88,6 +88,139 @@ class Paths:
         self.state_json   = self.roadmap_dir / "state.json"
         self.agents_dir   = self.meshkore / "agents"
         self.initiatives  = self.roadmap_dir / "initiatives"
+        # Cron scheduler (D-CRON-01..05). State file is gitignored
+        # under .meshkore/.runtime/; the logs dir holds per-run captures.
+        self.crons_state_path = self.runtime / "crons.json"
+        self.crons_logs_dir   = self.runtime / "logs" / "cron"
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Cron scheduler — schema (D-CRON-01)
+#
+# Job definitions live in `cluster.yaml.crons:` (committed, travels with
+# the repo). Runtime state lives in `.meshkore/.runtime/crons.json`
+# (gitignored, per-machine). Only the daemon whose `device_id` matches
+# `cluster.yaml.crons_owner` fires jobs; peers tick + emit
+# `cron.would_have_fired` events. See
+# `.meshkore/docs/conventions/cluster-yaml-crons.md` for the full
+# schema reference and `.meshkore/docs/architecture/daemon.md` for the
+# tick-loop diagram.
+
+# Allowed values — typed as plain string sets so we keep stdlib-only.
+_CRON_RUN_STATUSES = frozenset({
+    "pending", "running", "ok", "failed", "interrupted", "timeout",
+})
+_CRON_RESTART_POLICIES = frozenset({"never", "on-failure", "always"})
+
+# Defaults applied when a `crons:` entry omits the field.
+_CRON_DEFAULTS = {
+    "enabled":         True,
+    "max_runtime_sec": 7200,        # 2h
+    "restart_policy":  "never",
+    "retention_runs":  30,
+    "destructive":     False,
+}
+
+
+def _validate_cron_expr(expr: str) -> Optional[str]:
+    """Lightweight validation. Full parsing lands in D-CRON-02. Here we
+    only need to reject obviously malformed values at config load so the
+    daemon doesn't carry junk into the scheduler later.
+
+    Returns None on OK, or a short error message string on reject.
+    Accepts 5 space-separated fields. Each field is non-empty and
+    consists of characters from [0-9*/,\\-]. Quartz (6 fields with
+    seconds), `@daily`-style aliases, and the `L/W/#` modifiers are
+    explicitly NOT supported in v1.
+    """
+    if not isinstance(expr, str) or not expr.strip():
+        return "schedule must be a non-empty string"
+    fields = expr.strip().split()
+    if len(fields) != 5:
+        return f"schedule must have 5 space-separated fields, got {len(fields)}"
+    allowed = set("0123456789*/,-")
+    for i, f in enumerate(fields):
+        if not f:
+            return f"schedule field {i} is empty"
+        if not set(f).issubset(allowed):
+            return f"schedule field {i} ({f!r}) contains unsupported characters"
+    return None
+
+
+def _validate_crons_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Validates the `crons:` section of cluster.yaml in isolation.
+    Returns (cleaned_jobs, errors). Bad entries are skipped (not raised)
+    so a single broken job doesn't disable the entire scheduler.
+
+    Each returned job has defaults filled in and the schema's shape
+    enforced. Invariants:
+      - id is a non-empty kebab-case string, unique within the list
+      - cmd is non-empty string
+      - schedule passes _validate_cron_expr
+      - restart_policy is in _CRON_RESTART_POLICIES
+      - env values are strings
+    """
+    raw = data.get("crons") or []
+    if not isinstance(raw, list):
+        return [], ["crons: must be a list"]
+    out: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_ids: set = set()
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            errors.append(f"crons[{idx}] is not a dict — skipped")
+            continue
+        cid = entry.get("id")
+        if not isinstance(cid, str) or not cid.strip():
+            errors.append(f"crons[{idx}] missing id — skipped")
+            continue
+        cid = cid.strip()
+        if cid in seen_ids:
+            errors.append(f"crons[{idx}] duplicate id {cid!r} — skipped")
+            continue
+        cmd = entry.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            errors.append(f"crons[{cid}] missing cmd — skipped")
+            continue
+        sched = entry.get("schedule")
+        sched_err = _validate_cron_expr(sched) if isinstance(sched, str) else "schedule missing"
+        if sched_err:
+            errors.append(f"crons[{cid}] {sched_err} — skipped")
+            continue
+        policy = entry.get("restart_policy", _CRON_DEFAULTS["restart_policy"])
+        if policy not in _CRON_RESTART_POLICIES:
+            errors.append(
+                f"crons[{cid}] restart_policy={policy!r} not in "
+                f"{sorted(_CRON_RESTART_POLICIES)} — defaulting to 'never'"
+            )
+            policy = "never"
+        env = entry.get("env") or {}
+        if not isinstance(env, dict):
+            errors.append(f"crons[{cid}] env must be a dict — replaced with empty")
+            env = {}
+        env_clean: Dict[str, str] = {}
+        for k, v in env.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                errors.append(f"crons[{cid}] env {k!r}: values must be strings — dropped")
+                continue
+            env_clean[k] = v
+
+        cleaned = {
+            "id":              cid,
+            "name":            str(entry.get("name") or cid),
+            "schedule":        sched.strip(),
+            "cmd":             cmd.strip(),
+            "cwd":             entry.get("cwd"),
+            "env":             env_clean,
+            "enabled":         bool(entry.get("enabled", _CRON_DEFAULTS["enabled"])),
+            "max_runtime_sec": int(entry.get("max_runtime_sec", _CRON_DEFAULTS["max_runtime_sec"])),
+            "restart_policy":  policy,
+            "retention_runs":  int(entry.get("retention_runs", _CRON_DEFAULTS["retention_runs"])),
+            "destructive":     bool(entry.get("destructive", _CRON_DEFAULTS["destructive"])),
+        }
+        out.append(cleaned)
+        seen_ids.add(cid)
+    return out, errors
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -242,6 +375,11 @@ class Cluster:
     def __init__(self, paths: Paths):
         self.paths = paths
         self.data: Dict[str, Any] = {}
+        # Cron scheduler (D-CRON-01): validated job set + ownership.
+        # Populated by reload(); empty + None until a `crons:` block
+        # appears in cluster.yaml.
+        self.crons: List[Dict[str, Any]] = []
+        self.crons_owner: Optional[str] = None
         self.reload()
 
     def reload(self) -> None:
@@ -252,6 +390,15 @@ class Cluster:
                 "\n   https://meshkore.com/reference/cluster/templates/) and re-run.\n"
             )
         self.data = parse_simple_yaml(self.paths.cluster_yaml.read_text())
+        # Validate the cron block last so a bad config logs warnings but
+        # never blocks the daemon's other features.
+        self.crons, errs = _validate_crons_block(self.data)
+        for e in errs:
+            _log(f"cluster.yaml crons: {e}")
+        owner = self.data.get("crons_owner")
+        self.crons_owner = owner.strip() if isinstance(owner, str) and owner.strip() else None
+        if self.crons and not self.crons_owner:
+            _log("cluster.yaml has crons: but no crons_owner — scheduler will tick but never fire")
 
     @property
     def id(self) -> str:        return str(self.data.get("id") or "unknown")
