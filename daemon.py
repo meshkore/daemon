@@ -750,6 +750,14 @@ def make_handler(daemon: "Daemon"):
                 return self._json(200, daemon.health())
             if p == "/state":
                 return self._json(200, daemon.state_manager.state())
+            # U-DAEMON-02: subset reads. Matches Node's contract:
+            # GET /state/cluster, /state/modules, /state/roadmap, etc.
+            if p.startswith("/state/"):
+                sub = p[len("/state/"):].strip("/")
+                state = daemon.state_manager.state()
+                if sub in state:
+                    return self._json(200, state[sub])
+                return self._json(404, {"error": "unknown subset", "subset": sub})
             if p == "/reload":
                 if self._need_auth(): return
                 daemon.state_manager.rebuild(broadcast=True)
@@ -758,7 +766,63 @@ def make_handler(daemon: "Daemon"):
                 return self._json(200, daemon.agents_listing())
             if p == "/info":
                 return self._json(200, daemon.info())
+            # U-DAEMON-02: read-only file serve under .meshkore/ for
+            # docs, modules, and roadmap (the URL says `/tasks/` to
+            # match Node's contract — but it serves from
+            # .meshkore/roadmap/, which is where tasks live).
+            if p.startswith("/docs/"):
+                if self._need_auth(): return
+                return self._serve_meshkore_file(daemon.paths.docs_dir, p[len("/docs/"):])
+            if p.startswith("/modules/"):
+                if self._need_auth(): return
+                return self._serve_meshkore_file(daemon.paths.modules_dir, p[len("/modules/"):])
+            if p.startswith("/tasks/"):
+                if self._need_auth(): return
+                return self._serve_meshkore_file(daemon.paths.roadmap_dir, p[len("/tasks/"):])
+            # U-DAEMON-02: credentials listing — names only, never
+            # contents. Matches Node's response shape.
+            if p == "/credentials":
+                if self._need_auth(): return
+                return self._json(200, daemon.credentials_listing())
             return self._json(404, {"error": "not found", "path": p})
+
+        def _serve_meshkore_file(self, root: Path, rel: str) -> None:
+            """Read a single text file rooted at one of the .meshkore/
+            subtrees. Rejects path traversal absolutely — the resolved
+            path must be a subpath of `root`, after URL-decoding."""
+            rel = urllib.parse.unquote(rel)
+            # Cheap-but-thorough traversal defence: reject any segment
+            # that contains '..' or starts with '/', plus check the
+            # resolved path is inside `root`.
+            if ".." in rel.split("/") or rel.startswith("/"):
+                return self._json(400, {"error": "path traversal"})
+            target = (root / rel).resolve()
+            try:
+                target.relative_to(root.resolve())
+            except ValueError:
+                return self._json(400, {"error": "path traversal"})
+            if not target.is_file():
+                return self._json(404, {"error": "not found", "path": rel})
+            try:
+                body = target.read_bytes()
+            except OSError as e:
+                return self._json(500, {"error": str(e)})
+            # Content-Type from extension. Default to markdown since the
+            # vast majority of these files are .md.
+            ext = target.suffix.lower()
+            ctype = {
+                ".md":   "text/markdown; charset=utf-8",
+                ".json": "application/json; charset=utf-8",
+                ".yaml": "text/yaml; charset=utf-8",
+                ".yml":  "text/yaml; charset=utf-8",
+                ".txt":  "text/plain; charset=utf-8",
+            }.get(ext, "text/markdown; charset=utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):  # noqa: N802
             p, _ = self._path()
@@ -864,11 +928,38 @@ class Daemon:
             "port":         self.port,
             "mode":         "server",
             "implementation": "python",
+            "version":      DAEMON_VERSION,
             "cluster_id":   self.cluster.id,
             "cluster_name": self.cluster.name,
             "cluster_type": self.cluster.type,
+            # U-DAEMON-01: capability advertisement.
+            # During the Node→Python unification (initiative
+            # `unified-python-daemon`), the cockpit reads this array
+            # to route each call to the daemon that supports the
+            # feature. Adding an endpoint here is part of the
+            # acceptance criteria for that endpoint's port task.
+            "features":     self._features(),
             "ts":           _iso_now(),
         }
+
+    def _features(self) -> List[str]:
+        feats = [
+            "health",
+            "state", "state.subset",            # U-DAEMON-02
+            "reload",
+            "agents",                            # basic listing
+            "events",                            # WS heartbeats + state.rebuilt
+            "files.docs", "files.modules", "files.tasks",  # U-DAEMON-02 file serve
+            "credentials",                       # U-DAEMON-02 (list-only, no contents)
+            "info",
+            "shutdown",
+        ]
+        # Cron schema is present (D-CRON-01); scheduler tick / API
+        # comes with D-CRON-02..04. Advertise the schema-level feature
+        # so the cockpit knows the cluster.yaml validation is live.
+        if hasattr(self.cluster, "crons"):
+            feats.append("cron.schema")
+        return feats
 
     def info(self) -> Dict[str, Any]:
         h = self.health()
@@ -880,17 +971,55 @@ class Daemon:
         return h
 
     def agents_listing(self) -> List[Dict[str, Any]]:
+        # U-DAEMON-02: matches Node's shape including pid + online so
+        # the cockpit's Network tab works against either daemon.
         if not self.paths.agents_dir.exists():
             return []
+        runtime_agents = self.paths.runtime / "agents"
         out = []
         for yml in sorted(self.paths.agents_dir.glob("*.yaml")):
             try:
                 data = parse_simple_yaml(yml.read_text())
             except OSError:
                 continue
+            pid_file = runtime_agents / f"{yml.stem}.pid"
+            pid: Optional[int] = None
+            online = False
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    # Crude liveness check — os.kill(pid, 0) raises if no such pid
+                    os.kill(pid, 0)
+                    online = True
+                except (OSError, ValueError):
+                    pid = None
             out.append({
-                "id":     yml.stem,
-                "data":   data,
+                "id":       yml.stem,
+                "identity": yml.stem,           # alias, matches Node
+                "pid":      pid,
+                "online":   online,
+                "data":     data,
+            })
+        return out
+
+    def credentials_listing(self) -> List[Dict[str, Any]]:
+        """Names + sizes of every file in .meshkore/credentials/.
+        Never the contents — the cockpit only needs to know what
+        exists, never what's in them. Same security stance as Node."""
+        if not self.paths.credentials.exists():
+            return []
+        out = []
+        for f in sorted(self.paths.credentials.iterdir()):
+            if f.name.startswith("."):
+                continue
+            try:
+                size = f.stat().st_size if f.is_file() else None
+            except OSError:
+                size = None
+            out.append({
+                "name":      f.name,
+                "size":      size,
+                "is_symlink": f.is_symlink(),
             })
         return out
 
