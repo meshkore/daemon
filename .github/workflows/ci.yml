@@ -1,0 +1,59 @@
+# MeshKore Quality Gates — L2 — Python
+#
+# meshkore-quality-gates: v1
+# stack: python
+
+name: meshkore/quality-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install ruff + (optional) mypy
+        run: pip install --quiet ruff mypy
+
+      - name: Install project deps (if pyproject.toml or requirements.txt)
+        run: |
+          if [ -f pyproject.toml ]; then pip install --quiet -e . || true; fi
+          if [ -f requirements.txt ]; then pip install --quiet -r requirements.txt; fi
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check (if mypy config present)
+        run: |
+          if [ -f mypy.ini ] || grep -q '\[tool.mypy\]' pyproject.toml 2>/dev/null; then
+            mypy .
+          else
+            echo "no mypy config; skipping"
+          fi
+
+      - name: Test
+        run: |
+          if [ -d tests ] || ls -1 test_*.py 2>/dev/null | head -1 | grep -q .; then
+            pip install --quiet pytest
+            pytest -q
+          else
+            echo "no tests; skipping"
+          fi
+
+      - name: Secrets scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
