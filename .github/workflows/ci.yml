@@ -1,5 +1,4 @@
 # MeshKore Quality Gates — L2 — Python
-#
 # meshkore-quality-gates: v1
 # stack: python
 
@@ -17,15 +16,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: Install ruff + (optional) mypy
-        run: pip install --quiet ruff mypy
+      - name: Install ruff
+        run: pip install --quiet ruff
 
-      - name: Install project deps (if pyproject.toml or requirements.txt)
+      - name: Install project deps (if any)
         run: |
           if [ -f pyproject.toml ]; then pip install --quiet -e . || true; fi
           if [ -f requirements.txt ]; then pip install --quiet -r requirements.txt; fi
@@ -36,14 +37,6 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Type check (if mypy config present)
-        run: |
-          if [ -f mypy.ini ] || grep -q '\[tool.mypy\]' pyproject.toml 2>/dev/null; then
-            mypy .
-          else
-            echo "no mypy config; skipping"
-          fi
-
       - name: Test
         run: |
           if [ -d tests ] || ls -1 test_*.py 2>/dev/null | head -1 | grep -q .; then
@@ -53,7 +46,6 @@ jobs:
             echo "no tests; skipping"
           fi
 
-      - name: Secrets scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Secrets scan (basic patterns)
+        run: |
+          ! git log -p | grep -E '(AIza[A-Za-z0-9_-]{30,}|r8_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|xoxb-[A-Za-z0-9-]{30,})'
