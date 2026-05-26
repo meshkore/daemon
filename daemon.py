@@ -36,6 +36,7 @@ Endpoints:
 The token lives in `.meshkore/credentials/portal-token`. If it doesn't
 exist on first run we generate one (mode 0600).
 """
+
 from __future__ import annotations
 
 import base64
@@ -59,12 +60,12 @@ from typing import Any, Dict, List, Optional, Tuple
 # ───────────────────────────────────────────────────────────────────────
 # Configuration
 
-PORT_RANGE       = (5570, 5589)
-HEARTBEAT_SEC    = 20.0
-FS_POLL_SEC      = 1.5
-DAEMON_VERSION   = "py-1.0.0"
-MAX_BODY_BYTES   = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
-WS_GUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+PORT_RANGE = (5570, 5589)
+HEARTBEAT_SEC = 20.0
+FS_POLL_SEC = 1.5
+DAEMON_VERSION = "py-1.0.0"
+MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # ───────────────────────────────────────────────────────────────────────
 # Paths
@@ -72,32 +73,32 @@ WS_GUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 class Paths:
     def __init__(self, root: Path):
-        self.root         = root.resolve()
-        self.meshkore     = self.root / ".meshkore"
-        self.public       = self.meshkore / "public"
+        self.root = root.resolve()
+        self.meshkore = self.root / ".meshkore"
+        self.public = self.meshkore / "public"
         self.cluster_yaml = self.public / "cluster.yaml"
         # Standard §13 — deployment links registry. Optional file; the
         # registry treats a missing file as { version: 1, modules: [] }.
-        self.links_yaml   = self.public / "links.yaml"
+        self.links_yaml = self.public / "links.yaml"
         # Standard §14 — protocols (reusable multi-scope runbooks).
-        self.protocols_dir   = self.meshkore / "protocols"
-        self.protocols_log   = self.protocols_dir / "log"
-        self.credentials  = self.meshkore / "credentials"
-        self.token_file   = self.credentials / "portal-token"
-        self.runtime      = self.meshkore / ".runtime"
-        self.pid_file     = self.runtime / "daemon.pid"
-        self.port_file    = self.runtime / "port"
+        self.protocols_dir = self.meshkore / "protocols"
+        self.protocols_log = self.protocols_dir / "log"
+        self.credentials = self.meshkore / "credentials"
+        self.token_file = self.credentials / "portal-token"
+        self.runtime = self.meshkore / ".runtime"
+        self.pid_file = self.runtime / "daemon.pid"
+        self.port_file = self.runtime / "port"
         self.timeline_dir = self.meshkore / "timeline"
-        self.modules_dir  = self.meshkore / "modules"
-        self.docs_dir     = self.meshkore / "docs"
-        self.roadmap_dir  = self.meshkore / "roadmap"
-        self.state_json   = self.roadmap_dir / "state.json"
-        self.agents_dir   = self.meshkore / "agents"
-        self.initiatives  = self.roadmap_dir / "initiatives"
+        self.modules_dir = self.meshkore / "modules"
+        self.docs_dir = self.meshkore / "docs"
+        self.roadmap_dir = self.meshkore / "roadmap"
+        self.state_json = self.roadmap_dir / "state.json"
+        self.agents_dir = self.meshkore / "agents"
+        self.initiatives = self.roadmap_dir / "initiatives"
         # Cron scheduler (D-CRON-01..05). State file is gitignored
         # under .meshkore/.runtime/; the logs dir holds per-run captures.
         self.crons_state_path = self.runtime / "crons.json"
-        self.crons_logs_dir   = self.runtime / "logs" / "cron"
+        self.crons_logs_dir = self.runtime / "logs" / "cron"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -113,18 +114,25 @@ class Paths:
 # tick-loop diagram.
 
 # Allowed values — typed as plain string sets so we keep stdlib-only.
-_CRON_RUN_STATUSES = frozenset({
-    "pending", "running", "ok", "failed", "interrupted", "timeout",
-})
+_CRON_RUN_STATUSES = frozenset(
+    {
+        "pending",
+        "running",
+        "ok",
+        "failed",
+        "interrupted",
+        "timeout",
+    }
+)
 _CRON_RESTART_POLICIES = frozenset({"never", "on-failure", "always"})
 
 # Defaults applied when a `crons:` entry omits the field.
 _CRON_DEFAULTS = {
-    "enabled":         True,
-    "max_runtime_sec": 7200,        # 2h
-    "restart_policy":  "never",
-    "retention_runs":  30,
-    "destructive":     False,
+    "enabled": True,
+    "max_runtime_sec": 7200,  # 2h
+    "restart_policy": "never",
+    "retention_runs": 30,
+    "destructive": False,
 }
 
 
@@ -153,7 +161,9 @@ def _validate_cron_expr(expr: str) -> Optional[str]:
     return None
 
 
-def _validate_crons_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _validate_crons_block(
+    data: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Validates the `crons:` section of cluster.yaml in isolation.
     Returns (cleaned_jobs, errors). Bad entries are skipped (not raised)
     so a single broken job doesn't disable the entire scheduler.
@@ -189,7 +199,9 @@ def _validate_crons_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
             errors.append(f"crons[{cid}] missing cmd — skipped")
             continue
         sched = entry.get("schedule")
-        sched_err = _validate_cron_expr(sched) if isinstance(sched, str) else "schedule missing"
+        sched_err = (
+            _validate_cron_expr(sched) if isinstance(sched, str) else "schedule missing"
+        )
         if sched_err:
             errors.append(f"crons[{cid}] {sched_err} — skipped")
             continue
@@ -207,22 +219,30 @@ def _validate_crons_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
         env_clean: Dict[str, str] = {}
         for k, v in env.items():
             if not isinstance(k, str) or not isinstance(v, str):
-                errors.append(f"crons[{cid}] env {k!r}: values must be strings — dropped")
+                errors.append(
+                    f"crons[{cid}] env {k!r}: values must be strings — dropped"
+                )
                 continue
             env_clean[k] = v
 
         cleaned = {
-            "id":              cid,
-            "name":            str(entry.get("name") or cid),
-            "schedule":        sched.strip(),
-            "cmd":             cmd.strip(),
-            "cwd":             entry.get("cwd"),
-            "env":             env_clean,
-            "enabled":         bool(entry.get("enabled", _CRON_DEFAULTS["enabled"])),
-            "max_runtime_sec": int(entry.get("max_runtime_sec", _CRON_DEFAULTS["max_runtime_sec"])),
-            "restart_policy":  policy,
-            "retention_runs":  int(entry.get("retention_runs", _CRON_DEFAULTS["retention_runs"])),
-            "destructive":     bool(entry.get("destructive", _CRON_DEFAULTS["destructive"])),
+            "id": cid,
+            "name": str(entry.get("name") or cid),
+            "schedule": sched.strip(),
+            "cmd": cmd.strip(),
+            "cwd": entry.get("cwd"),
+            "env": env_clean,
+            "enabled": bool(entry.get("enabled", _CRON_DEFAULTS["enabled"])),
+            "max_runtime_sec": int(
+                entry.get("max_runtime_sec", _CRON_DEFAULTS["max_runtime_sec"])
+            ),
+            "restart_policy": policy,
+            "retention_runs": int(
+                entry.get("retention_runs", _CRON_DEFAULTS["retention_runs"])
+            ),
+            "destructive": bool(
+                entry.get("destructive", _CRON_DEFAULTS["destructive"])
+            ),
         }
         out.append(cleaned)
         seen_ids.add(cid)
@@ -261,8 +281,8 @@ def parse_simple_yaml(text: str) -> Dict[str, Any]:
             # just created as a nested holder for some key, convert it to
             # a list in the grandparent — we now know the value is a list.
             if isinstance(parent, dict) and not parent:
-                key   = stack[-1][2]
-                gp    = stack[-1][3]
+                key = stack[-1][2]
+                gp = stack[-1][3]
                 if key and isinstance(gp, dict) and gp.get(key) is parent:
                     new_list: List[Any] = []
                     gp[key] = new_list
@@ -277,7 +297,8 @@ def parse_simple_yaml(text: str) -> Dict[str, Any]:
                     parent.append(item)
                     # Treat the inline "key: val" as the first dict entry
                     k2, _, v2 = value.partition(":")
-                    k2 = k2.strip(); v2 = v2.strip()
+                    k2 = k2.strip()
+                    v2 = v2.strip()
                     if v2:
                         item[k2] = _coerce(_strip_inline_comment(v2))
                         stack.append((indent, item, "", parent))
@@ -288,7 +309,9 @@ def parse_simple_yaml(text: str) -> Dict[str, Any]:
                         stack.append((indent, item, "", parent))
                         stack.append((indent + 2, nested, k2, item))
                 else:
-                    parent.append(_coerce(_strip_inline_comment(value)) if value else None)
+                    parent.append(
+                        _coerce(_strip_inline_comment(value)) if value else None
+                    )
 
         elif ":" in stripped:
             key, _, val = stripped.partition(":")
@@ -302,7 +325,11 @@ def parse_simple_yaml(text: str) -> Dict[str, Any]:
             elif val.startswith("[") and val.endswith("]"):
                 # Inline list scalar: [a, b, "c d"]
                 inner = val[1:-1].strip()
-                items = [_coerce(x.strip()) for x in _split_top_level_commas(inner)] if inner else []
+                items = (
+                    [_coerce(x.strip()) for x in _split_top_level_commas(inner)]
+                    if inner
+                    else []
+                )
                 if isinstance(parent, dict):
                     parent[key] = items
             else:
@@ -325,11 +352,17 @@ def _split_top_level_commas(s: str) -> List[str]:
                 in_str = None
             continue
         if ch in ('"', "'"):
-            in_str = ch; buf += ch; continue
+            in_str = ch
+            buf += ch
+            continue
         if ch == "," and depth == 0:
-            out.append(buf); buf = ""; continue
-        if ch in "[{": depth += 1
-        elif ch in "]}": depth -= 1
+            out.append(buf)
+            buf = ""
+            continue
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
         buf += ch
     if buf.strip():
         out.append(buf)
@@ -340,7 +373,9 @@ def _coerce(v: str) -> Any:
     s = v.strip()
     if not s:
         return ""
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+    if (s.startswith('"') and s.endswith('"')) or (
+        s.startswith("'") and s.endswith("'")
+    ):
         return s[1:-1]
     if s.lower() in ("true", "yes"):
         return True
@@ -402,25 +437,38 @@ class Cluster:
         for e in errs:
             _log(f"cluster.yaml crons: {e}")
         owner = self.data.get("crons_owner")
-        self.crons_owner = owner.strip() if isinstance(owner, str) and owner.strip() else None
+        self.crons_owner = (
+            owner.strip() if isinstance(owner, str) and owner.strip() else None
+        )
         if self.crons and not self.crons_owner:
-            _log("cluster.yaml has crons: but no crons_owner — scheduler will tick but never fire")
+            _log(
+                "cluster.yaml has crons: but no crons_owner — scheduler will tick but never fire"
+            )
 
     @property
-    def id(self) -> str:        return str(self.data.get("id") or "unknown")
+    def id(self) -> str:
+        return str(self.data.get("id") or "unknown")
+
     @property
-    def name(self) -> str:      return str(self.data.get("name") or self.id)
+    def name(self) -> str:
+        return str(self.data.get("name") or self.id)
+
     @property
-    def type(self) -> str:      return str(self.data.get("type") or "dev")
+    def type(self) -> str:
+        return str(self.data.get("type") or "dev")
+
     @property
     def architect_port(self) -> Optional[int]:
         # cluster.yaml.architect.port (preferred) → fall back to legacy portal.port
         for key in ("architect", "portal"):
             sec = self.data.get(key)
             if isinstance(sec, dict) and "port" in sec:
-                try:    return int(sec["port"])
-                except: pass
+                try:
+                    return int(sec["port"])
+                except Exception:
+                    pass
         return None
+
     @property
     def modules(self) -> List[Dict[str, Any]]:
         m = self.data.get("modules") or []
@@ -436,14 +484,23 @@ class Cluster:
 # them at GET /links + /links/<id>, accepts patches at POST /links/<id>,
 # and broadcasts `links.updated` on the WebSocket.
 
-_LINKS_PROVIDERS = frozenset({
-    "fly", "cloudflare-pages", "cloudflare-workers",
-    "vercel", "render", "self-hosted", "other",
-})
+_LINKS_PROVIDERS = frozenset(
+    {
+        "fly",
+        "cloudflare-pages",
+        "cloudflare-workers",
+        "vercel",
+        "render",
+        "self-hosted",
+        "other",
+    }
+)
 _LINKS_BLOCKS = ("local", "prod", "repo")
 
 
-def _validate_links_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _validate_links_block(
+    data: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     errs: List[str] = []
     if not isinstance(data, dict):
         return [], ["links.yaml: top level must be a mapping"]
@@ -470,7 +527,9 @@ def _validate_links_block(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
             entry[blk] = v
         prov = (m.get("prod") or {}).get("provider")
         if isinstance(prov, str) and prov.strip() and prov not in _LINKS_PROVIDERS:
-            errs.append(f"links.yaml: {mid}.prod.provider `{prov}` is not in the canonical set (rendered as plain text)")
+            errs.append(
+                f"links.yaml: {mid}.prod.provider `{prov}` is not in the canonical set (rendered as plain text)"
+            )
         if "notes" in m:
             entry["notes"] = m["notes"]
         out.append(entry)
@@ -484,10 +543,10 @@ class LinksRegistry:
 
     def __init__(self, paths: Paths, hub: "Hub"):
         self.paths = paths
-        self.hub   = hub
+        self.hub = hub
         self.modules: List[Dict[str, Any]] = []
-        self.errors: List[str]            = []
-        self._mtime: Optional[float]      = None
+        self.errors: List[str] = []
+        self._mtime: Optional[float] = None
         self._stop = threading.Event()
         self.reload(broadcast=False)
         threading.Thread(target=self._watch_loop, daemon=True).start()
@@ -504,7 +563,6 @@ class LinksRegistry:
 
     def reload(self, broadcast: bool = True) -> bool:
         """Reread the file. Returns True if content changed."""
-        prev_sig = (tuple(sorted([m["id"] for m in self.modules])), self._mtime)
         if not self.paths.links_yaml.exists():
             changed = bool(self.modules) or self._mtime is not None
             self.modules, self.errors, self._mtime = [], [], None
@@ -528,14 +586,16 @@ class LinksRegistry:
         for e in errs:
             _log(f"links.yaml: {e}")
         if broadcast:
-            self.hub.broadcast({"type": "links.updated", "modules": [m["id"] for m in self.modules]})
+            self.hub.broadcast(
+                {"type": "links.updated", "modules": [m["id"] for m in self.modules]}
+            )
         return True
 
     def as_dict(self) -> Dict[str, Any]:
         return {
-            "version":  1,
-            "modules":  self.modules,
-            "_errors":  self.errors,
+            "version": 1,
+            "modules": self.modules,
+            "_errors": self.errors,
         }
 
     def get(self, mid: str) -> Optional[Dict[str, Any]]:
@@ -570,7 +630,8 @@ class LinksRegistry:
         found = None
         for m in mods:
             if isinstance(m, dict) and m.get("id") == mid:
-                found = m; break
+                found = m
+                break
         if found is None:
             found = {"id": mid}
             mods.append(found)
@@ -625,12 +686,15 @@ def _emit_links_yaml(data: Dict[str, Any]) -> str:
 
 
 def _emit_scalar(v: Any) -> str:
-    if v is None:        return '""'
-    if isinstance(v, bool): return "true" if v else "false"
-    if isinstance(v, (int, float)): return str(v)
+    if v is None:
+        return '""'
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
     s = str(v)
-    if s == "" or any(c in s for c in ':#"\''):
-        return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    if s == "" or any(c in s for c in ":#\"'"):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return s
 
 
@@ -644,7 +708,7 @@ def _emit_scalar(v: Any) -> str:
 # broadcasts `protocols.updated` on the WS.
 
 _PROTOCOL_FILE_RE = re.compile(r"^P(\d+)-[a-z0-9-]+\.md$")
-_PROTOCOL_LOG_RE  = re.compile(r"^(P\d+)-(\d{4}-\d{2}-\d{2})-[a-z0-9-]+\.md$")
+_PROTOCOL_LOG_RE = re.compile(r"^(P\d+)-(\d{4}-\d{2}-\d{2})-[a-z0-9-]+\.md$")
 
 
 def _split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
@@ -665,7 +729,7 @@ class ProtocolsRegistry:
 
     def __init__(self, paths: Paths, hub: "Hub"):
         self.paths = paths
-        self.hub   = hub
+        self.hub = hub
         # Each entry: { id, title, scope, status, updated, file, log_count }
         self.protocols: List[Dict[str, Any]] = []
         self._sig: str = ""
@@ -701,24 +765,26 @@ class ProtocolsRegistry:
                 fm, _body = _split_frontmatter(text)
                 pid = str(fm.get("id") or f"P{m.group(1)}")
                 entry = {
-                    "id":         pid,
-                    "title":      str(fm.get("title") or pid),
-                    "scope":      str(fm.get("scope") or "cluster"),
-                    "status":     str(fm.get("status") or "draft"),
-                    "priority":   str(fm.get("priority") or "medium"),
-                    "owner":      str(fm.get("owner") or ""),
-                    "updated":    str(fm.get("updated") or ""),
-                    "tags":       fm.get("tags") or [],
-                    "file":       fp.name,
-                    "log_count":  self._count_logs(pid),
+                    "id": pid,
+                    "title": str(fm.get("title") or pid),
+                    "scope": str(fm.get("scope") or "cluster"),
+                    "status": str(fm.get("status") or "draft"),
+                    "priority": str(fm.get("priority") or "medium"),
+                    "owner": str(fm.get("owner") or ""),
+                    "updated": str(fm.get("updated") or ""),
+                    "tags": fm.get("tags") or [],
+                    "file": fp.name,
+                    "log_count": self._count_logs(pid),
                 }
                 out.append(entry)
         self.protocols = out
         if broadcast:
-            self.hub.broadcast({
-                "type": "protocols.updated",
-                "ids":  [p["id"] for p in out],
-            })
+            self.hub.broadcast(
+                {
+                    "type": "protocols.updated",
+                    "ids": [p["id"] for p in out],
+                }
+            )
         return True
 
     def _compute_sig(self) -> str:
@@ -748,11 +814,11 @@ class ProtocolsRegistry:
                 return None
             fm, body = _split_frontmatter(text)
             return {
-                "id":          str(fm.get("id") or pid),
-                "title":       str(fm.get("title") or pid),
+                "id": str(fm.get("id") or pid),
+                "title": str(fm.get("title") or pid),
                 "frontmatter": fm,
-                "body":        body,
-                "file":        fp.name,
+                "body": body,
+                "file": fp.name,
             }
         return None
 
@@ -773,15 +839,17 @@ class ProtocolsRegistry:
                 except OSError:
                     continue
                 fm, _ = _split_frontmatter(text)
-                runs.append({
-                    "protocol":  pid,
-                    "date":      m.group(2),
-                    "file":      f"{month_dir.name}/{fp.name}",
-                    "outcome":   str(fm.get("outcome") or ""),
-                    "operator":  str(fm.get("operator") or ""),
-                    "agent":     str(fm.get("agent") or ""),
-                    "commit":    str(fm.get("commit") or ""),
-                })
+                runs.append(
+                    {
+                        "protocol": pid,
+                        "date": m.group(2),
+                        "file": f"{month_dir.name}/{fp.name}",
+                        "outcome": str(fm.get("outcome") or ""),
+                        "operator": str(fm.get("operator") or ""),
+                        "agent": str(fm.get("agent") or ""),
+                        "commit": str(fm.get("commit") or ""),
+                    }
+                )
                 if len(runs) >= limit:
                     return runs
         return runs
@@ -807,7 +875,15 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
     docs: List[Dict[str, Any]] = []
     initiatives: List[Dict[str, Any]] = []
     by_module: Dict[str, List[str]] = {}
-    stats = {"backlog": 0, "next": 0, "in_progress": 0, "active": 0, "blocked": 0, "done": 0, "total": 0}
+    stats = {
+        "backlog": 0,
+        "next": 0,
+        "in_progress": 0,
+        "active": 0,
+        "blocked": 0,
+        "done": 0,
+        "total": 0,
+    }
 
     # Tasks live at .meshkore/modules/<id>/tasks/*.md (+ archived under log/)
     if paths.modules_dir.exists():
@@ -830,21 +906,27 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                     if not fm.get("id"):
                         continue
                     t = {
-                        "id":         str(fm.get("id")),
-                        "title":      str(fm.get("title") or fm["id"]),
-                        "status":     normalize_status(fm.get("status")),
-                        "priority":   str(fm.get("priority") or "medium"),
-                        "owner":      str(fm.get("owner") or "unknown"),
-                        "category":   str(fm.get("category") or mid),
-                        "created":    str(fm.get("created") or ""),
-                        "updated":    str(fm.get("updated") or ""),
-                        "tags":       fm.get("tags") if isinstance(fm.get("tags"), list) else [],
-                        "depends_on": fm.get("depends_on") if isinstance(fm.get("depends_on"), list) else [],
+                        "id": str(fm.get("id")),
+                        "title": str(fm.get("title") or fm["id"]),
+                        "status": normalize_status(fm.get("status")),
+                        "priority": str(fm.get("priority") or "medium"),
+                        "owner": str(fm.get("owner") or "unknown"),
+                        "category": str(fm.get("category") or mid),
+                        "created": str(fm.get("created") or ""),
+                        "updated": str(fm.get("updated") or ""),
+                        "tags": fm.get("tags")
+                        if isinstance(fm.get("tags"), list)
+                        else [],
+                        "depends_on": fm.get("depends_on")
+                        if isinstance(fm.get("depends_on"), list)
+                        else [],
                         "initiative": str(fm.get("initiative") or "") or None,
-                        "path":       str(md.relative_to(paths.root)),
+                        "path": str(md.relative_to(paths.root)),
                     }
                     tasks.append(t)
-                    by_module[t["category"]] = by_module.get(t["category"], []) + [t["id"]]
+                    by_module[t["category"]] = by_module.get(t["category"], []) + [
+                        t["id"]
+                    ]
                     stats[t["status"]] = stats.get(t["status"], 0) + 1
                     stats["total"] += 1
 
@@ -860,15 +942,17 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
             fm = parse_frontmatter(text)
             if not fm:
                 continue
-            docs.append({
-                "title":    str(fm.get("title") or md.stem),
-                "category": str(fm.get("category") or ""),
-                "tags":     fm.get("tags") if isinstance(fm.get("tags"), list) else [],
-                "updated":  str(fm.get("updated") or ""),
-                "owner":    str(fm.get("owner") or ""),
-                "status":   str(fm.get("status") or "draft"),
-                "path":     str(md.relative_to(paths.root)),
-            })
+            docs.append(
+                {
+                    "title": str(fm.get("title") or md.stem),
+                    "category": str(fm.get("category") or ""),
+                    "tags": fm.get("tags") if isinstance(fm.get("tags"), list) else [],
+                    "updated": str(fm.get("updated") or ""),
+                    "owner": str(fm.get("owner") or ""),
+                    "status": str(fm.get("status") or "draft"),
+                    "path": str(md.relative_to(paths.root)),
+                }
+            )
 
     # Initiatives
     if paths.initiatives.exists():
@@ -880,39 +964,45 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
             fm = parse_frontmatter(text)
             if not fm.get("id"):
                 continue
-            child_ids = [t["id"] for t in tasks if (t.get("initiative") or "") == fm["id"]]
-            initiatives.append({
-                "id":             str(fm["id"]),
-                "title":          str(fm.get("title") or fm["id"]),
-                "status":         str(fm.get("status") or "backlog"),
-                "priority":       str(fm.get("priority") or "medium"),
-                "oneliner":       str(fm.get("oneliner") or ""),
-                "modules":        fm.get("modules") if isinstance(fm.get("modules"), list) else [],
-                "target":         str(fm.get("target") or ""),
-                "owner":          str(fm.get("owner") or ""),
-                "created":        str(fm.get("created") or ""),
-                "updated":        str(fm.get("updated") or ""),
-                "child_task_ids": child_ids,
-                "task_total":     len(child_ids),
-                "path":           str(md.relative_to(paths.root)),
-            })
+            child_ids = [
+                t["id"] for t in tasks if (t.get("initiative") or "") == fm["id"]
+            ]
+            initiatives.append(
+                {
+                    "id": str(fm["id"]),
+                    "title": str(fm.get("title") or fm["id"]),
+                    "status": str(fm.get("status") or "backlog"),
+                    "priority": str(fm.get("priority") or "medium"),
+                    "oneliner": str(fm.get("oneliner") or ""),
+                    "modules": fm.get("modules")
+                    if isinstance(fm.get("modules"), list)
+                    else [],
+                    "target": str(fm.get("target") or ""),
+                    "owner": str(fm.get("owner") or ""),
+                    "created": str(fm.get("created") or ""),
+                    "updated": str(fm.get("updated") or ""),
+                    "child_task_ids": child_ids,
+                    "task_total": len(child_ids),
+                    "path": str(md.relative_to(paths.root)),
+                }
+            )
 
     return {
-        "$schema":      "https://meshkore.com/standard.json",
+        "$schema": "https://meshkore.com/standard.json",
         "cluster": {
-            "id":   cluster.id,
+            "id": cluster.id,
             "name": cluster.name,
             "type": cluster.type,
         },
-        "modules":      cluster.modules,
+        "modules": cluster.modules,
         "roadmap": {
             "tasks": tasks,
             "stats": stats,
         },
-        "docs":         docs,
-        "initiatives":  initiatives,
+        "docs": docs,
+        "initiatives": initiatives,
         "generated_at": _iso_now(),
-        "generator":    {"name": "meshcore-py", "version": DAEMON_VERSION},
+        "generator": {"name": "meshcore-py", "version": DAEMON_VERSION},
     }
 
 
@@ -933,7 +1023,7 @@ class WSClient:
     __slots__ = ("sock", "closed")
 
     def __init__(self, sock: socket.socket):
-        self.sock   = sock
+        self.sock = sock
         self.closed = False
 
     def send_text(self, payload: str) -> None:
@@ -961,10 +1051,14 @@ class WSClient:
         if self.closed:
             return
         self.closed = True
-        try: self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError: pass
-        try: self.sock.close()
-        except OSError: pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 class Hub:
@@ -1024,10 +1118,12 @@ def _find_claude() -> Optional[str]:
     """Locate the `claude` CLI. Heuristic — try shell PATH, then the
     nvm + Homebrew locations we expect on a typical operator laptop."""
     import shutil
+
     found = shutil.which("claude")
     if found:
         return found
     import glob
+
     for pattern in [
         os.path.expanduser("~/.nvm/versions/node/v*/bin/claude"),
         "/opt/homebrew/bin/claude",
@@ -1111,7 +1207,7 @@ class ChatRunner:
         self.identity = identity
         self.conv = conv
         self.prompt = prompt
-        self.stream_id = f"s_{int(time.time()*1000):x}_{secrets.token_hex(2)}"
+        self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
         self.pid: Optional[int] = None
         self.proc: Any = None  # subprocess.Popen
         self.done = threading.Event()
@@ -1120,61 +1216,77 @@ class ChatRunner:
 
     def _briefing(self) -> str:
         history = _conversation_history(self.paths, self.conv)
-        history_block = ("Recent turns in this conversation:\n"
-                         + "\n".join(history) + "\n") if history else ""
+        history_block = (
+            ("Recent turns in this conversation:\n" + "\n".join(history) + "\n")
+            if history
+            else ""
+        )
         try:
             port = int(self.paths.port_file.read_text().strip())
         except (OSError, ValueError):
             port = 5570
-        return "\n".join([
-            f"You are the coordinator agent for a MeshKore cluster at {self.paths.root}.",
-            f"Identity: {self.identity}. Conversation id: {self.conv}.",
-            "",
-            "Read these before deciding what to do (in order, only what you need):",
-            "  • https://meshkore.com/cluster/operate — operator manual",
-            "  • .meshkore/docs/conventions/versioning.md — commits + versions",
-            "  • .meshkore/docs/conventions/context-workflow.md — every-change checklist",
-            "  • .meshkore/modules/<module>/{README.md,tasks/,log/} — per-module work",
-            "",
-            "Hard rules:",
-            "  • Don't push to git unless the user explicitly asks.",
-            f"  • Don't invent version numbers; ask POST localhost:{port}/version/next.",
-            "  • Never edit .meshkore/credentials/, .meshkore/.runtime/ or generated state.json.",
-            "  • Reply concisely. The portal renders your stdout as the chat answer.",
-            "",
-            history_block,
-            "User just said:",
-            self.prompt,
-            "",
-            'If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you\'re picking and why before doing the work.',
-        ])
+        return "\n".join(
+            [
+                f"You are the coordinator agent for a MeshKore cluster at {self.paths.root}.",
+                f"Identity: {self.identity}. Conversation id: {self.conv}.",
+                "",
+                "Read these before deciding what to do (in order, only what you need):",
+                "  • https://meshkore.com/cluster/operate — operator manual",
+                "  • .meshkore/docs/conventions/versioning.md — commits + versions",
+                "  • .meshkore/docs/conventions/context-workflow.md — every-change checklist",
+                "  • .meshkore/modules/<module>/{README.md,tasks/,log/} — per-module work",
+                "",
+                "Hard rules:",
+                "  • Don't push to git unless the user explicitly asks.",
+                f"  • Don't invent version numbers; ask POST localhost:{port}/version/next.",
+                "  • Never edit .meshkore/credentials/, .meshkore/.runtime/ or generated state.json.",
+                "  • Reply concisely. The portal renders your stdout as the chat answer.",
+                "",
+                history_block,
+                "User just said:",
+                self.prompt,
+                "",
+                'If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you\'re picking and why before doing the work.',
+            ]
+        )
 
     def spawn(self) -> None:
         import subprocess
+
         claude_bin = _find_claude()
         if not claude_bin:
             err = "claude CLI not found — install via `npm i -g @anthropic-ai/claude-code`"
             _log(err)
-            self.hub.broadcast(_append_timeline(self.paths, {
-                "type": "chat.assistant.final",
-                "author": self.identity,
-                "conv": self.conv,
-                "stream_id": self.stream_id,
-                "text": f"[runner error] {err}",
-            }))
+            self.hub.broadcast(
+                _append_timeline(
+                    self.paths,
+                    {
+                        "type": "chat.assistant.final",
+                        "author": self.identity,
+                        "conv": self.conv,
+                        "stream_id": self.stream_id,
+                        "text": f"[runner error] {err}",
+                    },
+                )
+            )
             self.done.set()
             return
         args = [
-            claude_bin, "-p",
-            "--output-format", "stream-json",
+            claude_bin,
+            "-p",
+            "--output-format",
+            "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--permission-mode", "bypassPermissions",
+            "--permission-mode",
+            "bypassPermissions",
             self._briefing(),
         ]
-        env = {**os.environ,
-               "MESHKORE_IDENTITY": self.identity,
-               "MESHKORE_CONV": self.conv}
+        env = {
+            **os.environ,
+            "MESHKORE_IDENTITY": self.identity,
+            "MESHKORE_CONV": self.conv,
+        }
         self.proc = subprocess.Popen(
             args,
             cwd=str(self.paths.root),
@@ -1185,24 +1297,28 @@ class ChatRunner:
             start_new_session=True,
         )
         self.pid = self.proc.pid
-        self.hub.broadcast({
-            "type": "task.started",
-            "id": f"chat:{self.conv}",
-            "agent": self.identity,
-            "ts": _iso_now(),
-            "runner": "claude-code",
-            "conv": self.conv,
-            "stream_id": self.stream_id,
-        })
+        self.hub.broadcast(
+            {
+                "type": "task.started",
+                "id": f"chat:{self.conv}",
+                "agent": self.identity,
+                "ts": _iso_now(),
+                "runner": "claude-code",
+                "conv": self.conv,
+                "stream_id": self.stream_id,
+            }
+        )
         # Empty assistant bubble so the cockpit shows progress immediately.
-        self.hub.broadcast({
-            "type": "chat.assistant.delta",
-            "author": self.identity,
-            "conv": self.conv,
-            "stream_id": self.stream_id,
-            "text": "",
-            "ts": _iso_now(),
-        })
+        self.hub.broadcast(
+            {
+                "type": "chat.assistant.delta",
+                "author": self.identity,
+                "conv": self.conv,
+                "stream_id": self.stream_id,
+                "text": "",
+                "ts": _iso_now(),
+            }
+        )
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
     def cancel(self) -> None:
@@ -1214,12 +1330,14 @@ class ChatRunner:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
             except (OSError, ProcessLookupError):
                 pass
+
             def _hard_kill():
                 if self.proc and self.proc.poll() is None:
                     try:
                         os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
                     except (OSError, ProcessLookupError):
                         pass
+
             threading.Timer(30.0, _hard_kill).start()
 
     def _reader_loop(self) -> None:
@@ -1242,65 +1360,82 @@ class ChatRunner:
             ev_type = ev.get("type")
             if ev_type == "stream_event":
                 inner = ev.get("event") or {}
-                if (inner.get("type") == "content_block_delta"
-                        and (inner.get("delta") or {}).get("type") == "text_delta"):
+                if (
+                    inner.get("type") == "content_block_delta"
+                    and (inner.get("delta") or {}).get("type") == "text_delta"
+                ):
                     delta = (inner.get("delta") or {}).get("text") or ""
                     if delta:
                         self._cumulative_text += delta
                         now = time.monotonic()
                         if now - last_emit_at > 0.2:
                             last_emit_at = now
-                            self.hub.broadcast({
-                                "type": "chat.assistant.delta",
-                                "author": self.identity,
-                                "conv": self.conv,
-                                "stream_id": self.stream_id,
-                                "text": self._cumulative_text[:16000],
-                                "ts": _iso_now(),
-                            })
-                elif (inner.get("type") == "content_block_start"
-                      and (inner.get("content_block") or {}).get("type") == "tool_use"):
+                            self.hub.broadcast(
+                                {
+                                    "type": "chat.assistant.delta",
+                                    "author": self.identity,
+                                    "conv": self.conv,
+                                    "stream_id": self.stream_id,
+                                    "text": self._cumulative_text[:16000],
+                                    "ts": _iso_now(),
+                                }
+                            )
+                elif (
+                    inner.get("type") == "content_block_start"
+                    and (inner.get("content_block") or {}).get("type") == "tool_use"
+                ):
                     cb = inner.get("content_block") or {}
-                    self.hub.broadcast({
-                        "type": "tool.use",
-                        "author": self.identity,
-                        "conv": self.conv,
-                        "stream_id": self.stream_id,
-                        "tool": cb.get("name"),
-                        "input": cb.get("input"),
-                        "ts": _iso_now(),
-                    })
+                    self.hub.broadcast(
+                        {
+                            "type": "tool.use",
+                            "author": self.identity,
+                            "conv": self.conv,
+                            "stream_id": self.stream_id,
+                            "tool": cb.get("name"),
+                            "input": cb.get("input"),
+                            "ts": _iso_now(),
+                        }
+                    )
                 continue
             if ev_type == "user":
                 for c in (ev.get("message") or {}).get("content") or []:
                     if isinstance(c, dict) and c.get("type") == "tool_result":
-                        self.hub.broadcast({
-                            "type": "tool.result",
-                            "author": self.identity,
-                            "conv": self.conv,
-                            "stream_id": self.stream_id,
-                            "ok": not c.get("is_error"),
-                            "ts": _iso_now(),
-                        })
+                        self.hub.broadcast(
+                            {
+                                "type": "tool.result",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "ok": not c.get("is_error"),
+                                "ts": _iso_now(),
+                            }
+                        )
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
         # Finalize
         final_text = result_text or self._cumulative_text
-        self.hub.broadcast(_append_timeline(self.paths, {
-            "type": "chat.assistant.final",
-            "author": self.identity,
-            "conv": self.conv,
-            "stream_id": self.stream_id,
-            "text": final_text,
-        }))
-        self.hub.broadcast({
-            "type": "task.finished",
-            "id": f"chat:{self.conv}",
-            "ts": _iso_now(),
-            "exit": self.proc.wait() if self.proc else None,
-            "conv": self.conv,
-        })
+        self.hub.broadcast(
+            _append_timeline(
+                self.paths,
+                {
+                    "type": "chat.assistant.final",
+                    "author": self.identity,
+                    "conv": self.conv,
+                    "stream_id": self.stream_id,
+                    "text": final_text,
+                },
+            )
+        )
+        self.hub.broadcast(
+            {
+                "type": "task.finished",
+                "id": f"chat:{self.conv}",
+                "ts": _iso_now(),
+                "exit": self.proc.wait() if self.proc else None,
+                "conv": self.conv,
+            }
+        )
         self.done.set()
 
 
@@ -1328,6 +1463,7 @@ class ChatSessions:
     def start(self, conv: str, runner: ChatRunner, on_chain) -> None:
         with self._lock:
             self._s[conv] = {"runner": runner, "pending": [], "cancelled": False}
+
         def _wait():
             runner.done.wait()
             with self._lock:
@@ -1339,10 +1475,14 @@ class ChatSessions:
                     return
                 pending = sess["pending"]
                 sess["pending"] = []
-            merged = (pending[0] if len(pending) == 1
-                      else "Several follow-up instructions while you were working:\n\n"
-                           + "\n\n".join(f"{i+1}. {t}" for i, t in enumerate(pending)))
+            merged = (
+                pending[0]
+                if len(pending) == 1
+                else "Several follow-up instructions while you were working:\n\n"
+                + "\n\n".join(f"{i + 1}. {t}" for i, t in enumerate(pending))
+            )
             on_chain(conv, merged)
+
         threading.Thread(target=_wait, daemon=True).start()
 
     def cancel(self, conv: str) -> Tuple[bool, int]:
@@ -1405,19 +1545,21 @@ def _cron_next(expr: str, after: datetime) -> datetime:
     if len(parts) != 5:
         raise ValueError(f"bad cron expression (need 5 fields): {expr!r}")
     minute_set = _parse_cron_field(parts[0], 0, 59)
-    hour_set   = _parse_cron_field(parts[1], 0, 23)
-    dom_set    = _parse_cron_field(parts[2], 1, 31)
-    month_set  = _parse_cron_field(parts[3], 1, 12)
+    hour_set = _parse_cron_field(parts[1], 0, 23)
+    dom_set = _parse_cron_field(parts[2], 1, 31)
+    month_set = _parse_cron_field(parts[3], 1, 12)
     # Cron dow: Sunday=0..Saturday=6. Python's weekday(): Monday=0..Sunday=6.
     # Convert at match time with (py + 1) % 7.
-    dow_set    = _parse_cron_field(parts[4], 0, 6)
+    dow_set = _parse_cron_field(parts[4], 0, 6)
     t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(60 * 24 * 366 * 4):
-        if (t.minute in minute_set
-                and t.hour in hour_set
-                and t.month in month_set
-                and t.day in dom_set
-                and ((t.weekday() + 1) % 7) in dow_set):
+        if (
+            t.minute in minute_set
+            and t.hour in hour_set
+            and t.month in month_set
+            and t.day in dom_set
+            and ((t.weekday() + 1) % 7) in dow_set
+        ):
             return t
         t += timedelta(minutes=1)
     raise ValueError(f"no next match within 4 years for {expr!r}")
@@ -1429,6 +1571,7 @@ def _curated_path_entries() -> List[str]:
     how the daemon itself was launched. Solves the 2026-05-19 incident
     where the LaunchAgent's PATH didn't include nvm."""
     import glob as _glob
+
     out: List[str] = []
     candidates = [
         "/opt/homebrew/bin",
@@ -1437,7 +1580,9 @@ def _curated_path_entries() -> List[str]:
         "/bin",
     ]
     # Highest nvm Node version
-    nvm = sorted(_glob.glob(os.path.expanduser("~/.nvm/versions/node/v*/bin")), reverse=True)
+    nvm = sorted(
+        _glob.glob(os.path.expanduser("~/.nvm/versions/node/v*/bin")), reverse=True
+    )
     if nvm:
         candidates.insert(0, nvm[0])
     for p in candidates:
@@ -1458,25 +1603,31 @@ class CronRunner:
         self.hub = hub
         self.identity = identity
         self.paths.crons_logs_dir.mkdir(parents=True, exist_ok=True)
-        self._active: Dict[str, Any] = {}   # job_id → subprocess.Popen
+        self._active: Dict[str, Any] = {}  # job_id → subprocess.Popen
         self._lock = threading.Lock()
 
     def is_running(self, job_id: str) -> bool:
         with self._lock:
             return job_id in self._active
 
-    def spawn(self, job: Dict[str, Any], reason: str = "scheduled") -> Optional[Dict[str, Any]]:
+    def spawn(
+        self, job: Dict[str, Any], reason: str = "scheduled"
+    ) -> Optional[Dict[str, Any]]:
         """Fire one run of `job`. Returns the started Run dict, or
         None if the job is already running (no concurrent fires)."""
         import subprocess
+
         jid = job["id"]
         with self._lock:
             if jid in self._active:
-                self.hub.broadcast({
-                    "type": "cron.skipped", "id": jid,
-                    "reason": "already running",
-                    "ts": _iso_now(),
-                })
+                self.hub.broadcast(
+                    {
+                        "type": "cron.skipped",
+                        "id": jid,
+                        "reason": "already running",
+                        "ts": _iso_now(),
+                    }
+                )
                 return None
         env = self._resolve_env(job.get("env") or {})
         log_path = self._make_log_path(jid)
@@ -1485,29 +1636,48 @@ class CronRunner:
         try:
             log_handle = open(log_path, "ab")
             proc = subprocess.Popen(
-                job["cmd"], shell=True,
+                job["cmd"],
+                shell=True,
                 cwd=str(self.paths.root),
                 env=env,
                 stdin=subprocess.DEVNULL,
-                stdout=log_handle, stderr=subprocess.STDOUT,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         except Exception as e:
             _log(f"cron spawn FAIL {jid}: {e}")
-            self.hub.broadcast({
-                "type": "cron.error", "id": jid, "error": str(e), "ts": ts,
-            })
+            self.hub.broadcast(
+                {
+                    "type": "cron.error",
+                    "id": jid,
+                    "error": str(e),
+                    "ts": ts,
+                }
+            )
             return None
         with self._lock:
             self._active[jid] = proc
-        self.hub.broadcast({
-            "type": "cron.fired", "id": jid, "reason": reason,
-            "pid": proc.pid, "log": str(log_path.relative_to(self.paths.root)),
-            "ts": ts,
-        })
-        run = {"id": jid, "started_at": ts, "pid": proc.pid, "log_path": str(log_path), "status": "running"}
+        self.hub.broadcast(
+            {
+                "type": "cron.fired",
+                "id": jid,
+                "reason": reason,
+                "pid": proc.pid,
+                "log": str(log_path.relative_to(self.paths.root)),
+                "ts": ts,
+            }
+        )
+        run = {
+            "id": jid,
+            "started_at": ts,
+            "pid": proc.pid,
+            "log_path": str(log_path),
+            "status": "running",
+        }
         threading.Thread(
-            target=self._wait_for, args=(jid, proc, log_handle, job, log_path, ts),
+            target=self._wait_for,
+            args=(jid, proc, log_handle, job, log_path, ts),
             daemon=True,
         ).start()
         return run
@@ -1534,7 +1704,15 @@ class CronRunner:
         except (OSError, ProcessLookupError):
             pass
 
-    def _wait_for(self, jid: str, proc, log_handle, job: Dict[str, Any], log_path: Path, started_at: str) -> None:
+    def _wait_for(
+        self,
+        jid: str,
+        proc,
+        log_handle,
+        job: Dict[str, Any],
+        log_path: Path,
+        started_at: str,
+    ) -> None:
         timeout = int(job.get("max_runtime_sec", 7200))
         t0 = time.monotonic()
         while proc.poll() is None and (time.monotonic() - t0) < timeout:
@@ -1557,13 +1735,17 @@ class CronRunner:
         with self._lock:
             self._active.pop(jid, None)
         status = "timeout" if timed_out else ("ok" if exit_code == 0 else "failed")
-        self.hub.broadcast({
-            "type": "cron.finished", "id": jid,
-            "exit": exit_code, "status": status,
-            "duration_sec": round(time.monotonic() - t0, 1),
-            "log": str(log_path.relative_to(self.paths.root)),
-            "ts": _iso_now(),
-        })
+        self.hub.broadcast(
+            {
+                "type": "cron.finished",
+                "id": jid,
+                "exit": exit_code,
+                "status": status,
+                "duration_sec": round(time.monotonic() - t0, 1),
+                "log": str(log_path.relative_to(self.paths.root)),
+                "ts": _iso_now(),
+            }
+        )
 
     def _resolve_env(self, job_env: Dict[str, str]) -> Dict[str, str]:
         env = dict(os.environ)
@@ -1574,7 +1756,7 @@ class CronRunner:
             if not isinstance(v, str) or not isinstance(k, str):
                 continue
             if v.startswith("file:"):
-                rel = v[len("file:"):]
+                rel = v[len("file:") :]
                 full = Path(rel) if os.path.isabs(rel) else (self.paths.root / rel)
                 try:
                     env[k] = full.read_text().strip()
@@ -1605,7 +1787,7 @@ class CronScheduler:
         self.hub = hub
         self.identity = identity
         self.runner = CronRunner(paths, cluster, hub, identity)
-        self._jobs: Dict[str, Dict[str, Any]] = {}    # job_id → {job, next_run}
+        self._jobs: Dict[str, Dict[str, Any]] = {}  # job_id → {job, next_run}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._timer: Optional[threading.Timer] = None
@@ -1639,8 +1821,14 @@ class CronScheduler:
         if n == 0:
             _log("cron: no jobs registered (cluster.yaml has no `crons:` block)")
         else:
-            owner_status = "coordinator" if self.is_coordinator() else f"peer (owner={self.cluster.crons_owner})"
-            _log(f"cron: {n} job(s) registered, this daemon is {owner_status}, tick every {self.TICK_SEC}s")
+            owner_status = (
+                "coordinator"
+                if self.is_coordinator()
+                else f"peer (owner={self.cluster.crons_owner})"
+            )
+            _log(
+                f"cron: {n} job(s) registered, this daemon is {owner_status}, tick every {self.TICK_SEC}s"
+            )
             for jid, state in self._jobs.items():
                 _log(f"  - {jid}: next_run={state['next_run'].isoformat()}")
         self._schedule_next_tick()
@@ -1685,23 +1873,28 @@ class CronScheduler:
             if is_coord:
                 self.runner.spawn(job, reason="scheduled")
             else:
-                self.hub.broadcast({
-                    "type": "cron.would_have_fired", "id": jid,
-                    "scheduled_for": scheduled_for.isoformat(),
-                    "reason": f"not coordinator (owner={self.cluster.crons_owner!r}, me={self.identity!r})",
-                    "ts": _iso_now(),
-                })
+                self.hub.broadcast(
+                    {
+                        "type": "cron.would_have_fired",
+                        "id": jid,
+                        "scheduled_for": scheduled_for.isoformat(),
+                        "reason": f"not coordinator (owner={self.cluster.crons_owner!r}, me={self.identity!r})",
+                        "ts": _iso_now(),
+                    }
+                )
 
     # ── introspection ───────────────────────────────────────────────
     def list_jobs(self) -> List[Dict[str, Any]]:
         out = []
         with self._lock:
             for jid, state in self._jobs.items():
-                out.append({
-                    **state["job"],
-                    "next_run": state["next_run"].isoformat(),
-                    "running": self.runner.is_running(jid),
-                })
+                out.append(
+                    {
+                        **state["job"],
+                        "next_run": state["next_run"].isoformat(),
+                        "running": self.runner.is_running(jid),
+                    }
+                )
         return out
 
     def trigger(self, job_id: str, reason: str = "manual") -> Optional[Dict[str, Any]]:
@@ -1718,12 +1911,12 @@ class CronScheduler:
 
 class StateManager:
     def __init__(self, paths: Paths, cluster: Cluster, hub: Hub):
-        self.paths   = paths
+        self.paths = paths
         self.cluster = cluster
-        self.hub     = hub
+        self.hub = hub
         self._state: Dict[str, Any] = {}
-        self._stop  = threading.Event()
-        self._lock  = threading.Lock()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._fs_signature = ""
         self.rebuild()
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -1760,8 +1953,12 @@ class StateManager:
 
     def _compute_signature(self) -> str:
         h = hashlib.sha1()
-        for root in (self.paths.modules_dir, self.paths.docs_dir,
-                     self.paths.initiatives, self.paths.public):
+        for root in (
+            self.paths.modules_dir,
+            self.paths.docs_dir,
+            self.paths.initiatives,
+            self.paths.public,
+        ):
             if not root.exists():
                 continue
             for md in sorted(root.rglob("*")):
@@ -1809,7 +2006,9 @@ def make_handler(daemon: "Daemon"):
             # token gates the privileged routes.
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header(
+                "Access-Control-Allow-Headers", "Authorization, Content-Type"
+            )
 
         def _json(self, code: int, body: Any) -> None:
             data = json.dumps(body).encode("utf-8")
@@ -1822,12 +2021,17 @@ def make_handler(daemon: "Daemon"):
 
         # ── verb dispatch ──────────────────────────────────────────────
         def do_OPTIONS(self):  # noqa: N802
-            self.send_response(204); self._cors(); self.end_headers()
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
 
         def do_GET(self):  # noqa: N802
             p, q = self._path()
             # WebSocket upgrade?
-            if p in ("/events", "/ws") and self.headers.get("Upgrade", "").lower() == "websocket":
+            if (
+                p in ("/events", "/ws")
+                and self.headers.get("Upgrade", "").lower() == "websocket"
+            ):
                 return self._handle_ws()
             if p == "/health":
                 return self._json(200, daemon.health())
@@ -1836,13 +2040,14 @@ def make_handler(daemon: "Daemon"):
             # U-DAEMON-02: subset reads. Matches Node's contract:
             # GET /state/cluster, /state/modules, /state/roadmap, etc.
             if p.startswith("/state/"):
-                sub = p[len("/state/"):].strip("/")
+                sub = p[len("/state/") :].strip("/")
                 state = daemon.state_manager.state()
                 if sub in state:
                     return self._json(200, state[sub])
                 return self._json(404, {"error": "unknown subset", "subset": sub})
             if p == "/reload":
-                if self._need_auth(): return
+                if self._need_auth():
+                    return
                 daemon.state_manager.rebuild(broadcast=True)
                 return self._json(200, {"ok": True, "generated_at": _iso_now()})
             if p == "/agents":
@@ -1854,53 +2059,71 @@ def make_handler(daemon: "Daemon"):
             # match Node's contract — but it serves from
             # .meshkore/roadmap/, which is where tasks live).
             if p.startswith("/docs/"):
-                if self._need_auth(): return
-                return self._serve_meshkore_file(daemon.paths.docs_dir, p[len("/docs/"):])
+                if self._need_auth():
+                    return
+                return self._serve_meshkore_file(
+                    daemon.paths.docs_dir, p[len("/docs/") :]
+                )
             if p.startswith("/modules/"):
-                if self._need_auth(): return
-                return self._serve_meshkore_file(daemon.paths.modules_dir, p[len("/modules/"):])
+                if self._need_auth():
+                    return
+                return self._serve_meshkore_file(
+                    daemon.paths.modules_dir, p[len("/modules/") :]
+                )
             if p.startswith("/tasks/"):
-                if self._need_auth(): return
-                return self._serve_meshkore_file(daemon.paths.roadmap_dir, p[len("/tasks/"):])
+                if self._need_auth():
+                    return
+                return self._serve_meshkore_file(
+                    daemon.paths.roadmap_dir, p[len("/tasks/") :]
+                )
             # U-DAEMON-02: credentials listing — names only, never
             # contents. Matches Node's response shape.
             if p == "/credentials":
-                if self._need_auth(): return
+                if self._need_auth():
+                    return
                 return self._json(200, daemon.credentials_listing())
             # D-CRON-02..05: scheduler introspection.
             if p == "/cron/list":
-                if self._need_auth(): return
-                return self._json(200, {
-                    "jobs": daemon.cron_scheduler.list_jobs(),
-                    "coordinator": daemon.cron_scheduler.is_coordinator(),
-                    "owner": daemon.cluster.crons_owner,
-                    "identity": daemon.identity,
-                    "tick_sec": daemon.cron_scheduler.TICK_SEC,
-                })
+                if self._need_auth():
+                    return
+                return self._json(
+                    200,
+                    {
+                        "jobs": daemon.cron_scheduler.list_jobs(),
+                        "coordinator": daemon.cron_scheduler.is_coordinator(),
+                        "owner": daemon.cluster.crons_owner,
+                        "identity": daemon.identity,
+                        "tick_sec": daemon.cron_scheduler.TICK_SEC,
+                    },
+                )
             # Standard §13 — deployment links registry.
             if p == "/links":
                 daemon.links_registry.reload()
                 return self._json(200, daemon.links_registry.as_dict())
             if p.startswith("/links/"):
-                mid = urllib.parse.unquote(p[len("/links/"):]).strip("/")
+                mid = urllib.parse.unquote(p[len("/links/") :]).strip("/")
                 if not mid:
                     return self._json(400, {"error": "module id required"})
                 daemon.links_registry.reload()
                 entry = daemon.links_registry.get(mid)
                 if entry is None:
-                    return self._json(404, {"error": "module not in links.yaml", "id": mid})
+                    return self._json(
+                        404, {"error": "module not in links.yaml", "id": mid}
+                    )
                 return self._json(200, entry)
             # Standard §14 — protocols registry.
             if p == "/protocols":
                 daemon.protocols_registry.reload()
                 return self._json(200, {"protocols": daemon.protocols_registry.list()})
             if p.startswith("/protocols/"):
-                rest = urllib.parse.unquote(p[len("/protocols/"):]).strip("/")
+                rest = urllib.parse.unquote(p[len("/protocols/") :]).strip("/")
                 if not rest:
                     return self._json(400, {"error": "protocol id required"})
                 if rest.endswith("/runs"):
-                    pid = rest[:-len("/runs")]
-                    return self._json(200, {"runs": daemon.protocols_registry.runs(pid)})
+                    pid = rest[: -len("/runs")]
+                    return self._json(
+                        200, {"runs": daemon.protocols_registry.runs(pid)}
+                    )
                 proto = daemon.protocols_registry.get(rest)
                 if proto is None:
                     return self._json(404, {"error": "protocol not found", "id": rest})
@@ -1932,11 +2155,11 @@ def make_handler(daemon: "Daemon"):
             # vast majority of these files are .md.
             ext = target.suffix.lower()
             ctype = {
-                ".md":   "text/markdown; charset=utf-8",
+                ".md": "text/markdown; charset=utf-8",
                 ".json": "application/json; charset=utf-8",
                 ".yaml": "text/yaml; charset=utf-8",
-                ".yml":  "text/yaml; charset=utf-8",
-                ".txt":  "text/plain; charset=utf-8",
+                ".yml": "text/yaml; charset=utf-8",
+                ".txt": "text/plain; charset=utf-8",
             }.get(ext, "text/markdown; charset=utf-8")
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -1948,13 +2171,15 @@ def make_handler(daemon: "Daemon"):
         def do_POST(self):  # noqa: N802
             p, _ = self._path()
             if p == "/shutdown":
-                if self._need_auth(): return
+                if self._need_auth():
+                    return
                 self._json(200, {"ok": True, "shutting_down": True, "ts": _iso_now()})
                 threading.Thread(target=daemon.request_shutdown, daemon=True).start()
                 return
 
             # All other POSTs need auth.
-            if self._need_auth(): return
+            if self._need_auth():
+                return
 
             # U-DAEMON-06: chat dispatch + cancel.
             if p == "/chat/dispatch":
@@ -1966,27 +2191,33 @@ def make_handler(daemon: "Daemon"):
             if p == "/messages":
                 return self._json(*daemon.append_message(self._read_json_body()))
             if p == "/version/next":
-                return self._json(501, {
-                    "error": "version coordinator not implemented yet",
-                    "see": "modules/daemon/tasks/V20-version-coordinator.md",
-                })
+                return self._json(
+                    501,
+                    {
+                        "error": "version coordinator not implemented yet",
+                        "see": "modules/daemon/tasks/V20-version-coordinator.md",
+                    },
+                )
 
             # U-DAEMON-04: task lifecycle.
             if p == "/tasks":
                 return self._json(*daemon.task_create(self._read_json_body()))
             if p.startswith("/tasks/") and p.endswith("/transition"):
-                tid = p[len("/tasks/"):-len("/transition")]
+                tid = p[len("/tasks/") : -len("/transition")]
                 return self._json(*daemon.task_transition(tid, self._read_json_body()))
             if p.startswith("/tasks/") and p.endswith("/cancel"):
-                tid = p[len("/tasks/"):-len("/cancel")]
+                tid = p[len("/tasks/") : -len("/cancel")]
                 return self._json(*daemon.task_cancel(tid))
             if p.startswith("/tasks/") and p.endswith("/dispatch"):
                 # U-DAEMON-07 territory — spawn a runner for a task.
                 # Stub for now: return 501 so cockpit shows a clear error.
-                return self._json(501, {
-                    "error": "task dispatch (runner) not implemented yet",
-                    "hint": "follows U-DAEMON-07 worker pool port",
-                })
+                return self._json(
+                    501,
+                    {
+                        "error": "task dispatch (runner) not implemented yet",
+                        "hint": "follows U-DAEMON-07 worker pool port",
+                    },
+                )
 
             # U-DAEMON-03 finish: declare a new agent.
             if p == "/agents":
@@ -1994,19 +2225,23 @@ def make_handler(daemon: "Daemon"):
 
             # D-CRON-04: trigger + cancel a cron job.
             if p.startswith("/cron/") and p.endswith("/trigger"):
-                jid = p[len("/cron/"):-len("/trigger")]
+                jid = p[len("/cron/") : -len("/trigger")]
                 run = daemon.cron_scheduler.trigger(jid, reason="manual-trigger")
                 if run is None:
-                    return self._json(404, {"error": f"no cron job named {jid!r} (or already running)"})
+                    return self._json(
+                        404,
+                        {"error": f"no cron job named {jid!r} (or already running)"},
+                    )
                 return self._json(202, run)
             if p.startswith("/cron/") and p.endswith("/cancel"):
-                jid = p[len("/cron/"):-len("/cancel")]
+                jid = p[len("/cron/") : -len("/cancel")]
                 ok = daemon.cron_scheduler.runner.cancel(jid)
                 return self._json(200, {"ok": ok, "id": jid, "cancelled": ok})
             # Standard §13 — patch a module's entry in links.yaml.
             if p.startswith("/links/"):
-                if self._need_auth(): return
-                mid = urllib.parse.unquote(p[len("/links/"):]).strip("/")
+                if self._need_auth():
+                    return
+                mid = urllib.parse.unquote(p[len("/links/") :]).strip("/")
                 if not mid:
                     return self._json(400, {"error": "module id required"})
                 ok, msg = daemon.links_registry.patch(mid, self._read_json_body())
@@ -2038,7 +2273,8 @@ def make_handler(daemon: "Daemon"):
         def _handle_ws(self) -> None:
             key = self.headers.get("Sec-WebSocket-Key")
             if not key:
-                self.send_error(400); return
+                self.send_error(400)
+                return
             accept = base64.b64encode(
                 hashlib.sha1((key + WS_GUID).encode()).digest()
             ).decode()
@@ -2052,12 +2288,16 @@ def make_handler(daemon: "Daemon"):
             client = WSClient(sock)
             daemon.hub.add(client)
             # Greeting
-            client.send_text(json.dumps({
-                "type":    "hello",
-                "identity": daemon.identity,
-                "port":     daemon.port,
-                "ts":       _iso_now(),
-            }))
+            client.send_text(
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "identity": daemon.identity,
+                        "port": daemon.port,
+                        "ts": _iso_now(),
+                    }
+                )
+            )
             # Drain inbound frames (we only care about close) so the
             # socket pump keeps moving; ignore everything else.
             try:
@@ -2089,7 +2329,7 @@ def _ws_read_frame(sock: socket.socket) -> Tuple[Optional[int], bytes]:
         ext = _recv_exact(sock, 8)
         length = struct.unpack(">Q", ext)[0]
     mask_key = _recv_exact(sock, 4) if masked else b""
-    payload  = _recv_exact(sock, length)
+    payload = _recv_exact(sock, length)
     if masked and payload:
         payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
     return opcode, payload
@@ -2110,24 +2350,28 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 class Daemon:
-    def __init__(self, paths: Paths, identity: Optional[str], requested_port: Optional[int]):
-        self.paths           = paths
-        self.cluster         = Cluster(paths)
-        self.identity        = identity or _detect_identity(paths) or _hostname_default()
-        self.token           = _ensure_token(paths)
-        self.port            = _pick_port(paths, requested_port or self.cluster.architect_port)
-        self.hub             = Hub()
-        self.state_manager   = StateManager(paths, self.cluster, self.hub)
-        self.chat_sessions   = ChatSessions()
+    def __init__(
+        self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
+    ):
+        self.paths = paths
+        self.cluster = Cluster(paths)
+        self.identity = identity or _detect_identity(paths) or _hostname_default()
+        self.token = _ensure_token(paths)
+        self.port = _pick_port(paths, requested_port or self.cluster.architect_port)
+        self.hub = Hub()
+        self.state_manager = StateManager(paths, self.cluster, self.hub)
+        self.chat_sessions = ChatSessions()
         # Standard §13 — deployment links registry. Quiet no-op when
         # .meshkore/public/links.yaml is absent.
-        self.links_registry  = LinksRegistry(paths, self.hub)
+        self.links_registry = LinksRegistry(paths, self.hub)
         # Standard §14 — protocols registry. Quiet no-op when
         # .meshkore/protocols/ is absent.
         self.protocols_registry = ProtocolsRegistry(paths, self.hub)
         # D-CRON-02..05: tick loop + runner; started in serve_forever()
-        self.cron_scheduler  = CronScheduler(paths, self.cluster, self.hub, self.identity)
-        self.stopping        = threading.Event()
+        self.cron_scheduler = CronScheduler(
+            paths, self.cluster, self.hub, self.identity
+        )
+        self.stopping = threading.Event()
         self.server: Optional[ThreadingHTTPServer] = None
 
     # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
@@ -2135,8 +2379,12 @@ class Daemon:
         """Start one chat turn. Wires the chain so a buffered next
         prompt re-spawns automatically when the current turn finishes."""
         runner = ChatRunner(
-            paths=self.paths, cluster=self.cluster, hub=self.hub,
-            identity=self.identity, conv=conv, prompt=prompt,
+            paths=self.paths,
+            cluster=self.cluster,
+            hub=self.hub,
+            identity=self.identity,
+            conv=conv,
+            prompt=prompt,
         )
         runner.spawn()
         self.chat_sessions.start(conv, runner, on_chain=self._spawn_chat_turn)
@@ -2147,17 +2395,28 @@ class Daemon:
         if not text:
             return 400, {"error": "text required"}
         author = str(body.get("author") or self.identity)
-        conv = str(body.get("conv") or f"chat-{_iso_now()[:16].replace(':', '-').replace('T', '-').lower()}")
+        conv = str(
+            body.get("conv")
+            or f"chat-{_iso_now()[:16].replace(':', '-').replace('T', '-').lower()}"
+        )
         # 1) Emit + persist the user event right away.
-        ev = _append_timeline(self.paths, {
-            "type": "chat.user", "author": author, "text": text, "conv": conv,
-        })
+        ev = _append_timeline(
+            self.paths,
+            {
+                "type": "chat.user",
+                "author": author,
+                "text": text,
+                "conv": conv,
+            },
+        )
         self.hub.broadcast(ev)
         # 2) Queue if a turn is already running for this conv.
         if self.chat_sessions.has(conv):
             pending = self.chat_sessions.queue(conv, text)
             return 202, {
-                "queued": True, "conv": conv, "pending": pending,
+                "queued": True,
+                "conv": conv,
+                "pending": pending,
                 "message": "turn in progress — your prompt will be merged into the next turn",
             }
         # 3) New turn.
@@ -2166,8 +2425,10 @@ class Daemon:
         except Exception as e:
             return 400, {"error": str(e)}
         return 202, {
-            "conv": conv, "runner": "claude-code",
-            "identity": self.identity, "pid": runner.pid,
+            "conv": conv,
+            "runner": "claude-code",
+            "identity": self.identity,
+            "pid": runner.pid,
             "stream_id": runner.stream_id,
         }
 
@@ -2177,12 +2438,19 @@ class Daemon:
             return 400, {"error": "conv required"}
         cancelled, dropped = self.chat_sessions.cancel(conv)
         if not cancelled:
-            return 200, {"ok": True, "cancelled": False,
-                         "reason": "no active turn for that conv"}
-        self.hub.broadcast({
-            "type": "chat.cancelled", "conv": conv,
-            "ts": _iso_now(), "dropped_pending": dropped,
-        })
+            return 200, {
+                "ok": True,
+                "cancelled": False,
+                "reason": "no active turn for that conv",
+            }
+        self.hub.broadcast(
+            {
+                "type": "chat.cancelled",
+                "conv": conv,
+                "ts": _iso_now(),
+                "dropped_pending": dropped,
+            }
+        )
         return 200, {"ok": True, "cancelled": True, "dropped_pending": dropped}
 
     # ── U-DAEMON-09: message append + version stubs ────────────────────
@@ -2192,9 +2460,15 @@ class Daemon:
             return 400, {"error": "text required"}
         author = str(body.get("author") or self.identity)
         conv = str(body.get("conv") or "general")
-        ev = _append_timeline(self.paths, {
-            "type": "message", "author": author, "text": text, "conv": conv,
-        })
+        ev = _append_timeline(
+            self.paths,
+            {
+                "type": "message",
+                "author": author,
+                "text": text,
+                "conv": conv,
+            },
+        )
         self.hub.broadcast(ev)
         return 201, ev
 
@@ -2226,27 +2500,31 @@ class Daemon:
         slug = re.sub(r"[^a-z0-9-]+", "-", title.lower())[:60].strip("-")
         fname = f"{tid}-{slug}.md" if slug else f"{tid}.md"
         target = tasks_dir / fname
-        frontmatter = "\n".join([
-            "---",
-            f"id: {tid}",
-            f'title: "{title}"',
-            f"status: {status}",
-            f"priority: {priority}",
-            f"category: {category}",
-            f"owner: {self.identity}",
-            f"created: {_iso_now()[:10]}",
-            f"updated: {_iso_now()[:10]}",
-            f"tags: {json.dumps(tags)}",
-            f"depends_on: {json.dumps(depends_on)}",
-            "---",
-            "",
-            body_md,
-        ])
+        frontmatter = "\n".join(
+            [
+                "---",
+                f"id: {tid}",
+                f'title: "{title}"',
+                f"status: {status}",
+                f"priority: {priority}",
+                f"category: {category}",
+                f"owner: {self.identity}",
+                f"created: {_iso_now()[:10]}",
+                f"updated: {_iso_now()[:10]}",
+                f"tags: {json.dumps(tags)}",
+                f"depends_on: {json.dumps(depends_on)}",
+                "---",
+                "",
+                body_md,
+            ]
+        )
         target.write_text(frontmatter)
         self.state_manager.rebuild(broadcast=True)
         return 201, {"id": tid, "path": str(target.relative_to(self.paths.root))}
 
-    def task_transition(self, tid: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    def task_transition(
+        self, tid: str, body: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
         to = str(body.get("to") or "").strip()
         valid = {"backlog", "next", "in_progress", "active", "blocked", "done"}
         if to not in valid:
@@ -2257,10 +2535,17 @@ class Daemon:
         text = path.read_text()
         new = re.sub(r"^status:\s*\S+\s*$", f"status: {to}", text, count=1, flags=re.M)
         if new == text:
-            new = re.sub(r"^---\s*$\n", f"---\nstatus: {to}\n", text, count=1, flags=re.M)
+            new = re.sub(
+                r"^---\s*$\n", f"---\nstatus: {to}\n", text, count=1, flags=re.M
+            )
         path.write_text(new)
         self.state_manager.rebuild(broadcast=True)
-        return 200, {"id": tid, "from": "?", "to": to, "path": str(path.relative_to(self.paths.root))}
+        return 200, {
+            "id": tid,
+            "from": "?",
+            "to": to,
+            "path": str(path.relative_to(self.paths.root)),
+        }
 
     def task_cancel(self, tid: str) -> Tuple[int, Dict[str, Any]]:
         # No active runner yet (dispatch is stubbed); this just transitions to blocked.
@@ -2294,13 +2579,13 @@ class Daemon:
     # ── HTTP body for /health and /info ────────────────────────────────
     def health(self) -> Dict[str, Any]:
         return {
-            "ok":           True,
-            "identity":     self.identity,
-            "port":         self.port,
-            "mode":         "server",
+            "ok": True,
+            "identity": self.identity,
+            "port": self.port,
+            "mode": "server",
             "implementation": "python",
-            "version":      DAEMON_VERSION,
-            "cluster_id":   self.cluster.id,
+            "version": DAEMON_VERSION,
+            "cluster_id": self.cluster.id,
             "cluster_name": self.cluster.name,
             "cluster_type": self.cluster.type,
             # U-DAEMON-01: capability advertisement.
@@ -2309,46 +2594,62 @@ class Daemon:
             # to route each call to the daemon that supports the
             # feature. Adding an endpoint here is part of the
             # acceptance criteria for that endpoint's port task.
-            "features":     self._features(),
-            "ts":           _iso_now(),
+            "features": self._features(),
+            "ts": _iso_now(),
         }
 
     def _features(self) -> List[str]:
         feats = [
             "health",
-            "state", "state.subset",            # U-DAEMON-02
+            "state",
+            "state.subset",  # U-DAEMON-02
             "reload",
-            "agents", "agents.create",          # U-DAEMON-02 + 03
-            "events",                            # WS hub + chat.* + task.* + tool.*
-            "files.docs", "files.modules", "files.tasks",  # U-DAEMON-02
-            "credentials",                       # U-DAEMON-02 (list-only)
+            "agents",
+            "agents.create",  # U-DAEMON-02 + 03
+            "events",  # WS hub + chat.* + task.* + tool.*
+            "files.docs",
+            "files.modules",
+            "files.tasks",  # U-DAEMON-02
+            "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
             # U-DAEMON-04 task lifecycle (dispatch is stubbed, marked separately)
-            "tasks.create", "tasks.transition", "tasks.cancel",
+            "tasks.create",
+            "tasks.transition",
+            "tasks.cancel",
             # U-DAEMON-05 + 06 chat coordinator
-            "chat", "chat.cancel",
+            "chat",
+            "chat.cancel",
             # U-DAEMON-09 misc
             "messages",
         ]
         if hasattr(self.cluster, "crons"):
             feats.append("cron.schema")
         # D-CRON-02..05: scheduler is live, list + trigger + cancel + log endpoints.
-        feats.extend(["cron.tick", "cron.list", "cron.trigger", "cron.cancel", "cron.log"])
+        feats.extend(
+            ["cron.tick", "cron.list", "cron.trigger", "cron.cancel", "cron.log"]
+        )
         # Standard §13: deployment links registry.
         feats.extend(["links.read", "links.write"])
         # Standard §14: protocols registry (read-only this version).
         feats.extend(["protocols.read"])
         # Stubs — advertised separately so the cockpit can show
         # "not yet" badges without trying the endpoint.
-        feats.extend(["stub.workers", "stub.admission", "stub.tasks.dispatch", "stub.version.next"])
+        feats.extend(
+            [
+                "stub.workers",
+                "stub.admission",
+                "stub.tasks.dispatch",
+                "stub.version.next",
+            ]
+        )
         return feats
 
     def info(self) -> Dict[str, Any]:
         h = self.health()
         h["version"] = DAEMON_VERSION
-        h["paths"]   = {
-            "root":     str(self.paths.root),
+        h["paths"] = {
+            "root": str(self.paths.root),
             "meshkore": str(self.paths.meshkore),
         }
         return h
@@ -2376,13 +2677,15 @@ class Daemon:
                     online = True
                 except (OSError, ValueError):
                     pid = None
-            out.append({
-                "id":       yml.stem,
-                "identity": yml.stem,           # alias, matches Node
-                "pid":      pid,
-                "online":   online,
-                "data":     data,
-            })
+            out.append(
+                {
+                    "id": yml.stem,
+                    "identity": yml.stem,  # alias, matches Node
+                    "pid": pid,
+                    "online": online,
+                    "data": data,
+                }
+            )
         return out
 
     def credentials_listing(self) -> List[Dict[str, Any]]:
@@ -2399,11 +2702,13 @@ class Daemon:
                 size = f.stat().st_size if f.is_file() else None
             except OSError:
                 size = None
-            out.append({
-                "name":      f.name,
-                "size":      size,
-                "is_symlink": f.is_symlink(),
-            })
+            out.append(
+                {
+                    "name": f.name,
+                    "size": size,
+                    "is_symlink": f.is_symlink(),
+                }
+            )
         return out
 
     # ── lifecycle ──────────────────────────────────────────────────────
@@ -2412,8 +2717,10 @@ class Daemon:
         handler = make_handler(self)
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         self.server.daemon_threads = True
-        _log(f"meshcore-py listening on http://127.0.0.1:{self.port} "
-             f"(identity={self.identity}, cluster={self.cluster.id})")
+        _log(
+            f"meshcore-py listening on http://127.0.0.1:{self.port} "
+            f"(identity={self.identity}, cluster={self.cluster.id})"
+        )
         # D-CRON-02: start the scheduler. Ticks every 10s in a background
         # thread; cluster.yaml.crons jobs fire from here, no LaunchAgent.
         self.cron_scheduler.start()
@@ -2444,12 +2751,18 @@ class Daemon:
 
     def cleanup(self) -> None:
         try:
-            if self.paths.pid_file.exists() and self.paths.pid_file.read_text().strip() == str(os.getpid()):
+            if (
+                self.paths.pid_file.exists()
+                and self.paths.pid_file.read_text().strip() == str(os.getpid())
+            ):
                 self.paths.pid_file.unlink()
         except OSError:
             pass
         try:
-            if self.paths.port_file.exists() and self.paths.port_file.read_text().strip() == str(self.port):
+            if (
+                self.paths.port_file.exists()
+                and self.paths.port_file.read_text().strip() == str(self.port)
+            ):
                 self.paths.port_file.unlink()
         except OSError:
             pass
@@ -2466,8 +2779,10 @@ class Daemon:
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-           f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    return (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    )
 
 
 def _log(msg: str) -> None:
@@ -2517,7 +2832,9 @@ def _pick_port(paths: Paths, preferred: Optional[int]) -> int:
     candidates: List[int] = []
     if preferred and 1024 <= preferred <= 65535:
         candidates.append(preferred)
-    candidates.extend(p for p in range(PORT_RANGE[0], PORT_RANGE[1] + 1) if p != preferred)
+    candidates.extend(
+        p for p in range(PORT_RANGE[0], PORT_RANGE[1] + 1) if p != preferred
+    )
     for p in candidates:
         if _port_free(p):
             return p
@@ -2537,27 +2854,38 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     while i < len(argv):
         a = argv[i]
         if a in ("-h", "--help"):
-            print(__doc__); raise SystemExit(0)
+            print(__doc__)
+            raise SystemExit(0)
         if a == "--version":
-            print(f"meshcore-py {DAEMON_VERSION}"); raise SystemExit(0)
+            print(f"meshcore-py {DAEMON_VERSION}")
+            raise SystemExit(0)
         if a == "--identity":
-            out["identity"] = argv[i + 1]; i += 2; continue
+            out["identity"] = argv[i + 1]
+            i += 2
+            continue
         if a == "--port":
-            out["port"] = int(argv[i + 1]); i += 2; continue
+            out["port"] = int(argv[i + 1])
+            i += 2
+            continue
         if a == "--root":
-            out["root"] = Path(argv[i + 1]); i += 2; continue
+            out["root"] = Path(argv[i + 1])
+            i += 2
+            continue
         # Positional default = root
         if not out["root"]:
-            out["root"] = Path(a); i += 1; continue
-        print(f"unknown arg: {a}", file=sys.stderr); raise SystemExit(2)
+            out["root"] = Path(a)
+            i += 1
+            continue
+        print(f"unknown arg: {a}", file=sys.stderr)
+        raise SystemExit(2)
     if not out["root"]:
         out["root"] = Path.cwd()
     return out
 
 
 def main() -> None:
-    args   = _parse_args(sys.argv[1:])
-    paths  = Paths(args["root"])
+    args = _parse_args(sys.argv[1:])
+    paths = Paths(args["root"])
     if not paths.meshkore.exists():
         raise SystemExit(
             f"\n .meshkore/ not found at {paths.meshkore}."
@@ -2573,8 +2901,10 @@ def main() -> None:
         daemon.request_shutdown()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try: signal.signal(sig, _on_signal)
-        except ValueError: pass  # Windows main-thread quirk; ignore
+        try:
+            signal.signal(sig, _on_signal)
+        except ValueError:
+            pass  # Windows main-thread quirk; ignore
 
     daemon.serve_forever()
     _log("daemon stopped cleanly")
