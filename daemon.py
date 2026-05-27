@@ -47,12 +47,13 @@ import re
 import secrets
 import signal
 import socket
-import struct
 import ssl
+import struct
 import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,22 +66,28 @@ PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
 DAEMON_VERSION = "py-1.8.0"  # 1.8.0 → loopback TLS via daemon.meshkore.com
-MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
-WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# ── TLS bundle (daemon.meshkore.com → 127.0.0.1) ──────────────────────
-# When these files exist next to daemon.py, the server binds HTTPS+WSS
-# instead of plain HTTP+WS. The cert is a Let's Encrypt wildcard for
-# *.daemon.meshkore.com. DNS resolves that name to 127.0.0.1 (public
-# CF A record), so the cockpit at architect.meshkore.com can reach
-# the daemon over a real HTTPS origin — no mixed-content blocks, no
-# Chrome Local Network Access Issues. The cert + key are "publicly
-# bundled" intentionally: the only thing an attacker can do with them
-# is impersonate daemon.meshkore.com on their own loopback, which is
-# a no-op. Same pattern Plex's *.plex.direct uses.
+# ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
+# Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
+# so the cockpit at architect.meshkore.com can talk to localhost over
+# HTTPS+WSS without mixed-content / Chrome Local Network Access Issues.
+# Bundled cert + key are intentionally "public" (only useful for
+# impersonating daemon.meshkore.com on the attacker's own loopback,
+# a no-op). The daemon falls back to plain HTTP if the bundle is
+# missing — backwards-compatible with operators who haven't pulled
+# the tls/ directory.
 TLS_BUNDLE_NAME = "tls"
 TLS_CERT_FILENAME = "fullchain.pem"
 TLS_KEY_FILENAME = "privkey.pem"
+# Max number of timeline events to surface in /state.timeline.recent_events.
+# The architect needs these to rebuild chat history + task lifecycle on
+# every reload — without them, conv history vanishes from the cockpit
+# even though the JSONL files on disk are intact. Bound to keep state.json
+# small enough to serve cheaply; everything older is still readable from
+# the per-day JSONL files in .meshkore/timeline/.
+TIMELINE_RECENT_LIMIT = 500
+MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # ───────────────────────────────────────────────────────────────────────
 # Paths
@@ -106,6 +113,8 @@ class Paths:
         self.timeline_dir = self.meshkore / "timeline"
         self.modules_dir = self.meshkore / "modules"
         self.docs_dir = self.meshkore / "docs"
+        # py-1.2.0 — where /self-update writes daemon.py + daemon.py.bak.
+        self.scripts_dir = self.meshkore / "scripts"
         self.roadmap_dir = self.meshkore / "roadmap"
         self.state_json = self.roadmap_dir / "state.json"
         self.agents_dir = self.meshkore / "agents"
@@ -480,7 +489,7 @@ class Cluster:
             if isinstance(sec, dict) and "port" in sec:
                 try:
                     return int(sec["port"])
-                except Exception:
+                except (TypeError, ValueError):
                     pass
         return None
 
@@ -1002,6 +1011,12 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                 }
             )
 
+    # py-1.1.0 — surface recent timeline events alongside the rest of the
+    # state so the architect cockpit can rebuild chat history + task
+    # lifecycle on every reload. JSONL files in .meshkore/timeline/ are
+    # already the source of truth; this just promotes the most recent
+    # slice into the same payload the cockpit fetches at boot.
+    recent_events = _recent_timeline_events(paths, limit=TIMELINE_RECENT_LIMIT)
     return {
         "$schema": "https://meshkore.com/standard.json",
         "cluster": {
@@ -1016,6 +1031,11 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
         },
         "docs": docs,
         "initiatives": initiatives,
+        "timeline": {
+            "recent_events": recent_events,
+            "event_count": len(recent_events),
+            "limit": TIMELINE_RECENT_LIMIT,
+        },
         "generated_at": _iso_now(),
         "generator": {"name": "meshcore-py", "version": DAEMON_VERSION},
     }
@@ -1129,6 +1149,22 @@ class Hub:
 # each turn so context survives daemon restarts.
 
 
+# py-1.6.0 — Stable namespace for deterministic per-conv claude session
+# ids. uuid5(NAMESPACE, conv_id) yields a valid UUID that's the same
+# across daemon restarts → claude resumes the same session across turns
+# (memory + prompt cache). Same conv id in two different MeshKore
+# clusters will collide on UUID — fine, claude isolates sessions per
+# project (cwd-scoped).
+_CLAUDE_SESSION_NAMESPACE = uuid.UUID("a4f7c1e8-3b29-4d8e-9c52-7f1e3a8d4b62")
+
+
+def _session_id_for_conv(conv: str) -> str:
+    """Deterministic session UUID per conversation id. Stable across
+    daemon restarts so `claude -p --session-id <id>` resumes the same
+    conversation context + benefits from Anthropic's prompt cache."""
+    return str(uuid.uuid5(_CLAUDE_SESSION_NAMESPACE, conv or "default"))
+
+
 def _find_claude() -> Optional[str]:
     """Locate the `claude` CLI. Heuristic — try shell PATH, then the
     nvm + Homebrew locations we expect on a typical operator laptop."""
@@ -1150,22 +1186,32 @@ def _find_claude() -> Optional[str]:
     return None
 
 
-def _conversation_history(paths: "Paths", conv: str, limit: int = 12) -> List[str]:
+def _conversation_history(
+    paths: "Paths",
+    conv: str,
+    limit: int = 12,
+    rolling_summary_threshold: int = 12,
+    summary_head_chars: int = 200,
+) -> List[str]:
     """Walk timeline files newest→oldest, return last `limit` turns of
-    `conv` formatted as 'USER: …' / 'YOU (last turn): …'."""
+    `conv` formatted as 'USER: …' / 'YOU (last turn): …'.
+
+    py-1.5.0 — Rolling-summary compaction. If the conv has more than
+    `rolling_summary_threshold` turns total, the older turns (beyond
+    the most-recent `limit`) are collapsed into a single 'EARLIER:'
+    block listing one truncated line per turn so the agent still has
+    *some* awareness of what was discussed before its recent window,
+    without paying the full token cost. Previous behaviour: silently
+    drop everything beyond turn 12, the agent had amnesia past that.
+    """
     if not paths.timeline_dir.exists():
         return []
-    turns: List[Tuple[str, str]] = []
-    for f in sorted(paths.timeline_dir.glob("*.jsonl"), reverse=True):
-        try:
-            lines = f.read_text().splitlines()
-        except OSError:
-            continue
-        for line in reversed(lines):
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    # Collect ALL turns for the conv, oldest → newest, scanning all
+    # timeline files (jsonl + jsonl.gz from rotation). Bounded by the
+    # caller's overall history dataset size; cheap on small projects.
+    all_turns: List[Tuple[str, str]] = []
+    for f in sorted(_iter_timeline_files(paths)):
+        for ev in _read_timeline_file(f):
             if ev.get("conv") != conv:
                 continue
             t = ev.get("type")
@@ -1175,26 +1221,1288 @@ def _conversation_history(paths: "Paths", conv: str, limit: int = 12) -> List[st
             text = str(ev.get("text") or "").strip()
             if not text:
                 continue
-            turns.append((who, text[:800]))
-            if len(turns) >= limit:
+            all_turns.append((who, text))
+    if not all_turns:
+        return []
+    # Split into "earlier" (everything beyond `limit`) and "recent".
+    if len(all_turns) <= max(limit, rolling_summary_threshold):
+        recent = all_turns
+        earlier: List[Tuple[str, str]] = []
+    else:
+        recent = all_turns[-limit:]
+        earlier = all_turns[:-limit]
+    out: List[str] = []
+    if earlier:
+        # Collapsed view of older turns — one short line each, prefixed
+        # so the agent knows these are summarised.
+        head_lines = [
+            f"  • {w}: {t[:summary_head_chars]}{'…' if len(t) > summary_head_chars else ''}"
+            for w, t in earlier
+        ]
+        out.append(
+            f"EARLIER turns in this conversation ({len(earlier)} compacted, oldest first):"
+        )
+        out.extend(head_lines)
+        out.append("")  # blank line before recent block
+    # Recent turns at full 800-char truncation (same as before).
+    out.extend(f"{w}: {t[:800]}" for w, t in recent)
+    return out
+
+
+def _iter_timeline_files(paths: "Paths") -> List[Any]:
+    """All timeline files (jsonl + jsonl.gz from rotation)."""
+    if not paths.timeline_dir.exists():
+        return []
+    files = list(paths.timeline_dir.glob("*.jsonl"))
+    files.extend(paths.timeline_dir.glob("*.jsonl.gz"))
+    # Also look in the archive subdir produced by rotation.
+    archive_dir = paths.timeline_dir / "archive"
+    if archive_dir.exists():
+        files.extend(archive_dir.glob("*.jsonl"))
+        files.extend(archive_dir.glob("*.jsonl.gz"))
+    return files
+
+
+def _read_timeline_file(path: Any) -> List[Dict[str, Any]]:
+    """Parse one timeline file (jsonl or jsonl.gz) → list of events.
+    Never raises; bad lines / unreadable files yield empty list."""
+    try:
+        if str(path).endswith(".gz"):
+            import gzip
+
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        else:
+            lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _recent_timeline_events(
+    paths: "Paths", limit: int = TIMELINE_RECENT_LIMIT
+) -> List[Dict[str, Any]]:
+    """Return the most recent `limit` events across all timeline files,
+    sorted chronologically (oldest first — the order the architect's
+    indexEvents() expects).
+
+    The cockpit reconstructs convMap + taskMap from these on every load,
+    so chat history and task lifecycle survive page reloads. Without
+    this, the .meshkore/timeline/*.jsonl files are still on disk but the
+    cockpit can't see them — they just sit there until the next time
+    claude-code rebuilds context from them on a chat turn.
+
+    We walk files newest→oldest so even a multi-day history is read
+    efficiently; once we have `limit` events we stop.
+    """
+    if not paths.timeline_dir.exists():
+        return []
+    events: List[Dict[str, Any]] = []
+    # py-1.5.0 — _iter_timeline_files also picks up rotated .jsonl.gz
+    # files. Reverse sort: newest dates first so we hit `limit` early
+    # on long-running clusters without reading old archived months.
+    for f in sorted(_iter_timeline_files(paths), reverse=True):
+        file_events = _read_timeline_file(f)
+        # Walk this file newest-line-last → newest-line-first.
+        for ev in reversed(file_events):
+            events.append(ev)
+            if len(events) >= limit:
                 break
-        if len(turns) >= limit:
+        if len(events) >= limit:
             break
-    turns.reverse()
-    return [f"{w}: {t}" for w, t in turns]
+    # Architect expects oldest-first (it sorts by ts ascending anyway,
+    # but giving the right order avoids a re-sort hot path).
+    events.sort(key=lambda e: e.get("ts") or "")
+    return events
 
 
 def _append_timeline(paths: "Paths", event: Dict[str, Any]) -> Dict[str, Any]:
     """Append one JSON-line event to today's timeline file.
-    Returns the event enriched with `ts` if it wasn't already set."""
+    Returns the event enriched with `ts` if it wasn't already set.
+
+    py-1.5.0 — atomic append. The line is rendered fully in memory,
+    then written + flushed + fsync'd in a single open/close cycle so
+    a daemon crash mid-write can't leave a half-written line in the
+    jsonl. We rely on the OS guarantee that `write()` is atomic for
+    buffers < PIPE_BUF (~4KB on most systems); for larger events
+    (very long assistant.final replies) we still get atomicity at the
+    page-cache level under POSIX. The added fsync forces durability
+    so we don't lose events on a power cut either."""
     paths.timeline_dir.mkdir(parents=True, exist_ok=True)
     if "ts" not in event:
         event = {**event, "ts": _iso_now()}
     date = event["ts"][:10]
     f = paths.timeline_dir / f"{date}.jsonl"
-    with open(f, "a", encoding="utf-8") as out:
-        out.write(json.dumps(event, separators=(",", ":")) + "\n")
+    payload = json.dumps(event, separators=(",", ":")) + "\n"
+    encoded = payload.encode("utf-8")
+    # Open with O_APPEND so concurrent writers (the StateManager poll
+    # loop + ChatRunner reader threads) interleave at line boundaries
+    # rather than overwrite each other. O_APPEND is atomic per write()
+    # on POSIX for any size up to PIPE_BUF; for larger writes (a multi-
+    # KB assistant.final) the worst case is interleaved bytes, but the
+    # daemon's writers never race on the same line. Single line per
+    # write() call preserves jsonl integrity.
+    fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, encoded)
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass  # best-effort durability
+    finally:
+        os.close(fd)
     return event
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Briefing pipeline (py-1.4.0)
+#
+# The agent's prompt is composed by stacking small, independent sections.
+# Each section is a method on BriefingPipeline returning a markdown block
+# (or "" to skip itself). Two read-only helpers feed it:
+#
+#   • ProjectState         — cheap FS summary (counts, emptiness)
+#   • StateIntegrityChecker — orphan-module / broken-ref detection
+#
+# Adding a new section is a one-line append in `build()`. Each section
+# is small enough to maintain without touching others, which makes
+# evolution safe even as the briefing grows.
+#
+# Sections, in order:
+#   1. role               — who you are + where
+#   2. core_rules         — stable hard rules (don't push, don't edit creds)
+#   3. cluster_snapshot   — N initiatives, M tasks, P modules
+#   4. project_mode       — bootstrap brief if empty, ø otherwise
+#   5. integrity          — orphan modules + other repair hints
+#   6. cockpit_context    — operator-attached context_docs[] from /chat/dispatch
+#   7. history            — last N turns from .meshkore/timeline/
+#   8. user_turn          — what the user just typed
+#
+# All sections are separated by `\n\n---\n\n` so the LLM reads them as
+# discrete blocks rather than one flat wall.
+
+
+# py-1.4.1 — Stopwords for the context-coverage heuristic. These are
+# tokens that pass the capitalised-token regex but are uninformative
+# (sentence starters, generic acronyms). Lowercased for comparison.
+_COVERAGE_STOPWORDS: set = {
+    # generic English
+    "this",
+    "that",
+    "they",
+    "them",
+    "their",
+    "these",
+    "those",
+    "with",
+    "without",
+    "from",
+    "into",
+    "onto",
+    "upon",
+    "until",
+    "after",
+    "before",
+    "between",
+    "while",
+    "during",
+    "and",
+    "but",
+    "for",
+    "not",
+    "yes",
+    "now",
+    "next",
+    "plus",
+    "any",
+    "all",
+    "every",
+    "some",
+    "either",
+    "neither",
+    "both",
+    "should",
+    "would",
+    "could",
+    "must",
+    "might",
+    "will",
+    "shall",
+    "when",
+    "where",
+    "what",
+    "which",
+    "while",
+    "whose",
+    "section",
+    "schema",
+    "phase",
+    "rule",
+    "rules",
+    "step",
+    "steps",
+    "task",
+    "tasks",
+    "module",
+    "modules",
+    "user",
+    "users",
+    "name",
+    "kind",
+    "type",
+    "data",
+    "code",
+    "file",
+    "files",
+    "page",
+    "site",
+    "team",
+    "work",
+    "doing",
+    # acronyms / common labels that misfire
+    "mvp",
+    "tba",
+    "tbd",
+    "etc",
+    "eta",
+    "etl",
+    "faq",
+    "kpi",
+    "ai",
+    "eu",
+    "us",
+    "uk",
+    "utc",
+    "url",
+    "http",
+    "https",
+    "api",
+    "ui",
+    "ux",
+    "ci",
+    "cd",
+    "qa",
+    "io",
+    # MeshKore-isms that shouldn't be flagged
+    "meshkore",
+    "cockpit",
+    "architect",
+    "operator",
+}
+
+
+class ProjectState:
+    """Cheap, lazy filesystem summary of a cluster. Computed once per
+    briefing build; reused across sections. Never raises on missing
+    directories — empty answers everywhere instead."""
+
+    def __init__(self, paths: "Paths"):
+        self.paths = paths
+        self._initiative_files: Optional[List[Any]] = None
+        self._task_files: Optional[List[Any]] = None
+        self._module_dirs: Optional[List[Any]] = None
+
+    def initiative_files(self) -> List[Any]:
+        if self._initiative_files is None:
+            ini = self.paths.initiatives
+            self._initiative_files = (
+                [f for f in ini.glob("*.md") if not f.name.startswith("_")]
+                if ini.exists()
+                else []
+            )
+        return self._initiative_files
+
+    def task_files(self, *, include_boilerplate: bool = False) -> List[Any]:
+        if self._task_files is None:
+            out: List[Any] = []
+            md_root = self.paths.modules_dir
+            if md_root.exists():
+                for mdir in md_root.iterdir():
+                    if not mdir.is_dir():
+                        continue
+                    tasks_dir = mdir / "tasks"
+                    if not tasks_dir.exists():
+                        continue
+                    for t in tasks_dir.rglob("*.md"):
+                        if t.name.startswith("_"):
+                            continue
+                        if not include_boilerplate and t.name.lower().startswith(
+                            "t1-hello"
+                        ):
+                            continue
+                        out.append(t)
+            self._task_files = out
+        return self._task_files
+
+    def module_dirs(self) -> List[Any]:
+        if self._module_dirs is None:
+            md_root = self.paths.modules_dir
+            self._module_dirs = (
+                [m for m in md_root.iterdir() if m.is_dir()] if md_root.exists() else []
+            )
+        return self._module_dirs
+
+    def is_empty(self) -> bool:
+        return not self.initiative_files() and not self.task_files()
+
+
+class StateIntegrityChecker:
+    """Walks the cluster looking for inconsistencies that should be
+    surfaced to the agent for repair on its next turn. Surfaces hints,
+    not blockers — the agent decides whether to fix them now or later.
+
+    Cheap (single FS walk + a YAML parse). Runs on every briefing.
+    """
+
+    def __init__(self, paths: "Paths", cluster: "Cluster", project: ProjectState):
+        self.paths = paths
+        self.cluster = cluster
+        self.project = project
+
+    def check(self) -> List[Dict[str, Any]]:
+        violations: List[Dict[str, Any]] = []
+        declared_modules = {
+            m.get("id")
+            for m in (self.cluster.data.get("modules") or [])
+            if isinstance(m, dict) and m.get("id")
+        }
+        # Rule: every .meshkore/modules/<X>/ should be declared in
+        # cluster.yaml.modules[]. Otherwise the cockpit's module tree
+        # won't show it and child tasks render as orphans.
+        for mdir in self.project.module_dirs():
+            mid = mdir.name
+            if mid not in declared_modules:
+                violations.append(
+                    {
+                        "kind": "module_not_declared",
+                        "module_id": mid,
+                        "fix": (
+                            f"Append `{{id: {mid}, kind: area, name: '{mid.capitalize()}'}}`"
+                            " to `.meshkore/public/cluster.yaml.modules[]` so the cockpit's"
+                            " module tree shows this module + its tasks."
+                        ),
+                    }
+                )
+        # Rule: every task's `initiative:` should reference an existing
+        # initiative file. Surfaces typos and renames.
+        initiative_ids = {self._read_id(f) for f in self.project.initiative_files()}
+        initiative_ids.discard(None)
+        for tf in self.project.task_files():
+            tid = self._read_id(tf)
+            ini = self._read_field(tf, "initiative")
+            if ini and ini not in initiative_ids:
+                violations.append(
+                    {
+                        "kind": "task_initiative_broken",
+                        "task_id": tid or tf.name,
+                        "initiative_ref": ini,
+                        "fix": (
+                            f"Task `{tid or tf.name}` references initiative"
+                            f" `{ini}` which does not exist under"
+                            " `.meshkore/roadmap/initiatives/`. Either create"
+                            " the initiative file or update the task's"
+                            " `initiative:` frontmatter to an existing id"
+                            f" (current: {sorted(initiative_ids)})."
+                        ),
+                    }
+                )
+        # Rule: every initiative whose status is `active` or `next`
+        # should have ≥1 child task. `backlog` / `done` are exempt.
+        # This catches "I created an initiative and forgot the tasks".
+        tasks_by_initiative: Dict[str, List[str]] = {}
+        for tf in self.project.task_files():
+            ini = self._read_field(tf, "initiative")
+            if ini:
+                tasks_by_initiative.setdefault(ini, []).append(tf.name)
+        for inif in self.project.initiative_files():
+            iid = self._read_id(inif)
+            status = (self._read_field(inif, "status") or "").lower()
+            if not iid:
+                continue
+            if status not in ("active", "next"):
+                continue
+            children = tasks_by_initiative.get(iid) or []
+            if not children:
+                violations.append(
+                    {
+                        "kind": "initiative_without_tasks",
+                        "initiative_id": iid,
+                        "status": status,
+                        "fix": (
+                            f"Initiative `{iid}` is `{status}` but has no child"
+                            " tasks. Either add 1-2 scaffolding tasks (linked"
+                            f" via `initiative: {iid}` in their frontmatter)"
+                            " or drop the initiative back to `status: backlog`"
+                            " until you're ready to populate it."
+                        ),
+                    }
+                )
+            # py-1.6.2 — Over-dense initiative. >12 active/next tasks
+            # under one initiative is a roadmap anti-pattern: the cockpit
+            # card becomes unscannable and the initiative is almost
+            # certainly mixing multiple work-streams.
+            elif len(children) > 12:
+                violations.append(
+                    {
+                        "kind": "initiative_too_dense",
+                        "initiative_id": iid,
+                        "child_count": len(children),
+                        "fix": (
+                            f"Initiative `{iid}` carries {len(children)} child"
+                            " tasks — that's almost always multiple work-streams"
+                            " grouped under one card. Split into work-stream-"
+                            "coherent sub-initiatives (e.g., 'Auth & identity',"
+                            " 'Canvas viewer', 'Anchoring chain'), each with"
+                            " 3-8 tasks. Repoint each task's `initiative:`"
+                            " frontmatter at its new id. Then either repurpose"
+                            f" `{iid}` as one of the new work-streams or move"
+                            " its file to `.meshkore/roadmap/initiatives/log/`"
+                            f" with `status: superseded` + `superseded_by:`."
+                        ),
+                    }
+                )
+        # py-1.4.1 — Context coverage gap (heuristic). Finds capitalised
+        # tokens (brand / product / proper-noun-ish) mentioned ≥3 times
+        # in context.md but 0 times across any task / initiative file.
+        # Conservative: stopword filter + frequency floor → low false
+        # positives. Surfaced as a single hint, NOT a hard violation.
+        coverage_gap = self._check_context_coverage()
+        if coverage_gap:
+            violations.append(coverage_gap)
+        # py-1.4.3 — Coverage matrix discipline.
+        cov_v = self._check_coverage_doc()
+        if cov_v:
+            violations.append(cov_v)
+        return violations
+
+    def _check_coverage_doc(self) -> Optional[Dict[str, Any]]:
+        """Once the cluster has at least one initiative, enforce that
+        `.meshkore/docs/coverage.md` exists and has no `?` / `TBD` /
+        `TODO` / `FIXME` placeholders in the Coverage column."""
+        if not self.project.initiative_files():
+            return None  # bootstrap still in progress; not yet expected
+        cov_path = self.paths.docs_dir / "coverage.md"
+        if not cov_path.exists():
+            return {
+                "kind": "coverage_doc_missing",
+                "fix": (
+                    "Create `.meshkore/docs/coverage.md` mapping every"
+                    " numbered requirement from the brief (sections + rules"
+                    " + explicit deliverables) to a task id OR a"
+                    " `defer: <reason>` marker. See the bootstrap brief's"
+                    " 'Coverage matrix' block for the required format —"
+                    " three sections: Sections, Rules, Explicit deliverables."
+                ),
+            }
+        try:
+            text = cov_path.read_text(errors="replace")
+        except OSError:
+            return None
+        # Detect placeholders in the Coverage column of pipe-tables.
+        # Matches `| ? |`, `| TBD |`, `| TODO |`, `| FIXME |`, `|  |`
+        # (empty), and `|   ???  |`. Case-insensitive.
+        gap_pat = re.compile(r"\|\s*(\?+|TBD|TODO|FIXME|N/A)\s*\|", re.IGNORECASE)
+        gap_hits = gap_pat.findall(text)
+        # Empty cells: only count those that look like a final column
+        # (line ends with the empty cell pipe). Skip header/separator
+        # rows ("|---|---|").
+        empty_count = 0
+        for line in text.splitlines():
+            if line.strip().startswith("|") and "---" not in line:
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if cells and cells[-1] == "":
+                    empty_count += 1
+        total_gaps = len(gap_hits) + empty_count
+        if total_gaps == 0:
+            return None
+        return {
+            "kind": "coverage_gaps_in_doc",
+            "count": total_gaps,
+            "fix": (
+                f"`.meshkore/docs/coverage.md` has {total_gaps} row(s) with"
+                " a placeholder (`?`, `TBD`, `TODO`, `FIXME`, `N/A`, or"
+                " empty) in the Coverage column. Resolve each: either add"
+                " the task that addresses the requirement (and reference"
+                " it in the cell), or replace with `defer: <reason>`."
+            ),
+        }
+
+    def _check_context_coverage(self) -> Optional[Dict[str, Any]]:
+        ctx_path = self.paths.docs_dir / "context.md"
+        if not ctx_path.exists():
+            return None
+        try:
+            ctx_text = ctx_path.read_text(errors="replace")
+        except OSError:
+            return None
+        haystack_parts: List[str] = []
+        for f in (
+            self.project.task_files(include_boilerplate=True)
+            + self.project.initiative_files()
+        ):
+            try:
+                haystack_parts.append(f.read_text(errors="replace"))
+            except OSError:
+                pass
+        haystack_lower = "\n".join(haystack_parts).lower()
+
+        # Capitalised tokens, 4+ chars, allow dot + hyphen inside (FAL.ai,
+        # DALL-E, Cloudflare, SvelteKit). All-caps acronyms are caught by
+        # the same regex.
+        pat = re.compile(r"\b[A-Z][A-Za-z0-9.\-]{3,}\b")
+        counts: Dict[str, int] = {}
+        for m in pat.finditer(ctx_text):
+            tok = m.group(0)
+            low = tok.lower()
+            if low in _COVERAGE_STOPWORDS:
+                continue
+            counts[tok] = counts.get(tok, 0) + 1
+        # Threshold: appears ≥3 times in context AND 0 times across
+        # tasks + initiatives. Top 8 by frequency.
+        gaps: List[Tuple[str, int]] = []
+        for tok, n in counts.items():
+            if n < 3:
+                continue
+            if tok.lower() in haystack_lower:
+                continue
+            gaps.append((tok, n))
+        gaps.sort(key=lambda x: (-x[1], x[0]))
+        gaps = gaps[:8]
+        if not gaps:
+            return None
+        return {
+            "kind": "context_coverage_gap",
+            "tokens": [{"token": t, "mentions": n} for t, n in gaps],
+            "fix": (
+                "These proper-noun-ish terms appear repeatedly in"
+                " `.meshkore/docs/context.md` but in 0 task / initiative"
+                " files. Either (a) add a task that addresses them, or"
+                " (b) write a `> defer: <reason>` line in context.md so"
+                " future briefings stop flagging them as gaps."
+            ),
+        }
+
+    @staticmethod
+    def _read_id(path: Any) -> Optional[str]:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            return None
+        fm = parse_frontmatter(text)
+        v = fm.get("id")
+        return str(v) if v else None
+
+    @staticmethod
+    def _read_field(path: Any, key: str) -> Optional[str]:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            return None
+        fm = parse_frontmatter(text)
+        v = fm.get(key)
+        return str(v) if v else None
+
+
+# py-1.7.0 — Specialised agent prompt registry. Each agent type gets a
+# role + focus + redirect + storage rules block. The default "custom"
+# (a.k.a. General coder) keeps the original coordinator behaviour: full
+# roadmap / module / task authority. Service agents (deploy / db /
+# testing / audit / docs / review) get a tight focus + an explicit
+# "redirect to General coder" clause so they refuse out-of-scope work
+# cleanly instead of bumbling into roadmap edits.
+#
+# Why declarative: scaling. Adding a new agent type later = one entry
+# here, no `if agent_type == 'foo':` branches scattered across the
+# briefing pipeline. The pipeline reads from this dict.
+AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
+    "custom": {
+        "label": "General coder",
+        "role": (
+            "You are the **general coder** for this MeshKore cluster. "
+            "This is the default coordinator role — you own the roadmap, "
+            "modules, tasks, integrity checks, deploys, docs, the lot. "
+            "Specialised agents (deploy / db / testing / audit / docs / "
+            "review) exist for narrow service work; everything else is "
+            "yours."
+        ),
+        "focus": "",  # general coder has no narrowing focus
+        "redirect": "",
+        "rules_addendum": "",
+    },
+    "deploy": {
+        "label": "Deploy",
+        "role": (
+            "You are the **deploy** agent. Your job is shipping this "
+            "cluster's code to its runtime targets (Cloudflare Pages, "
+            "Workers, R2, custom hosts) and keeping the build / CI / "
+            "credentials story healthy."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Build & deploy commands (wrangler, npm, custom scripts).\n"
+            "- Git hygiene before deploy: refuse to deploy uncommitted "
+            "changes silently — surface them and ask what to do.\n"
+            "- Credentials & auth: know **where** they live "
+            "(`.meshkore/credentials/`), never read/print/leak them, "
+            "never commit them. If a deploy fails on auth, surface the "
+            "missing token name and ask the operator to provide it.\n"
+            "- Version bumps: use `POST /version/next` to pick the next "
+            "version; never invent a number.\n"
+            "- After every successful deploy, append a 1-line entry to "
+            "`.meshkore/log/<UTC-date>.md` recording target + version + "
+            "commit SHA + URL.\n"
+            "- Coordinate with the general coder when the deploy uncovers "
+            "code changes needed (e.g. broken build) — flag it, don't fix "
+            "it yourself unless the operator OKs."
+        ),
+        "redirect": (
+            "If the operator asks you to edit the roadmap, change task "
+            "definitions, write features, or do general coding work, "
+            "answer: \"I'm the deploy agent — for roadmap / coordination "
+            '/ feature work please use the General coder." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+    "db": {
+        "label": "Database",
+        "role": (
+            "You are the **database** agent. You own schemas, migrations, "
+            "seeds, backups, and data-shape decisions for this cluster's "
+            "stores (Postgres, D1, KV, R2, SQLite, whatever applies)."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Migrations: every schema change ships as a numbered, "
+            "reversible migration file. Never `DROP` or destructive "
+            "`ALTER` without a backup + the operator's explicit OK.\n"
+            "- Before migrating production data: dump first to "
+            "`.meshkore/.runtime/backups/<UTC-ts>/` (gitignored).\n"
+            "- Record every applied migration in "
+            "`.meshkore/log/<UTC-date>.md` (file + target + outcome).\n"
+            "- Cross-talk with deploy: when a migration must run before a "
+            "deploy, flag it — don't run the deploy yourself."
+        ),
+        "redirect": (
+            "If the operator asks for roadmap edits, feature work, or "
+            "anything outside schemas / data / migrations, answer: \"I'm "
+            "the database agent — for roadmap / coordination / feature "
+            'work please use the General coder." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+    "testing": {
+        "label": "Testing",
+        "role": (
+            "You are the **testing** agent. You write, run, and maintain "
+            "tests (unit / integration / e2e / contract) for this "
+            "cluster — and only those."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Cover the golden path AND edge cases. Type-checks and "
+            "lints are not tests — flag missing real tests when you see "
+            "them.\n"
+            "- Test code only: you may add fixtures, mocks, harnesses, "
+            "and CI test config. You may NOT change production code to "
+            "make tests pass — surface the bug to the general coder.\n"
+            "- After a substantive test run / new test file, append a "
+            "summary to `.meshkore/log/<UTC-date>.md` (what was tested, "
+            "pass/fail counts, anything flaky)."
+        ),
+        "redirect": (
+            "If the operator asks for production-code edits, refactors, "
+            "roadmap changes, or features, answer: \"I'm the testing "
+            "agent — for production code or roadmap work please use the "
+            'General coder." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+    "audit": {
+        "label": "Audit",
+        "role": (
+            "You are the **audit** agent. Read-only. You inspect the "
+            "cluster (code, roadmap, state, deploys, deps) and report "
+            "findings — you never apply fixes yourself."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Find: security issues, drift between standard.json and the "
+            "cluster, orphan modules / broken refs, dependency risks, "
+            "credentials in the wrong place, dense initiatives, missing "
+            "coverage matrix rows.\n"
+            "- Report: open `.meshkore/log/<UTC-date>.md` with an `Audit "
+            "findings` section listing each finding with severity + "
+            "suggested owner (general coder / deploy / db / etc.).\n"
+            "- Never edit code or roadmap files. If the operator asks "
+            "you to fix something, surface what you'd change and ask "
+            "them to hand it off."
+        ),
+        "redirect": (
+            "If asked to edit or implement anything, answer: \"I'm the "
+            "audit agent — I report, I don't fix. Hand this to the "
+            "General coder (or the relevant specialist) once you've "
+            'decided what to do." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+    "docs": {
+        "label": "Docs",
+        "role": (
+            "You are the **docs** agent. You own narrative documentation: "
+            "READMEs, operator manuals, architecture notes, "
+            "`.meshkore/docs/*.md`, comments at file headers."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Markdown / prose / examples only. You may add diagrams "
+            "(mermaid blocks).\n"
+            "- Read code to understand it, but don't change behaviour. "
+            "Inline JSDoc / docstrings that explain *why* are allowed; "
+            "refactors are not.\n"
+            "- After a substantive docs pass, log it to "
+            "`.meshkore/log/<UTC-date>.md` (files touched, what changed "
+            "at a high level).\n"
+            "- Keep `.meshkore/docs/coverage.md` honest if you discover "
+            "a gap between docs and reality — flag the gap, don't paper "
+            "over it."
+        ),
+        "redirect": (
+            "If asked to change code behaviour, edit the roadmap, or do "
+            "feature work, answer: \"I'm the docs agent — for code or "
+            'roadmap changes please use the General coder." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+    "review": {
+        "label": "Review",
+        "role": (
+            "You are the **review** agent. You read recent changes (git "
+            "diff, modified files, recent commits) and give code-review "
+            "feedback — you don't apply changes."
+        ),
+        "focus": (
+            "## Your focus\n\n"
+            "- Comment on: correctness, security, complexity, test "
+            "coverage, naming, missing edge cases.\n"
+            "- Focus on what would block merge, not stylistic taste.\n"
+            "- After a substantive review, log a summary to "
+            "`.meshkore/log/<UTC-date>.md` (files reviewed, top findings, "
+            "verdict).\n"
+            "- If you want a change made, write it as a suggested diff "
+            "the operator can hand to the General coder — don't apply it."
+        ),
+        "redirect": (
+            "If asked to apply fixes, refactor, or do new work, answer: "
+            "\"I'm the review agent — I comment, I don't merge. Hand "
+            'this to the General coder." Then stop.'
+        ),
+        "rules_addendum": "",
+    },
+}
+
+
+def _agent_type_normalised(t: Optional[str]) -> str:
+    """Return a known agent_type, defaulting to 'custom' if missing/unknown."""
+    if not t:
+        return "custom"
+    t = str(t).strip().lower()
+    return t if t in AGENT_PROMPTS else "custom"
+
+
+class BriefingPipeline:
+    """Composes the prompt sent to `claude -p` for one agent turn.
+    See module-level comment above for the section order + rationale."""
+
+    SECTION_SEP = "\n\n---\n\n"
+
+    def __init__(
+        self,
+        *,
+        paths: "Paths",
+        cluster: "Cluster",
+        identity: str,
+        conv: str,
+        user_text: str,
+        context_docs: Optional[List[Dict[str, Any]]] = None,
+        agent_type: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ):
+        self.paths = paths
+        self.cluster = cluster
+        self.identity = identity
+        self.conv = conv
+        self.user_text = user_text
+        self.context_docs = context_docs or []
+        # py-1.7.0 — agent_type drives role / focus / redirect / rules
+        # selection from AGENT_PROMPTS. Defaults to 'custom' (General
+        # coder) when missing/unknown so older cockpits and direct API
+        # callers keep working.
+        self.agent_type = _agent_type_normalised(agent_type)
+        self.agent_id = (agent_id or "").strip() or None
+        self.project = ProjectState(paths)
+        self.integrity = StateIntegrityChecker(paths, cluster, self.project)
+        # py-1.7.0 — cadence: detect whether this conv has had any prior
+        # assistant turn. The full role+rules block is sent on the first
+        # turn (so the agent gets the complete onboarding); on subsequent
+        # turns we send a tight role reminder only, saving tokens and
+        # keeping the conversation snappier.
+        self.is_first_turn = self._detect_first_turn()
+
+    def _detect_first_turn(self) -> bool:
+        try:
+            for f in _iter_timeline_files(self.paths):
+                for ev in _read_timeline_file(f):
+                    if ev.get("conv") != self.conv:
+                        continue
+                    if ev.get("type") in (
+                        "chat.assistant.final",
+                        "chat.assistant.delta",
+                    ):
+                        return False
+            return True
+        except Exception:
+            return True
+
+    def build(self) -> str:
+        sections = [
+            self._section_role(),
+            self._section_core_rules(),
+            self._section_agent_focus(),
+            self._section_agent_redirect(),
+            self._section_agent_memory(),
+            self._section_cluster_snapshot(),
+            self._section_project_mode(),
+            self._section_integrity(),
+            self._section_cockpit_context(),
+            self._section_history(),
+            self._section_user_turn(),
+        ]
+        return self.SECTION_SEP.join(s for s in sections if s and s.strip())
+
+    # ── sections ──────────────────────────────────────────────────
+
+    def _section_role(self) -> str:
+        # py-1.7.0 — Role text is now driven by AGENT_PROMPTS so service
+        # agents (deploy / db / testing / ...) get their own framing,
+        # not a generic "coordinator" label.
+        prompt = AGENT_PROMPTS.get(self.agent_type) or AGENT_PROMPTS["custom"]
+        role = prompt["role"]
+        # On subsequent turns, send a tight role reminder only.
+        if not self.is_first_turn:
+            return (
+                f"## Role reminder\n\n{role}\n\n"
+                f"Cluster root: `{self.paths.root}` · Identity: "
+                f"`{self.identity}` · Conv: `{self.conv}`"
+                + (f" · Agent: `{self.agent_id}`" if self.agent_id else "")
+            )
+        return (
+            f"## Role\n\n{role}\n\n"
+            f"Cluster root: `{self.paths.root}`\nIdentity: `{self.identity}`"
+            f" · Conv: `{self.conv}`"
+            + (f" · Agent: `{self.agent_id}`" if self.agent_id else "")
+        )
+
+    def _section_core_rules(self) -> str:
+        try:
+            port = int(self.paths.port_file.read_text().strip())
+        except (OSError, ValueError):
+            port = 5570
+
+        # py-1.7.0 — Universal rules: every agent type sees these every
+        # turn. Short, load-bearing. These are NOT role-specific.
+        universal = [
+            "## Universal rules (every agent, every turn)",
+            "",
+            "- Don't push to git unless the user explicitly asks.",
+            f"- Don't invent version numbers; ask `POST localhost:{port}/version/next`.",
+            "- Never edit `.meshkore/credentials/`, `.meshkore/.runtime/` or generated `state.json`.",
+            "- The cockpit auto-refreshes ~2s after any write under `.meshkore/` — don't tell the user to reload.",
+            "- Reply concisely. The portal renders your stdout as the chat answer.",
+            "",
+            "## MeshKore standard (where things live)",
+            "",
+            "- `.meshkore/` — everything the cluster knows lives here. The operator never edits it by hand; you do.",
+            "- `.meshkore/modules/<id>/` — module-scoped work. Tasks live at `.meshkore/modules/<id>/tasks/*.md`.",
+            "- `.meshkore/roadmap/initiatives/*.md` — initiatives (work-streams). Status: `active` / `next` / `backlog` / `done`.",
+            "- `.meshkore/log/<UTC-date>.md` — daily activity log. **Append a 1-paragraph entry when you mutate ≥3 files in a turn**, single-file touch-ups don't need one.",
+            "- `.meshkore/docs/coverage.md` — coverage matrix (requirement → which task delivers it).",
+            "- `.meshkore/agents/_types/<agent-type>/memory.md` — your role's long-term memory (see below).",
+            "",
+            "## Daemon endpoints you should know",
+            "",
+            f"- `POST localhost:{port}/version/next` — get the next valid version for a key (never invent numbers).",
+            f"- `POST localhost:{port}/log/append` (or just append to `.meshkore/log/<UTC-date>.md` directly) — operator activity log.",
+            f"- `GET  localhost:{port}/state` — current cluster state (initiatives, tasks, modules, integrity flags).",
+            f"- `POST localhost:{port}/chat/dispatch` — used by the cockpit; you receive your prompt via this path, you don't call it.",
+            "",
+            "## How to flag persistent learnings",
+            "",
+            "- When you discover something other agents of your role would want to know next time (a credential location, a flaky test pattern, a migration gotcha), end your reply with a line: `REMEMBER: <one short fact>`.",
+            "- The daemon harvests `REMEMBER:` lines and appends them to your role's `memory.md`. Don't write to that file directly.",
+            "",
+            "Reference docs:",
+            "  - https://meshkore.com/standard.json — canonical schemas",
+            "  - https://meshkore.com/cluster/operate — operator manual",
+            "  - `.meshkore/docs/context.md` — project-specific context (if present)",
+            "  - `.meshkore/docs/conventions/*.md` — repo conventions",
+        ]
+
+        # General coder ('custom') additionally owns the roadmap, so it
+        # gets the granularity rules. Service agents don't.
+        if self.agent_type == "custom":
+            general_coder_extras = [
+                "",
+                "## Module / task / initiative authority (General coder only)",
+                "",
+                "- When you create a new module directory `.meshkore/modules/<id>/`, ALSO add `{id: <id>, kind: area, name: '<Title>'}` to `cluster.yaml.modules[]`.",
+                "- Every initiative you mark `active` or `next` must have ≥1 child task linked via `initiative: <id>` in the task's frontmatter. Use `status: backlog` for placeholders.",
+                "",
+                "### Task granularity",
+                "",
+                "- Target grain: **one task ≈ one week of focused work**.",
+                "- If a candidate task would take > 2 weeks to deliver, split it (with `depends_on:` chains).",
+                "- If a candidate task would take < 2 days, fold it into a sibling or the parent task's body.",
+                "- Every task body MUST end with a `## Done when` section listing 2-5 concrete acceptance criteria the operator can verify without asking you.",
+                "",
+                "### Initiative granularity",
+                "",
+                '- Each initiative = **ONE coherent work-stream**, never a phase or release name. ✓ "Auth & identity", "Payments & credits". ✗ "MVP", "Phase 1", "Closed beta".',
+                "- Target shape: **3-8 child tasks** in `active` / `next` status.",
+                "- **Hard limit: never > 12 active/next tasks** per initiative. The integrity check (next turn's briefing) flags over-dense initiatives.",
+                "- **Lower limit: ≥ 2 child tasks** for any active/next initiative. If only 1 task fits — fold, or drop the initiative back to `backlog`.",
+                "- When SPLITTING an initiative: create the new files first, re-point each child task's `initiative:` frontmatter, then move the old file to `.meshkore/roadmap/initiatives/log/<old-id>.md` with `status: superseded` + `superseded_by:`.",
+                "- An initiative's `## Done when` is the WORK-STREAM completion signal, verifiable independently.",
+                "",
+                "### Coverage matrix",
+                "",
+                "- When you create or modify any task / initiative, update `.meshkore/docs/coverage.md` to reflect it. Create the file if missing.",
+            ]
+            return "\n".join(universal + general_coder_extras)
+        return "\n".join(universal)
+
+    def _section_agent_focus(self) -> str:
+        # py-1.7.0 — Service agents get their narrow focus block. The
+        # General coder doesn't (it has no narrowing focus — its scope
+        # is the whole cluster).
+        prompt = AGENT_PROMPTS.get(self.agent_type) or AGENT_PROMPTS["custom"]
+        focus = prompt.get("focus") or ""
+        return focus.strip()
+
+    def _section_agent_redirect(self) -> str:
+        # py-1.7.0 — Out-of-scope policy for service agents. General
+        # coder has nothing to redirect.
+        prompt = AGENT_PROMPTS.get(self.agent_type) or AGENT_PROMPTS["custom"]
+        redirect = prompt.get("redirect") or ""
+        if not redirect.strip():
+            return ""
+        return "## Out-of-scope policy\n\n" + redirect.strip()
+
+    def _section_agent_memory(self) -> str:
+        # py-1.7.0 — Per-type long-term memory at
+        # `.meshkore/agents/_types/<agent-type>/memory.md`. Populated by
+        # the daemon when the agent ends a turn with `REMEMBER: …`
+        # lines. Shared across all conversations of the same role.
+        try:
+            mem_path = self.paths.agents_dir / "_types" / self.agent_type / "memory.md"
+            if not mem_path.exists():
+                return ""
+            txt = mem_path.read_text(errors="replace").strip()
+            if not txt:
+                return ""
+            # Cap to ~4 KB so this section never dominates the briefing.
+            if len(txt) > 4096:
+                txt = txt[-4096:]
+                # Trim to start of next line so we don't cut mid-entry.
+                nl = txt.find("\n")
+                if nl > 0:
+                    txt = txt[nl + 1 :]
+            return (
+                f"## Your role's accumulated memory "
+                f"(`agents/_types/{self.agent_type}/memory.md`)\n\n"
+                f"{txt}\n\n"
+                "These are facts past instances of your role have flagged "
+                "as worth remembering. Use them; don't repeat them back."
+            )
+        except Exception:
+            return ""
+
+    def _section_cluster_snapshot(self) -> str:
+        n_ini = len(self.project.initiative_files())
+        n_tasks = len(self.project.task_files())
+        declared_mods = self.cluster.data.get("modules") or []
+        n_decl_mods = len(declared_mods) if isinstance(declared_mods, list) else 0
+        n_dir_mods = len(self.project.module_dirs())
+        bits = [
+            f"- {n_ini} initiative(s) at `.meshkore/roadmap/initiatives/`",
+            f"- {n_tasks} task(s) across modules (excluding the wizard's T1-hello boilerplate)",
+            f"- {n_decl_mods} module(s) declared in `cluster.yaml.modules[]`",
+        ]
+        if n_dir_mods != n_decl_mods:
+            bits.append(
+                f"- {n_dir_mods} module directory(ies) on disk — mismatch with declared"
+                " (see Integrity section below)"
+            )
+        return "## Cluster snapshot\n\n" + "\n".join(bits)
+
+    def _section_project_mode(self) -> str:
+        if not self.project.is_empty():
+            return ""
+        # py-1.4.3 — Scale the target task count by brief size. Briefs
+        # in the kilobytes deserve more granular task decomposition than
+        # "build a todo list" one-liners. Sources of brief size,
+        # in order of preference: context.md (already written),
+        # accumulated chat.user texts in this conv, the current
+        # user_text. The number is heuristic, not enforced — the agent
+        # picks a sensible point inside the range.
+        brief_chars = self._estimate_brief_size()
+        if brief_chars < 500:
+            ini_range, task_range, breadth = "1-2", "3-8", "tiny"
+        elif brief_chars < 2000:
+            ini_range, task_range, breadth = "2-4", "8-15", "small"
+        elif brief_chars < 5000:
+            ini_range, task_range, breadth = "3-5", "15-25", "medium"
+        elif brief_chars < 10000:
+            ini_range, task_range, breadth = "3-6", "25-40", "large"
+        else:
+            ini_range, task_range, breadth = "4-8", "40-60", "comprehensive"
+        return "\n".join(
+            [
+                "## Project mode: BOOTSTRAPPING (empty cluster)",
+                "",
+                f"The cluster at `{self.paths.root}` has 0 initiatives + 0 real",
+                "tasks. Your purpose right now is to bootstrap the roadmap,",
+                "not to interrogate the user until you have a perfect brief.",
+                "",
+                "**Write FIRST, talk SECOND.** As soon as the user has given",
+                "you ANY substantive description of the project — its goal,",
+                "audience, rough scope, any constraint — STOP asking",
+                "clarifying questions and write:",
+                "",
+                f"### Brief size: ≈ {brief_chars} chars → {breadth} scope",
+                "",
+                f"  - **{ini_range} initiatives** at `.meshkore/roadmap/initiatives/<id>.md`",
+                "    (frontmatter per `initiative` schema). Each initiative is a",
+                '    **coherent work-stream**, named by what it builds: "Auth &',
+                '    identity", "Canvas viewer", "Anchoring chain", "Payments",',
+                '    "Observability". NEVER name initiatives by phase ("MVP",',
+                '    "Phase 1", "Closed beta") — those collapse into one giant',
+                "    catch-all card and break the roadmap UX. Target 3-8 child",
+                "    tasks per initiative; hard limit 12. The next-turn integrity",
+                "    check flags initiatives that exceed that.",
+                f"  - **{task_range} initial tasks** distributed across modules",
+                "    under `.meshkore/modules/<module>/tasks/<id>.md`. Bias",
+                "    towards MORE tasks if the brief is long — every numbered",
+                "    section, every rule, every explicit deliverable that's",
+                "    in scope for Phase 1 should map to either a task or an",
+                "    explicit `defer: <reason>` marker in coverage.md (see",
+                "    below). Each task ≈ one week of focused work; split",
+                "    tasks that exceed two weeks; fold tasks under two days.",
+                "    Module directories MUST be declared in `cluster.yaml.modules[]`",
+                "    on creation (otherwise the cockpit tree won't show them).",
+                "  - A short `.meshkore/docs/context.md` capturing goal,",
+                "    audience, constraints, and non-obvious decisions from the",
+                "    brief. Frontmatter per `doc_frontmatter`.",
+                "",
+                "### Coverage matrix (mandatory deliverable)",
+                "",
+                "Write `.meshkore/docs/coverage.md` mapping EVERY numbered",
+                "section, EVERY rule, and EVERY explicit deliverable in the",
+                "user's brief to a task id OR a `defer: <reason>` marker.",
+                "This is what makes the roadmap auditable — without it, gaps",
+                "stay invisible until someone notices a feature wasn't built.",
+                "Required shape (3 sections, in order):",
+                "",
+                "```markdown",
+                "---",
+                "title: Coverage matrix",
+                "updated: YYYY-MM-DD",
+                "owner: <you>",
+                "---",
+                "",
+                "# Coverage matrix — `<cluster>`",
+                "",
+                "Maps every brief requirement to a task id or a deferral.",
+                "Maintained on every roadmap-modifying turn.",
+                "",
+                "## Sections",
+                "",
+                "| Source | Requirement | Coverage |",
+                "|---|---|---|",
+                "| §4 Cosmology | Halo FIFO eviction | API7 |",
+                "| §4 Cosmology | Oort decay state machine | WEB5 |",
+                "| §6 Economic | Referral program | defer: Phase 4 (growth) |",
+                "",
+                "## Rules",
+                "",
+                "| # | Rule | Coverage |",
+                "|---|---|---|",
+                "| 1 | AI-only generation | AI1 |",
+                "| 10 | Named zones | defer: Phase 5 (B2B) |",
+                "",
+                "## Explicit deliverables",
+                "",
+                "| Deliverable | Coverage |",
+                "|---|---|",
+                "| Architecture document | DOC1 |",
+                "| Risk register | DOC2 |",
+                "```",
+                "",
+                "Rules for the Coverage column:",
+                "- Task id (e.g., `WEB2`) → that task addresses the requirement",
+                "- `defer: <one-line reason>` → out of scope for current phase",
+                "- `?` / `TBD` / empty → integrity check will flag it on the",
+                "  next turn. Don't leave these in the final output.",
+                "",
+                "### Other rules for this bootstrap turn",
+                "",
+                "Mark assumptions with `> assumption: …` inside file bodies.",
+                "Every task body ends with `## Done when` (2-5 acceptance",
+                "criteria, observable, present tense).",
+                "",
+                "When done writing, reply with: (a) one short paragraph summary,",
+                "(b) at MOST two open questions whose answers would materially",
+                "change the plan. Do NOT paste file contents back — the",
+                "cockpit auto-refreshes within ~2 seconds.",
+                "",
+                "If the user said almost nothing (literally 'hi', 'test',",
+                "one-word), ask ONE focused question and stop. Never more.",
+                "",
+                "Once this turn lands files, the cluster is no longer empty",
+                "and this section disappears from future briefings.",
+            ]
+        )
+
+    def _estimate_brief_size(self) -> int:
+        """Best-available signal for how big the project brief is.
+        Drives the bootstrap task-count target. Sources, in order:
+        (1) context.md if present, (2) accumulated chat.user texts in
+        the current conv from .meshkore/timeline/, (3) the current
+        user_text. Returns total chars."""
+        # Source 1: context.md (already written on prior turns).
+        ctx = self.paths.docs_dir / "context.md"
+        if ctx.exists():
+            try:
+                size = len(ctx.read_text(errors="replace"))
+                if size > 0:
+                    return size
+            except OSError:
+                pass
+        # Source 2: sum of all chat.user texts in this conv.
+        total = 0
+        try:
+            if self.paths.timeline_dir.exists():
+                for f in sorted(self.paths.timeline_dir.glob("*.jsonl")):
+                    try:
+                        for line in f.read_text(errors="replace").splitlines():
+                            try:
+                                ev = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                ev.get("conv") == self.conv
+                                and ev.get("type") == "chat.user"
+                            ):
+                                total += len(ev.get("text") or "")
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+        if total > 0:
+            return total
+        # Source 3: this turn's user_text.
+        return len(self.user_text or "")
+
+    def _section_integrity(self) -> str:
+        violations = self.integrity.check()
+        if not violations:
+            return ""
+        lines = [
+            "## Integrity hints (please fix as part of this turn)",
+            "",
+            f"State-integrity check found {len(violations)} issue(s) you",
+            "can resolve quickly. They are NOT blocking — proceed with the",
+            "user's request first, then fix as you go.",
+            "",
+        ]
+        for v in violations:
+            kind = v.get("kind", "unknown")
+            fix = v.get("fix", "(no fix suggested)")
+            if kind == "module_not_declared":
+                lines.append(f"- **Orphan module** `{v.get('module_id')}` — {fix}")
+            elif kind == "task_initiative_broken":
+                lines.append(
+                    f"- **Broken initiative ref** task=`{v.get('task_id')}`"
+                    f" → initiative=`{v.get('initiative_ref')}` — {fix}"
+                )
+            elif kind == "initiative_without_tasks":
+                lines.append(
+                    f"- **Initiative without tasks** `{v.get('initiative_id')}`"
+                    f" (status: `{v.get('status')}`) — {fix}"
+                )
+            elif kind == "initiative_too_dense":
+                lines.append(
+                    f"- **Initiative too dense** `{v.get('initiative_id')}`"
+                    f" carries {v.get('child_count')} active/next tasks"
+                    f" — {fix}"
+                )
+            elif kind == "context_coverage_gap":
+                toks = v.get("tokens") or []
+                pretty = ", ".join(
+                    f"`{t.get('token')}` ({t.get('mentions')}×)" for t in toks
+                )
+                lines.append(
+                    f"- **Potential coverage gaps (tokens)** — {pretty} — {fix}"
+                )
+            elif kind == "coverage_doc_missing":
+                lines.append(f"- **Coverage matrix missing** — {fix}")
+            elif kind == "coverage_gaps_in_doc":
+                n = v.get("count", "?")
+                lines.append(f"- **Coverage matrix has {n} unresolved row(s)** — {fix}")
+            else:
+                lines.append(f"- **{kind}** — {fix}")
+        return "\n".join(lines)
+
+    def _section_cockpit_context(self) -> str:
+        if not self.context_docs:
+            return ""
+        lines = [
+            "## Context attached by the operator's cockpit",
+            "",
+            "The architect cockpit sent these documents alongside the",
+            "user's message. Treat them as authoritative context for this",
+            "turn (operator's intent, scope, recent UI state).",
+            "",
+        ]
+        for doc in self.context_docs:
+            if not isinstance(doc, dict):
+                continue
+            fname = doc.get("filename") or "(unnamed)"
+            content = (doc.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(f"### `{fname}`")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def _section_history(self) -> str:
+        turns = _conversation_history(self.paths, self.conv)
+        if not turns:
+            return ""
+        return "## Recent turns in this conversation\n\n" + "\n".join(turns)
+
+    def _section_user_turn(self) -> str:
+        body = self.user_text.strip() if self.user_text else ""
+        if not body:
+            return "## User just said\n\n(empty message)"
+        return "## User just said\n\n" + body
 
 
 class ChatRunner:
@@ -1215,6 +2523,9 @@ class ChatRunner:
         identity: str,
         conv: str,
         prompt: str,
+        context_docs: Optional[List[Dict[str, Any]]] = None,
+        agent_type: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ):
         self.paths = paths
         self.cluster = cluster
@@ -1222,6 +2533,14 @@ class ChatRunner:
         self.identity = identity
         self.conv = conv
         self.prompt = prompt
+        # py-1.4.0 — Carried into BriefingPipeline so the cockpit can
+        # attach project-specific context (bootstrap brief, scope
+        # hints, integrity check overrides, …) on a per-turn basis.
+        self.context_docs: List[Dict[str, Any]] = context_docs or []
+        # py-1.7.0 — agent_type drives specialised prompt selection,
+        # agent_id is the human label (A001, A002, …) for logging.
+        self.agent_type = _agent_type_normalised(agent_type)
+        self.agent_id = (agent_id or "").strip() or None
         self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
         self.pid: Optional[int] = None
         self.proc: Any = None  # subprocess.Popen
@@ -1230,40 +2549,21 @@ class ChatRunner:
         self._cumulative_text = ""
 
     def _briefing(self) -> str:
-        history = _conversation_history(self.paths, self.conv)
-        history_block = (
-            ("Recent turns in this conversation:\n" + "\n".join(history) + "\n")
-            if history
-            else ""
-        )
-        try:
-            port = int(self.paths.port_file.read_text().strip())
-        except (OSError, ValueError):
-            port = 5570
-        return "\n".join(
-            [
-                f"You are the coordinator agent for a MeshKore cluster at {self.paths.root}.",
-                f"Identity: {self.identity}. Conversation id: {self.conv}.",
-                "",
-                "Read these before deciding what to do (in order, only what you need):",
-                "  • https://meshkore.com/cluster/operate — operator manual",
-                "  • .meshkore/docs/conventions/versioning.md — commits + versions",
-                "  • .meshkore/docs/conventions/context-workflow.md — every-change checklist",
-                "  • .meshkore/modules/<module>/{README.md,tasks/,log/} — per-module work",
-                "",
-                "Hard rules:",
-                "  • Don't push to git unless the user explicitly asks.",
-                f"  • Don't invent version numbers; ask POST localhost:{port}/version/next.",
-                "  • Never edit .meshkore/credentials/, .meshkore/.runtime/ or generated state.json.",
-                "  • Reply concisely. The portal renders your stdout as the chat answer.",
-                "",
-                history_block,
-                "User just said:",
-                self.prompt,
-                "",
-                'If the user is vague (e.g. "continue", "siguiente tarea", "next"), look at the roadmap (state.json or .meshkore/modules/*/tasks/) and pick the highest-priority next/in_progress task that is unblocked. Tell them what you\'re picking and why before doing the work.',
-            ]
-        )
+        # py-1.4.0 — the briefing is now composed by BriefingPipeline.
+        # Each section (role, core rules, cluster snapshot, project
+        # mode, integrity hints, cockpit context, history, user turn)
+        # is independently maintained. See the class definition above
+        # this file's HTTP handler block.
+        return BriefingPipeline(
+            paths=self.paths,
+            cluster=self.cluster,
+            identity=self.identity,
+            conv=self.conv,
+            user_text=self.prompt,
+            context_docs=self.context_docs,
+            agent_type=self.agent_type,
+            agent_id=self.agent_id,
+        ).build()
 
     def spawn(self) -> None:
         import subprocess
@@ -1286,6 +2586,20 @@ class ChatRunner:
             )
             self.done.set()
             return
+        # py-1.6.1 HOTFIX — --session-id from py-1.6.0 caused empty
+        # assistant responses in production (claude-code exited
+        # silently on subsequent turns of the same conv). Reverted to
+        # opt-in via env var MESHKORE_CLAUDE_SESSION_ID=1. Default off
+        # until the failure mode is understood and re-tested.
+        # The uuid5 helper is preserved so reintroduction is a one-line
+        # flip once safe.
+        session_id = _session_id_for_conv(self.conv)
+        use_session = os.environ.get("MESHKORE_CLAUDE_SESSION_ID", "").strip() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         args = [
             claude_bin,
             "-p",
@@ -1295,12 +2609,17 @@ class ChatRunner:
             "--include-partial-messages",
             "--permission-mode",
             "bypassPermissions",
-            self._briefing(),
         ]
+        if use_session:
+            args[2:2] = ["--session-id", session_id]
+        args.append(self._briefing())
         env = {
             **os.environ,
             "MESHKORE_IDENTITY": self.identity,
             "MESHKORE_CONV": self.conv,
+            # py-1.6.0 — expose session id to child so the agent can
+            # reference it if it spawns sub-tools.
+            "MESHKORE_SESSION_ID": session_id,
         }
         self.proc = subprocess.Popen(
             args,
@@ -1400,36 +2719,59 @@ class ChatRunner:
                     and (inner.get("content_block") or {}).get("type") == "tool_use"
                 ):
                     cb = inner.get("content_block") or {}
+                    # py-1.5.0 — Persist tool.use to timeline so the
+                    # cockpit can replay full turn detail after a reload
+                    # or a daemon restart. Previously broadcast-only,
+                    # which made historical turns auditable only via
+                    # git log of the files the agent touched.
                     self.hub.broadcast(
-                        {
-                            "type": "tool.use",
-                            "author": self.identity,
-                            "conv": self.conv,
-                            "stream_id": self.stream_id,
-                            "tool": cb.get("name"),
-                            "input": cb.get("input"),
-                            "ts": _iso_now(),
-                        }
+                        _append_timeline(
+                            self.paths,
+                            {
+                                "type": "tool.use",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "tool": cb.get("name"),
+                                "input": cb.get("input"),
+                            },
+                        )
                     )
                 continue
             if ev_type == "user":
                 for c in (ev.get("message") or {}).get("content") or []:
                     if isinstance(c, dict) and c.get("type") == "tool_result":
+                        # py-1.5.0 — Persist tool.result too (was
+                        # broadcast-only). Pair-matched to a tool.use
+                        # via stream_id in the cockpit.
                         self.hub.broadcast(
-                            {
-                                "type": "tool.result",
-                                "author": self.identity,
-                                "conv": self.conv,
-                                "stream_id": self.stream_id,
-                                "ok": not c.get("is_error"),
-                                "ts": _iso_now(),
-                            }
+                            _append_timeline(
+                                self.paths,
+                                {
+                                    "type": "tool.result",
+                                    "author": self.identity,
+                                    "conv": self.conv,
+                                    "stream_id": self.stream_id,
+                                    "ok": not c.get("is_error"),
+                                },
+                            )
                         )
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
         # Finalize
         final_text = result_text or self._cumulative_text
+        # py-1.7.0 — Harvest REMEMBER: lines into the role's shared
+        # memory. Anything the agent flags ("REMEMBER: credentials live
+        # at …") gets appended once, deduplicated. Lines are also
+        # stripped from the final response shown in the chat so they
+        # don't clutter the UI.
+        cleaned_text, harvested = self._harvest_remember_lines(final_text)
+        if harvested:
+            try:
+                self._append_role_memory(harvested)
+            except Exception as e:
+                _log(f"role memory append failed: {e}")
         self.hub.broadcast(
             _append_timeline(
                 self.paths,
@@ -1438,7 +2780,7 @@ class ChatRunner:
                     "author": self.identity,
                     "conv": self.conv,
                     "stream_id": self.stream_id,
-                    "text": final_text,
+                    "text": cleaned_text,
                 },
             )
         )
@@ -1453,6 +2795,248 @@ class ChatRunner:
         )
         self.done.set()
 
+    def _harvest_remember_lines(self, text: str) -> Tuple[str, List[str]]:
+        """Extract any `REMEMBER: …` lines from `text` and return
+        (cleaned text, list of remembered facts). Case-insensitive on
+        the marker; one fact per line."""
+        if not text:
+            return text, []
+        kept: List[str] = []
+        harvested: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            low = stripped.lower()
+            # Allow "REMEMBER: ...", "- REMEMBER: ...", "* REMEMBER: ..."
+            for prefix in ("remember:", "- remember:", "* remember:"):
+                if low.startswith(prefix):
+                    fact = stripped[len(prefix) :].strip()
+                    # When the prefix had a list bullet, strip the bullet.
+                    if prefix.startswith(("-", "*")):
+                        fact = fact.lstrip()
+                    if fact:
+                        harvested.append(fact)
+                    break
+            else:
+                kept.append(line)
+                continue
+        cleaned = "\n".join(kept).rstrip()
+        return cleaned, harvested
+
+    def _append_role_memory(self, facts: List[str]) -> None:
+        """Append facts to `.meshkore/agents/_types/<agent-type>/memory.md`,
+        deduplicating against what's already in the file. Each entry
+        prefixed with its UTC date so memory has provenance."""
+        if not facts:
+            return
+        from datetime import datetime as _dt
+
+        today = _dt.utcnow().strftime("%Y-%m-%d")
+        d = self.paths.agents_dir / "_types" / self.agent_type
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "memory.md"
+        existing = ""
+        try:
+            existing = path.read_text(errors="replace") if path.exists() else ""
+        except OSError:
+            existing = ""
+        existing_lc = existing.lower()
+        new_blocks: List[str] = []
+        for fact in facts:
+            if fact.lower() in existing_lc:
+                continue
+            new_blocks.append(f"- {today} · {fact}")
+        if not new_blocks:
+            return
+        header = ""
+        if not existing.strip():
+            header = (
+                f"# `{self.agent_type}` role memory\n\n"
+                f"Long-lived facts captured by past instances of this role "
+                f"via `REMEMBER: …` lines. Append-only.\n\n"
+            )
+        addition = (
+            ("\n" if existing and not existing.endswith("\n") else "")
+            + "\n".join(new_blocks)
+            + "\n"
+        )
+        with path.open("a", encoding="utf-8") as fh:
+            if header:
+                fh.write(header)
+            fh.write(addition)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# ChatArchive (py-1.5.0)
+#
+# Until v1.5.0 the cockpit kept the "is this conversation archived?" bit
+# in localStorage. That meant a different browser (same operator, same
+# project) saw all previously-archived convs as live again. The archive
+# state is now daemon-side, persisted to `.meshkore/.runtime/archives.json`,
+# so it's a single source of truth across cockpit instances on the same
+# machine. The cockpit syncs from `/chat/archives` on boot and POSTs to
+# `/chat/archive` / `/chat/unarchive` on toggle.
+#
+# Schema:
+#   {
+#     "version": 1,
+#     "archived": {
+#       "<conv-id>": {"archived_at": "<iso>", "by": "<author>"}
+#     }
+#   }
+
+
+class ChatArchive:
+    """Persistent registry of archived conv ids.
+    Read on boot; mutated via /chat/archive + /chat/unarchive endpoints."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, paths: "Paths") -> None:
+        self.paths = paths
+        self._path = paths.runtime / "archives.json"
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {"version": self.SCHEMA_VERSION, "archived": {}}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            raw = json.loads(self._path.read_text())
+            if isinstance(raw, dict) and isinstance(raw.get("archived"), dict):
+                self._data = raw
+                self._data.setdefault("version", self.SCHEMA_VERSION)
+        except Exception:
+            # corrupted file → keep defaults; never crash the daemon
+            pass
+
+    def _save(self) -> None:
+        # Atomic write — render to a temp file in the same dir, fsync,
+        # then rename. Survives a daemon crash mid-write.
+        self.paths.runtime.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".json.tmp")
+        payload = json.dumps(self._data, indent=2).encode("utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, payload)
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+        os.replace(tmp, self._path)
+
+    def list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {"conv": c, **meta}
+                for c, meta in sorted(self._data["archived"].items())
+            ]
+
+    def is_archived(self, conv: str) -> bool:
+        with self._lock:
+            return conv in self._data["archived"]
+
+    def archive(self, conv: str, by: str = "") -> Dict[str, Any]:
+        with self._lock:
+            entry = {"archived_at": _iso_now(), "by": by or "operator"}
+            self._data["archived"][conv] = entry
+            self._save()
+            return {"conv": conv, **entry}
+
+    def unarchive(self, conv: str) -> bool:
+        with self._lock:
+            if conv in self._data["archived"]:
+                del self._data["archived"][conv]
+                self._save()
+                return True
+            return False
+
+
+# ───────────────────────────────────────────────────────────────────────
+# TimelineRotator (py-1.5.0)
+#
+# Compresses old jsonl files into .jsonl.gz to keep .meshkore/timeline/
+# from growing unbounded over months / years. Files older than
+# TIMELINE_ROTATE_AGE_DAYS get gzipped in place (or moved to an archive/
+# subdir if configured). Cheap: runs in a background thread on a long
+# cadence, only touches files modified before the threshold, never
+# touches today's or yesterday's file.
+#
+# Readers (`_iter_timeline_files` + `_read_timeline_file`) already handle
+# .gz transparently, so the cockpit and the agent's history block are
+# unaffected by rotation.
+
+
+TIMELINE_ROTATE_AGE_DAYS = 90
+TIMELINE_ROTATE_SCAN_SEC = 3600.0  # once per hour
+
+
+class TimelineRotator:
+    """Background gzipper for old jsonl files in .meshkore/timeline/."""
+
+    def __init__(self, paths: "Paths", age_days: int = TIMELINE_ROTATE_AGE_DAYS):
+        self.paths = paths
+        self.age_days = age_days
+        self._stop = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # Run once at boot (after a brief delay so we don't fight with
+        # the cluster's first state.json rebuild), then every hour.
+        if self._stop.wait(60.0):
+            return
+        while True:
+            try:
+                self.rotate_once()
+            except Exception as e:
+                _log(f"timeline rotator: {e}")
+            if self._stop.wait(TIMELINE_ROTATE_SCAN_SEC):
+                return
+
+    def rotate_once(self) -> int:
+        if not self.paths.timeline_dir.exists():
+            return 0
+        cutoff = time.time() - (self.age_days * 86400)
+        archive_dir = self.paths.timeline_dir / "archive"
+        rotated = 0
+        for f in self.paths.timeline_dir.glob("*.jsonl"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_mtime > cutoff:
+                continue  # too recent
+            # Compress in place, move the .gz to archive/, delete the
+            # original. Keep one log line per rotation so the operator
+            # can audit it from the daemon's stderr.
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                import gzip
+
+                gz_path = archive_dir / (f.name + ".gz")
+                if gz_path.exists():
+                    # Already rotated — just delete the source.
+                    f.unlink()
+                    rotated += 1
+                    continue
+                with open(f, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                    while True:
+                        chunk = src.read(64 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                f.unlink()
+                _log(f"timeline rotator: {f.name} → archive/{gz_path.name}")
+                rotated += 1
+            except OSError as e:
+                _log(f"timeline rotator: skipped {f.name}: {e}")
+        return rotated
+
 
 class ChatSessions:
     """conv → active runner + pending buffer. Same mid-turn-merge
@@ -1466,6 +3050,12 @@ class ChatSessions:
     def has(self, conv: str) -> bool:
         with self._lock:
             return conv in self._s
+
+    def list_active(self) -> List[str]:
+        """All conv ids with a turn in flight. Used by /self-update to
+        refuse mid-stream so claude-code processes aren't orphaned."""
+        with self._lock:
+            return list(self._s.keys())
 
     def queue(self, conv: str, text: str) -> int:
         with self._lock:
@@ -1937,8 +3527,24 @@ class StateManager:
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def state(self) -> Dict[str, Any]:
+        # py-1.4.2 — Always recompute `timeline.recent_events` on demand.
+        # The cached `_state` skips chat-event-driven rebuilds (the FS
+        # signature only watches modules/, docs/, roadmap/initiatives/,
+        # public/ — not timeline/, because chat persists on every turn
+        # and would thrash the signature). Result: on a fresh GET /state
+        # the cached payload would be missing the latest chat.assistant.*
+        # events even though they're on disk in
+        # .meshkore/timeline/<date>.jsonl. Cockpit reloads were losing
+        # the agent's most recent reply.
         with self._lock:
-            return dict(self._state)
+            snap = dict(self._state)
+        events = _recent_timeline_events(self.paths, limit=TIMELINE_RECENT_LIMIT)
+        snap["timeline"] = {
+            "recent_events": events,
+            "event_count": len(events),
+            "limit": TIMELINE_RECENT_LIMIT,
+        }
+        return snap
 
     def rebuild(self, broadcast: bool = True) -> None:
         self.cluster.reload()
@@ -2024,6 +3630,16 @@ def make_handler(daemon: "Daemon"):
             self.send_header(
                 "Access-Control-Allow-Headers", "Authorization, Content-Type"
             )
+            # py-1.2.0 — Wire-version contract. The architect reads
+            # this header on every response so a stale daemon is
+            # detected without a separate /health round-trip. The
+            # Expose-Headers entry is required because Allow-Origin
+            # is `*` — without it, browser JS sees the response but
+            # cannot read this custom header.
+            self.send_header("X-MeshKore-Daemon-Version", DAEMON_VERSION)
+            self.send_header(
+                "Access-Control-Expose-Headers", "X-MeshKore-Daemon-Version"
+            )
 
         def _json(self, code: int, body: Any) -> None:
             data = json.dumps(body).encode("utf-8")
@@ -2097,6 +3713,15 @@ def make_handler(daemon: "Daemon"):
                 if self._need_auth():
                     return
                 return self._json(200, daemon.credentials_listing())
+            # py-1.5.0 — Daemon-side archive state. Anonymous read so the
+            # cockpit can sync from boot before the token is pasted.
+            if p == "/chat/archives":
+                return self._json(
+                    200,
+                    {
+                        "archived": daemon.chat_archive.list(),
+                    },
+                )
             # D-CRON-02..05: scheduler introspection.
             if p == "/cron/list":
                 if self._need_auth():
@@ -2196,11 +3821,21 @@ def make_handler(daemon: "Daemon"):
             if self._need_auth():
                 return
 
+            # py-1.2.0 — Daemon self-update (standard v7 §10.4). Driven by
+            # the cockpit's auto-update flow on a version mismatch.
+            if p == "/self-update":
+                return self._json(*daemon.self_update(self._read_json_body()))
+
             # U-DAEMON-06: chat dispatch + cancel.
             if p == "/chat/dispatch":
                 return self._json(*daemon.chat_dispatch(self._read_json_body()))
             if p == "/chat/cancel":
                 return self._json(*daemon.chat_cancel(self._read_json_body()))
+            # py-1.5.0 — Daemon-side archive lifecycle.
+            if p == "/chat/archive":
+                return self._json(*daemon.chat_archive_set(self._read_json_body()))
+            if p == "/chat/unarchive":
+                return self._json(*daemon.chat_archive_clear(self._read_json_body()))
 
             # U-DAEMON-09: simple message append + version stubs.
             if p == "/messages":
@@ -2370,12 +4005,29 @@ class Daemon:
     ):
         self.paths = paths
         self.cluster = Cluster(paths)
+        # py-1.2.0 — Standard v7 migration: write a default `daemon:`
+        # block into cluster.yaml if it's missing. Idempotent; quiet
+        # on success, no-op when the operator has already opted out
+        # by setting auto_update: false.
+        try:
+            _migrate_cluster_daemon_block(paths)
+            # Re-parse so self.cluster.data reflects the migration we
+            # just wrote.
+            self.cluster.reload()
+        except Exception as e:
+            _log(f"daemon-block migration skipped: {e}")
         self.identity = identity or _detect_identity(paths) or _hostname_default()
         self.token = _ensure_token(paths)
         self.port = _pick_port(paths, requested_port or self.cluster.architect_port)
         self.hub = Hub()
         self.state_manager = StateManager(paths, self.cluster, self.hub)
         self.chat_sessions = ChatSessions()
+        # py-1.5.0 — persistent archive state (was cockpit-localStorage-only).
+        self.chat_archive = ChatArchive(paths)
+        # py-1.5.0 — background gzipper for .meshkore/timeline/*.jsonl
+        # older than 90 days. Keeps disk footprint bounded on long-running
+        # clusters; transparent to readers (gzip-aware).
+        self.timeline_rotator = TimelineRotator(paths)
         # Standard §13 — deployment links registry. Quiet no-op when
         # .meshkore/public/links.yaml is absent.
         self.links_registry = LinksRegistry(paths, self.hub)
@@ -2388,16 +4040,33 @@ class Daemon:
         )
         self.stopping = threading.Event()
         self.server: Optional[ThreadingHTTPServer] = None
-        # Filled in by serve_forever once we know whether the TLS
-        # bundle was successfully loaded. /health reports this so
-        # the cockpit knows whether to use https:// + wss:// or
-        # the plain HTTP fallback.
+        # D-TLS-01 — set by serve_forever once it knows whether the
+        # bundle loaded. /health reports this; cockpit decides URL scheme.
         self.tls_enabled: bool = False
 
     # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
-    def _spawn_chat_turn(self, conv: str, prompt: str) -> ChatRunner:
+    def _spawn_chat_turn(
+        self,
+        conv: str,
+        prompt: str,
+        *,
+        context_docs: Optional[List[Dict[str, Any]]] = None,
+        agent_type: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
-        prompt re-spawns automatically when the current turn finishes."""
+        prompt re-spawns automatically when the current turn finishes.
+        Context docs (py-1.4.0) flow into the BriefingPipeline."""
+        # py-1.7.0 — Resolve agent_type/id from caller args, falling
+        # back to the persisted conv sidecar so chained turns and
+        # cockpit reconnects don't lose specialisation.
+        resolved_type, resolved_id = self._conv_meta_get(conv)
+        if agent_type:
+            resolved_type = agent_type
+        if agent_id:
+            resolved_id = agent_id
+        # Persist whatever we end up with so subsequent turns inherit it.
+        self._conv_meta_set(conv, resolved_type, resolved_id)
         runner = ChatRunner(
             paths=self.paths,
             cluster=self.cluster,
@@ -2405,10 +4074,69 @@ class Daemon:
             identity=self.identity,
             conv=conv,
             prompt=prompt,
+            context_docs=context_docs or [],
+            agent_type=resolved_type,
+            agent_id=resolved_id,
         )
         runner.spawn()
-        self.chat_sessions.start(conv, runner, on_chain=self._spawn_chat_turn)
+        # Chained turns (auto-spawn when a queued prompt lands) inherit
+        # the current turn's context_docs + agent metadata.
+        chain_ctx = list(context_docs or [])
+        chain_type = resolved_type
+        chain_id = resolved_id
+        self.chat_sessions.start(
+            conv,
+            runner,
+            on_chain=lambda c, p: self._spawn_chat_turn(
+                c,
+                p,
+                context_docs=chain_ctx,
+                agent_type=chain_type,
+                agent_id=chain_id,
+            ),
+        )
         return runner
+
+    # py-1.7.0 — conv → (agent_type, agent_id) sidecar. Lets the daemon
+    # remember the specialisation across turns even if the cockpit
+    # forgets to re-send it (and gives offline/migrated clusters a stable
+    # store outside the cockpit's localStorage).
+    def _conv_meta_path(self) -> Any:
+        return self.paths.runtime / "conv_meta.json"
+
+    def _conv_meta_load(self) -> Dict[str, Dict[str, str]]:
+        p = self._conv_meta_path()
+        try:
+            if not p.exists():
+                return {}
+            return json.loads(p.read_text() or "{}") or {}
+        except Exception:
+            return {}
+
+    def _conv_meta_get(self, conv: str) -> Tuple[str, Optional[str]]:
+        meta = self._conv_meta_load().get(conv) or {}
+        return (
+            _agent_type_normalised(meta.get("agent_type")),
+            (meta.get("agent_id") or None),
+        )
+
+    def _conv_meta_set(
+        self, conv: str, agent_type: str, agent_id: Optional[str]
+    ) -> None:
+        try:
+            all_meta = self._conv_meta_load()
+            entry = all_meta.get(conv) or {}
+            entry["agent_type"] = _agent_type_normalised(agent_type)
+            if agent_id:
+                entry["agent_id"] = agent_id
+            all_meta[conv] = entry
+            p = self._conv_meta_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(all_meta, indent=2, sort_keys=True))
+            tmp.replace(p)
+        except Exception as e:
+            _log(f"conv_meta write failed: {e}")
 
     def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         text = str(body.get("text") or "").strip()
@@ -2419,6 +4147,28 @@ class Daemon:
             body.get("conv")
             or f"chat-{_iso_now()[:16].replace(':', '-').replace('T', '-').lower()}"
         )
+        # py-1.7.0 — agent specialisation from cockpit. Both fields are
+        # optional; missing → 'custom' (General coder). When present,
+        # persisted to the conv_meta sidecar so chained turns and
+        # cockpit reconnects keep the same role.
+        agent_type = body.get("agent_type")
+        agent_id = body.get("agent_id")
+        # py-1.4.0 — Accept cockpit-attached context as part of the
+        # briefing pipeline. Previously this field was silently
+        # dropped, which broke V46/V78b onboarding (the cockpit
+        # thought it was sending a bootstrap brief but the agent
+        # never saw it).
+        raw_docs = body.get("context_docs")
+        context_docs: List[Dict[str, Any]] = []
+        if isinstance(raw_docs, list):
+            for d in raw_docs:
+                if isinstance(d, dict) and (d.get("content") or "").strip():
+                    context_docs.append(
+                        {
+                            "filename": str(d.get("filename") or "doc.md"),
+                            "content": str(d.get("content") or ""),
+                        }
+                    )
         # 1) Emit + persist the user event right away.
         ev = _append_timeline(
             self.paths,
@@ -2441,7 +4191,13 @@ class Daemon:
             }
         # 3) New turn.
         try:
-            runner = self._spawn_chat_turn(conv, text)
+            runner = self._spawn_chat_turn(
+                conv,
+                text,
+                context_docs=context_docs,
+                agent_type=agent_type,
+                agent_id=agent_id,
+            )
         except Exception as e:
             return 400, {"error": str(e)}
         return 202, {
@@ -2450,6 +4206,7 @@ class Daemon:
             "identity": self.identity,
             "pid": runner.pid,
             "stream_id": runner.stream_id,
+            "agent_type": _agent_type_normalised(agent_type),
         }
 
     def chat_cancel(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -2472,6 +4229,196 @@ class Daemon:
             }
         )
         return 200, {"ok": True, "cancelled": True, "dropped_pending": dropped}
+
+    # ── py-1.5.0: daemon-side archive lifecycle ───────────────────────
+    def chat_archive_set(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        conv = str(body.get("conv") or "").strip()
+        if not conv:
+            return 400, {"error": "conv required"}
+        by = str(body.get("author") or "").strip()
+        entry = self.chat_archive.archive(conv, by=by)
+        # Broadcast so other cockpit instances see the change in real
+        # time (multi-tab / multi-window scenarios).
+        self.hub.broadcast(
+            {
+                "type": "chat.archived",
+                "conv": conv,
+                "ts": entry.get("archived_at"),
+                "by": entry.get("by"),
+            }
+        )
+        return 200, {"ok": True, "archived": entry}
+
+    def chat_archive_clear(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        conv = str(body.get("conv") or "").strip()
+        if not conv:
+            return 400, {"error": "conv required"}
+        was_archived = self.chat_archive.unarchive(conv)
+        if was_archived:
+            self.hub.broadcast(
+                {
+                    "type": "chat.unarchived",
+                    "conv": conv,
+                    "ts": _iso_now(),
+                }
+            )
+        return 200, {"ok": True, "unarchived": was_archived, "conv": conv}
+
+    # ── py-1.2.0: self-update (standard v7 §10.4) ──────────────────────
+    def self_update(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """Download a new daemon.py, validate it, swap it in, spawn the
+        replacement on a free port, and schedule our own shutdown.
+        The cockpit reconnects to the new port via re-discovery (same
+        cluster_id, dedupe collapses the rail).
+
+        Refused (409) while any chat turn is mid-stream — killing the
+        daemon kills its claude-code children. The cockpit can cancel
+        the conv first and retry.
+
+        Network/syntax failures keep the running daemon untouched —
+        the new download lands at daemon.py.new and is only swapped
+        in after ast.parse() accepts it.
+        """
+        # 1. Refuse if any chat turn is active.
+        active = self.chat_sessions.list_active()
+        if active:
+            return 409, {
+                "error": "chat turn in progress",
+                "convs": active,
+                "hint": "POST /chat/cancel for each conv first, then retry.",
+            }
+        # 2. Resolve the download source. cluster.yaml takes precedence
+        #    over the optional `url` in the body — operator config wins.
+        cfg_src = None
+        try:
+            d = (
+                self.cluster.data.get("daemon")
+                if isinstance(self.cluster.data, dict)
+                else None
+            )
+            if isinstance(d, dict):
+                cfg_src = d.get("auto_update_source")
+        except Exception:
+            cfg_src = None
+        url = (
+            (isinstance(cfg_src, str) and cfg_src.strip())
+            or str(body.get("url") or "").strip()
+            or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+        )
+        if not (url.startswith("https://") or url.startswith("http://localhost")):
+            return 400, {
+                "error": "auto_update_source must be HTTPS (or http://localhost for testing)",
+                "url": url,
+            }
+        # 3. Download to .new.
+        import urllib.request
+        import ast
+        import shutil
+        import sys
+        import subprocess as _sp
+
+        scripts_dir = self.paths.scripts_dir
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        new_path = scripts_dir / "daemon.py.new"
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": f"meshcore-py/{DAEMON_VERSION} self-update"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                payload = r.read()
+            new_path.write_bytes(payload)
+        except Exception as e:
+            try:
+                new_path.unlink()
+            except Exception:
+                pass
+            return 500, {"error": "download failed", "url": url, "detail": str(e)}
+        # 4. Syntax-check before swapping. Rejects HTML 404 pages,
+        #    partial downloads, accidental binary content.
+        try:
+            ast.parse(payload)
+        except SyntaxError as e:
+            try:
+                new_path.unlink()
+            except Exception:
+                pass
+            return 500, {
+                "error": "syntax check failed on downloaded daemon.py — running daemon untouched",
+                "url": url,
+                "detail": str(e),
+            }
+        # Quick sanity: must declare DAEMON_VERSION somewhere.
+        if b"DAEMON_VERSION" not in payload:
+            try:
+                new_path.unlink()
+            except Exception:
+                pass
+            return 500, {
+                "error": "download does not look like a MeshKore daemon (no DAEMON_VERSION marker)",
+                "url": url,
+            }
+        # 5. Backup current binary so the operator can roll back.
+        current = scripts_dir / "daemon.py"
+        backup = scripts_dir / "daemon.py.bak"
+        try:
+            if current.exists():
+                shutil.copy2(current, backup)
+        except Exception as e:
+            return 500, {"error": "backup failed — refusing to swap", "detail": str(e)}
+        # 6. Atomic rename .new → daemon.py.
+        try:
+            new_path.replace(current)
+        except Exception as e:
+            return 500, {"error": "rename failed", "detail": str(e)}
+        # 7. Spawn replacement on a free port (NOT this daemon's port —
+        #    we're still bound to it; the new process needs its own).
+        try:
+            new_port = _pick_port(self.paths, preferred=None)
+        except SystemExit as e:
+            return 500, {
+                "error": "no free port available for new daemon",
+                "detail": str(e),
+            }
+        try:
+            proc = _sp.Popen(
+                [sys.executable, str(current), "--port", str(new_port)],
+                cwd=str(self.paths.root),
+                stdin=_sp.DEVNULL,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                start_new_session=True,  # detach from our process group
+            )
+        except Exception as e:
+            return 500, {"error": "failed to spawn new daemon", "detail": str(e)}
+        # 8. Schedule own shutdown so the cockpit can reconnect.
+        SHUTDOWN_DELAY = 3.0
+
+        def _self_kill():
+            try:
+                self.hub.broadcast(
+                    {
+                        "type": "daemon.self_update.handing_off",
+                        "new_pid": proc.pid,
+                        "new_port": new_port,
+                        "ts": _iso_now(),
+                    }
+                )
+            except Exception:
+                pass
+            os._exit(0)
+
+        threading.Timer(SHUTDOWN_DELAY, _self_kill).start()
+        return 202, {
+            "ok": True,
+            "new_pid": proc.pid,
+            "new_port": new_port,
+            "shutdown_in_sec": SHUTDOWN_DELAY,
+            "old_backup": str(backup.relative_to(self.paths.root))
+            if backup.exists()
+            else None,
+            "old_version": DAEMON_VERSION,
+            "source_url": url,
+        }
 
     # ── U-DAEMON-09: message append + version stubs ────────────────────
     def append_message(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -2598,6 +4545,27 @@ class Daemon:
 
     # ── HTTP body for /health and /info ────────────────────────────────
     def health(self) -> Dict[str, Any]:
+        # py-1.2.0 — Surface the cluster.yaml.daemon block (or its
+        # defaults) so the cockpit knows whether to fire the silent
+        # auto-update flow on a version mismatch.
+        cfg = {}
+        try:
+            d = (
+                self.cluster.data.get("daemon")
+                if isinstance(self.cluster.data, dict)
+                else None
+            )
+            if isinstance(d, dict):
+                cfg = d
+        except Exception:
+            cfg = {}
+        daemon_cfg = {
+            "auto_update": bool(cfg.get("auto_update", True)),
+            "auto_update_source": str(
+                cfg.get("auto_update_source")
+                or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+            ),
+        }
         return {
             "ok": True,
             "identity": self.identity,
@@ -2609,8 +4577,8 @@ class Daemon:
             "cluster_name": self.cluster.name,
             "cluster_type": self.cluster.type,
             # D-TLS-01 — advertise the transport scheme so the cockpit
-            # knows whether https://daemon.meshkore.com:<port> works
-            # or it must fall back to http://localhost:<port>.
+            # knows whether https://daemon.meshkore.com:<port> is
+            # available or it must use http://localhost:<port>.
             "tls": self.tls_enabled,
             "endpoint": (
                 f"https://daemon.meshkore.com:{self.port}"
@@ -2624,6 +4592,8 @@ class Daemon:
             # feature. Adding an endpoint here is part of the
             # acceptance criteria for that endpoint's port task.
             "features": self._features(),
+            # py-1.2.0 — Standard v7 §10.4 (daemon self-update).
+            "daemon": daemon_cfg,
             "ts": _iso_now(),
         }
 
@@ -2633,9 +4603,7 @@ class Daemon:
             "state",
             "state.subset",  # U-DAEMON-02
             "reload",
-            # D-TLS-01 — only advertised when the bundled cert actually
-            # loaded. Cockpit gates the https://daemon.meshkore.com URL
-            # on this flag.
+            # D-TLS-01 — only when the bundled cert actually loaded.
             *(["tls.loopback"] if self.tls_enabled else []),
             "agents",
             "agents.create",  # U-DAEMON-02 + 03
@@ -2655,7 +4623,27 @@ class Daemon:
             "chat.cancel",
             # U-DAEMON-09 misc
             "messages",
+            # py-1.2.0 — Standard v7 §10.4 daemon self-update.
+            "self_update",
+            "version_header",
+            # py-1.5.0 — chat integrity bundle.
+            "chat.tools_persisted",  # tool.use + tool.result in jsonl
+            "chat.rolling_history",  # >12-turn summary in briefing
+            "chat.atomic_writes",  # fsync + atomic append
+            "chat.archives",  # /chat/archives + /chat/archive[+un]
+            "timeline.rotation",  # gzip > 90d into archive/
+            # py-1.6.0 → py-1.6.1 — session_resume opt-in only.
+            # Set env MESHKORE_CLAUDE_SESSION_ID=1 to enable. Default
+            # off after a production bug where claude-code exited
+            # silently on resumed sessions.
         ]
+        if os.environ.get("MESHKORE_CLAUDE_SESSION_ID", "").strip() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            feats.append("chat.session_resume.optin")
         if hasattr(self.cluster, "crons"):
             feats.append("cron.schema")
         # D-CRON-02..05: scheduler is live, list + trigger + cancel + log endpoints.
@@ -2750,12 +4738,9 @@ class Daemon:
         handler = make_handler(self)
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         self.server.daemon_threads = True
-
-        # TLS — wrap the listening socket if a bundled cert exists.
-        # The HTTPS path lets the cockpit at architect.meshkore.com
-        # talk to localhost without mixed-content / LNA Issues. The
-        # WebSocket implementation reuses the same socket so it
-        # negotiates WSS automatically when TLS is on.
+        # D-TLS-01 — wrap the socket with TLS when the bundle is
+        # present. Cockpit uses https://daemon.meshkore.com:<port>
+        # then, no mixed-content / LNA Issues.
         bundle = _find_tls_bundle()
         ctx = _build_tls_context(*bundle) if bundle else None
         self.tls_enabled = ctx is not None
@@ -2865,37 +4850,28 @@ def _ensure_token(paths: Paths) -> str:
 
 
 # ───────────────────────────────────────────────────────────────────────
-# TLS — loopback subdomain (V85e / D-TLS-01)
-#
-# The daemon serves HTTPS+WSS when a bundled cert is present. The
-# wildcard cert is for `*.daemon.meshkore.com` (DNS A record points
-# to 127.0.0.1) so any HTTPS origin can reach this daemon without
-# mixed-content or LNA Issues.
+# TLS — loopback subdomain (D-TLS-01)
 
 
 def _find_tls_bundle() -> Optional[Tuple[Path, Path]]:
-    """Locate the (cert, key) pair next to daemon.py. Returns None if
-    either file is missing or unreadable. The daemon falls back to
-    plain HTTP in that case (backwards-compatible with operators who
-    haven't pulled the updated daemon directory)."""
+    """Locate (cert, key) next to daemon.py. Returns None if either
+    file is missing — daemon then falls back to plain HTTP, so older
+    operators who don't have the bundle keep working unchanged."""
     here = Path(__file__).resolve().parent
     cert = here / TLS_BUNDLE_NAME / TLS_CERT_FILENAME
     key = here / TLS_BUNDLE_NAME / TLS_KEY_FILENAME
     if not cert.is_file() or not key.is_file():
         return None
     try:
-        # Probe readability — surfaces file-mode mistakes early.
         cert.read_bytes()
         key.read_bytes()
     except OSError as e:
-        _log(f"tls: bundle files exist but unreadable ({e}); falling back to HTTP")
+        _log(f"tls: bundle exists but unreadable ({e}); falling back to HTTP")
         return None
     return cert, key
 
 
 def _build_tls_context(cert_path: Path, key_path: Path) -> Optional[ssl.SSLContext]:
-    """Build a TLS server context. Returns None on failure (and logs)
-    so callers can fall back to HTTP rather than crashing the daemon."""
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -2913,6 +4889,41 @@ def _port_free(port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+def _migrate_cluster_daemon_block(paths: Paths) -> None:
+    """Standard v7 §10.4 migration — ensure cluster.yaml has a `daemon:`
+    block with auto_update defaulted to true. Existing clusters scaffolded
+    under v6 pick up the new behaviour the first time they boot a v7+
+    daemon. No-op when the block (or just the field) is already there,
+    so operators who set `auto_update: false` keep their preference."""
+    yml = paths.cluster_yaml
+    if not yml.exists():
+        return
+    text = yml.read_text()
+    # Crude detection — we don't want to round-trip parse + reserialise
+    # because our YAML parser is a tiny subset and would drop comments
+    # the operator may have added. Just append a block at EOF if absent.
+    has_block = re.search(r"(?m)^daemon\s*:", text) is not None
+    if has_block:
+        # The block exists; check for auto_update inside it. If the
+        # operator wrote `daemon:` with sub-keys but not auto_update,
+        # leave it alone — they're aware of the section and chose not
+        # to set the field, so default applies at read time.
+        return
+    block = (
+        "\n# Standard v7 §10.4 — Daemon self-update. Written automatically by\n"
+        "# the v7+ daemon on first boot. Set auto_update: false to require\n"
+        "# explicit confirmation for every version update via the V47 modal.\n"
+        "daemon:\n"
+        "  auto_update: true\n"
+        "  auto_update_source: https://meshkore.com/reference/cluster/scripts/daemon.py\n"
+    )
+    # Ensure there's exactly one newline between the existing tail and our
+    # appended block so YAML stays valid (no trailing whitespace gymnastics).
+    if not text.endswith("\n"):
+        text += "\n"
+    yml.write_text(text + block)
 
 
 def _pick_port(paths: Paths, preferred: Optional[int]) -> int:
