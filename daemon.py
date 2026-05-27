@@ -48,6 +48,7 @@ import secrets
 import signal
 import socket
 import struct
+import ssl
 import sys
 import threading
 import time
@@ -63,9 +64,23 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.0.0"
+DAEMON_VERSION = "py-1.8.0"  # 1.8.0 → loopback TLS via daemon.meshkore.com
 MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# ── TLS bundle (daemon.meshkore.com → 127.0.0.1) ──────────────────────
+# When these files exist next to daemon.py, the server binds HTTPS+WSS
+# instead of plain HTTP+WS. The cert is a Let's Encrypt wildcard for
+# *.daemon.meshkore.com. DNS resolves that name to 127.0.0.1 (public
+# CF A record), so the cockpit at architect.meshkore.com can reach
+# the daemon over a real HTTPS origin — no mixed-content blocks, no
+# Chrome Local Network Access Issues. The cert + key are "publicly
+# bundled" intentionally: the only thing an attacker can do with them
+# is impersonate daemon.meshkore.com on their own loopback, which is
+# a no-op. Same pattern Plex's *.plex.direct uses.
+TLS_BUNDLE_NAME = "tls"
+TLS_CERT_FILENAME = "fullchain.pem"
+TLS_KEY_FILENAME = "privkey.pem"
 
 # ───────────────────────────────────────────────────────────────────────
 # Paths
@@ -2373,6 +2388,11 @@ class Daemon:
         )
         self.stopping = threading.Event()
         self.server: Optional[ThreadingHTTPServer] = None
+        # Filled in by serve_forever once we know whether the TLS
+        # bundle was successfully loaded. /health reports this so
+        # the cockpit knows whether to use https:// + wss:// or
+        # the plain HTTP fallback.
+        self.tls_enabled: bool = False
 
     # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
     def _spawn_chat_turn(self, conv: str, prompt: str) -> ChatRunner:
@@ -2588,6 +2608,15 @@ class Daemon:
             "cluster_id": self.cluster.id,
             "cluster_name": self.cluster.name,
             "cluster_type": self.cluster.type,
+            # D-TLS-01 — advertise the transport scheme so the cockpit
+            # knows whether https://daemon.meshkore.com:<port> works
+            # or it must fall back to http://localhost:<port>.
+            "tls": self.tls_enabled,
+            "endpoint": (
+                f"https://daemon.meshkore.com:{self.port}"
+                if self.tls_enabled
+                else f"http://localhost:{self.port}"
+            ),
             # U-DAEMON-01: capability advertisement.
             # During the Node→Python unification (initiative
             # `unified-python-daemon`), the cockpit reads this array
@@ -2604,6 +2633,10 @@ class Daemon:
             "state",
             "state.subset",  # U-DAEMON-02
             "reload",
+            # D-TLS-01 — only advertised when the bundled cert actually
+            # loaded. Cockpit gates the https://daemon.meshkore.com URL
+            # on this flag.
+            *(["tls.loopback"] if self.tls_enabled else []),
             "agents",
             "agents.create",  # U-DAEMON-02 + 03
             "events",  # WS hub + chat.* + task.* + tool.*
@@ -2717,9 +2750,22 @@ class Daemon:
         handler = make_handler(self)
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         self.server.daemon_threads = True
+
+        # TLS — wrap the listening socket if a bundled cert exists.
+        # The HTTPS path lets the cockpit at architect.meshkore.com
+        # talk to localhost without mixed-content / LNA Issues. The
+        # WebSocket implementation reuses the same socket so it
+        # negotiates WSS automatically when TLS is on.
+        bundle = _find_tls_bundle()
+        ctx = _build_tls_context(*bundle) if bundle else None
+        self.tls_enabled = ctx is not None
+        if ctx is not None:
+            self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        scheme = "https" if self.tls_enabled else "http"
         _log(
-            f"meshcore-py listening on http://127.0.0.1:{self.port} "
-            f"(identity={self.identity}, cluster={self.cluster.id})"
+            f"meshcore-py listening on {scheme}://127.0.0.1:{self.port} "
+            f"(identity={self.identity}, cluster={self.cluster.id}, "
+            f"tls={'on (daemon.meshkore.com)' if self.tls_enabled else 'off'})"
         )
         # D-CRON-02: start the scheduler. Ticks every 10s in a background
         # thread; cluster.yaml.crons jobs fire from here, no LaunchAgent.
@@ -2816,6 +2862,48 @@ def _ensure_token(paths: Paths) -> str:
         pass
     _log(f"minted new architect token at {paths.token_file}")
     return tok
+
+
+# ───────────────────────────────────────────────────────────────────────
+# TLS — loopback subdomain (V85e / D-TLS-01)
+#
+# The daemon serves HTTPS+WSS when a bundled cert is present. The
+# wildcard cert is for `*.daemon.meshkore.com` (DNS A record points
+# to 127.0.0.1) so any HTTPS origin can reach this daemon without
+# mixed-content or LNA Issues.
+
+
+def _find_tls_bundle() -> Optional[Tuple[Path, Path]]:
+    """Locate the (cert, key) pair next to daemon.py. Returns None if
+    either file is missing or unreadable. The daemon falls back to
+    plain HTTP in that case (backwards-compatible with operators who
+    haven't pulled the updated daemon directory)."""
+    here = Path(__file__).resolve().parent
+    cert = here / TLS_BUNDLE_NAME / TLS_CERT_FILENAME
+    key = here / TLS_BUNDLE_NAME / TLS_KEY_FILENAME
+    if not cert.is_file() or not key.is_file():
+        return None
+    try:
+        # Probe readability — surfaces file-mode mistakes early.
+        cert.read_bytes()
+        key.read_bytes()
+    except OSError as e:
+        _log(f"tls: bundle files exist but unreadable ({e}); falling back to HTTP")
+        return None
+    return cert, key
+
+
+def _build_tls_context(cert_path: Path, key_path: Path) -> Optional[ssl.SSLContext]:
+    """Build a TLS server context. Returns None on failure (and logs)
+    so callers can fall back to HTTP rather than crashing the daemon."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        return ctx
+    except (ssl.SSLError, OSError) as e:
+        _log(f"tls: failed to load cert ({e}); falling back to HTTP")
+        return None
 
 
 def _port_free(port: int) -> bool:
