@@ -4404,6 +4404,40 @@ class Daemon:
             new_path.replace(current)
         except Exception as e:
             return 500, {"error": "rename failed", "detail": str(e)}
+        # 6.5. py-1.8.0 — also refresh the bundled TLS cert if the
+        #      published source serves one alongside daemon.py.
+        #      Without this the new daemon comes up as plain HTTP
+        #      while the cockpit still expects HTTPS, and the
+        #      switch-to-new-port handshake fails. Best-effort: if
+        #      either file 404s, we keep the existing tls/ bundle.
+        if url.startswith("https://") and url.endswith("/daemon.py"):
+            tls_dir = scripts_dir / "tls"
+            tls_dir.mkdir(parents=True, exist_ok=True)
+            base_url = url[: -len("/daemon.py")] + "/tls"
+            for fname, mode in (("fullchain.pem", 0o644), ("privkey.pem", 0o600)):
+                try:
+                    treq = urllib.request.Request(
+                        f"{base_url}/{fname}",
+                        headers={
+                            "User-Agent": f"meshcore-py/{DAEMON_VERSION} self-update"
+                        },
+                    )
+                    with urllib.request.urlopen(treq, timeout=10) as tr:
+                        tls_payload = tr.read()
+                    if not tls_payload.startswith(b"-----BEGIN"):
+                        _log(f"self-update: skipped tls/{fname} — not a PEM payload")
+                        continue
+                    target = tls_dir / fname
+                    target.write_bytes(tls_payload)
+                    try:
+                        os.chmod(target, mode)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    # 404 / network / TLS error — keep whatever bundle
+                    # the operator already had on disk. The new daemon
+                    # will fall back to plain HTTP if neither lands.
+                    _log(f"self-update: tls/{fname} refresh skipped ({e})")
         # 7. Spawn replacement on a free port (NOT this daemon's port —
         #    we're still bound to it; the new process needs its own).
         try:
