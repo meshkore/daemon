@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.8.0"  # 1.8.0 → loopback TLS via daemon.meshkore.com
+DAEMON_VERSION = "py-1.8.1"  # 1.8.0 loopback TLS + 1.8.1 /auth/challenge
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -3666,6 +3666,40 @@ def make_handler(daemon: "Daemon"):
                 return self._handle_ws()
             if p == "/health":
                 return self._json(200, daemon.health())
+            # D-TLS-02 — challenge-response auth. Cockpit posts a
+            # random nonce; we return HMAC-SHA256(portal-token, nonce).
+            # Cockpit verifies with its copy of the token before
+            # trusting the daemon endpoint. Defeats MITM by an
+            # attacker who serves a valid TLS cert (our wildcard is
+            # public) but doesn't have the operator's portal-token.
+            if p == "/auth/challenge":
+                nonce = q.get("nonce", "")
+                if (
+                    not nonce
+                    or len(nonce) > 128
+                    or not re.match(r"^[A-Za-z0-9._-]+$", nonce)
+                ):
+                    return self._json(
+                        400, {"error": "nonce required: 1-128 chars, [A-Za-z0-9._-]"}
+                    )
+                import hmac as _hmac
+                import hashlib as _hashlib
+
+                sig = _hmac.new(
+                    daemon.token.encode("utf-8"),
+                    nonce.encode("utf-8"),
+                    _hashlib.sha256,
+                ).hexdigest()
+                return self._json(
+                    200,
+                    {
+                        "nonce": nonce,
+                        "sig": sig,
+                        "alg": "HMAC-SHA256",
+                        "version": DAEMON_VERSION,
+                        "ts": _iso_now(),
+                    },
+                )
             if p == "/state":
                 return self._json(200, daemon.state_manager.state())
             # U-DAEMON-02: subset reads. Matches Node's contract:
@@ -4605,6 +4639,8 @@ class Daemon:
             "reload",
             # D-TLS-01 — only when the bundled cert actually loaded.
             *(["tls.loopback"] if self.tls_enabled else []),
+            # D-TLS-02 — challenge-response auth for MITM defence.
+            "auth.challenge",
             "agents",
             "agents.create",  # U-DAEMON-02 + 03
             "events",  # WS hub + chat.* + task.* + tool.*
