@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.8.1"  # 1.8.0 loopback TLS + 1.8.1 /auth/challenge
+DAEMON_VERSION = "py-1.10.7"  # 1.10.7 roadmap-architect: full autonomy rewrite — no questions, decision-matrix, commit/doc/summary cadence
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -113,6 +113,10 @@ class Paths:
         self.timeline_dir = self.meshkore / "timeline"
         self.modules_dir = self.meshkore / "modules"
         self.docs_dir = self.meshkore / "docs"
+        # py-1.9.0 — daily narrative logs (operator/Claude prose, one
+        # file per day). Served read-only over /log/<YYYY-MM-DD>.md +
+        # listed under /log so the cockpit Diary tab can lazy-page.
+        self.log_dir = self.meshkore / "log"
         # py-1.2.0 — where /self-update writes daemon.py + daemon.py.bak.
         self.scripts_dir = self.meshkore / "scripts"
         self.roadmap_dir = self.meshkore / "roadmap"
@@ -1979,6 +1983,224 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
         ),
         "rules_addendum": "",
     },
+    "roadmap-architect": {
+        "label": "Roadmap Architect",
+        "role": (
+            "You are the **Roadmap Architect** for this MeshKore cluster. "
+            "The operator just pressed Run all. From this moment on, you "
+            "are accountable for executing the cluster's active roadmap "
+            "to completion — as a tech-lead-meets-foreman: read, analyse, "
+            "plan, dispatch, monitor, report, hand off blockers.\n\n"
+            "You do not write the code yourself. You dispatch sub-agents "
+            "(coding, deploy, db, testing, docs, review) and coordinate "
+            "their work. Your output here is operator-facing narration of "
+            "what is happening."
+        ),
+        "focus": (
+            "## IRON RULE — NO QUESTIONS, EVER\n\n"
+            "You never ask the operator a question during a Run all pass. "
+            "These patterns are BANNED — if your draft response contains "
+            "any of them, rewrite it before sending:\n"
+            '  - "Which one?"\n'
+            '  - "Should I X or Y?"\n'
+            '  - "(A) or (B)?"\n'
+            '  - "Two options: ..."\n'
+            '  - "Let me know what you prefer."\n'
+            "  - \"If you don't reply, I'll default to X.\"   ← still a question\n"
+            '  - "Proposed plan for the rest of the pass" followed by '
+            "options.\n"
+            '  - "Halt here until you\'ve ..."\n'
+            "  - Listing two paths and inviting a choice.\n\n"
+            "The operator pressed Run all because they want the roadmap "
+            "LANDED, not a meeting. Decisions belong in your output as "
+            "STATEMENTS, not options. If you find yourself drafting a "
+            "question, consult the Decision Matrix below — your answer "
+            "is already there.\n\n"
+            "## DECISION MATRIX — pre-baked answers\n\n"
+            "Before drafting any deliberation, scan this table. If your "
+            "blocker matches a row, the answer is FIXED. Execute it, log "
+            "it, move on.\n\n"
+            "| Blocker | Decision |\n"
+            "|---|---|\n"
+            "| Missing operator credential (API token, wallet key, deploy auth) | Code-side prep: write the script, dry-run with `--dry-run`/mock, prepare the exact paste-and-run command. Mark task `pending-operator` with the exact missing piece. Move on. |\n"
+            "| Missing 3rd-party account (CF/Solana/AWS/...) | Same as above. Deferred. Move on. |\n"
+            "| Spec ambiguous between two readings | Pick the simpler reading. Add `# YYYY-MM-DD architect: interpreted X as Y because Z` to the task body. Dispatch. Move on. |\n"
+            "| Spec contradicts another already-shipped task | Edit the contradiction so the new task matches the shipped reality. One-line note. Move on. |\n"
+            "| Two initiatives can both go next, no dependency | Take the lower id (I3 before I12). Move on. |\n"
+            "| Sub-agent failed once | Retry with a clarified prompt (one retry max per task per pass). |\n"
+            "| Sub-agent failed twice | Mark task `blocked` with the failure reason. Move on. |\n"
+            "| Tests fail on freshly-landed work | Dispatch a `testing` agent to fix. If it can't in one turn, mark `blocked: tests`. Move on. |\n"
+            "| Tool not installed on host (solana-cli, foundry, ...) | Code-side: write the script anyway. Mark `pending-operator: install <tool>`. Move on. |\n"
+            "| Task body references a deleted file | Edit the body to point at the current equivalent, OR mark `blocked: stale-spec` if no equivalent exists. Move on. |\n"
+            "| Daemon HTTP returned 5xx on a dispatch | Wait 5 seconds, retry once. If still 5xx, mark task `blocked: daemon-dispatch`. Move on. |\n\n"
+            "If your blocker isn't in this matrix, default to **code-side "
+            "prep + `pending-operator` note + move on**. The matrix is "
+            "the source of truth; you don't escalate to the operator "
+            "mid-pass.\n\n"
+            "## EXECUTION LOOP\n\n"
+            "For each active+next initiative, in lower-id-first order:\n\n"
+            "1. Read `.meshkore/roadmap/initiatives/<id>.md` and its task "
+            "files under `.meshkore/modules/<m>/tasks/*.md`.\n"
+            "2. Plan parallel-vs-sequential in ONE line: `Plan I12: "
+            "DEMO1+DEMO3 parallel, DEMO2 last (deps DEMO1).`\n"
+            "3. Dispatch the first wave (max 3 parallel) via "
+            "`POST localhost:<port>/chat/dispatch`. Body:\n"
+            "```json\n"
+            "{\n"
+            '  "conv": "work-<initiative-id>-<task-id>-<stamp>",\n'
+            '  "text": "<concise instructions + commit cadence (see below)>",\n'
+            '  "agent_type": "custom|deploy|db|testing|docs|review",\n'
+            '  "agent_id": "A<NNN>",\n'
+            '  "initiative_id": "<id>",\n'
+            '  "task_id": "<id>"\n'
+            "}\n"
+            "```\n"
+            "Pick `agent_type` by what the task needs: code → `custom`, "
+            "deploy → `deploy`, schema → `db`, write tests → `testing`, "
+            "narrative docs → `docs`, code review → `review`. Default "
+            "`custom`. Token at `.meshkore/credentials/portal-token` → "
+            "`Authorization: Bearer <token>`.\n\n"
+            "4. Poll `GET /state` or `/runs` until each sub-agent "
+            "finishes. While waiting, do nothing — silence is fine here, "
+            "but emit a `⏳ A007 still running (Nm)` line every 2-3 "
+            "minutes if you're idle.\n"
+            "5. Verify the finish: spot-check the file mutations exist, "
+            "confirm the sub-agent's claimed commit sha resolves.\n"
+            "6. Dispatch the next wave for this initiative. Repeat 3-5 "
+            "until the initiative is shipped OR every remaining task in "
+            "it is blocked/pending-operator per the matrix.\n"
+            "7. Post the **Initiative transition block** (see below).\n"
+            "8. Move to the next initiative IMMEDIATELY. No pause, no "
+            'confirmation, no "shall I proceed?".\n\n'
+            "## COMMIT CADENCE — every code-side dispatch ends with a commit\n\n"
+            "Every dispatch you send to a `custom`/`deploy`/`db`/`testing` "
+            "sub-agent MUST include this block at the end of the prompt:\n\n"
+            "```\n"
+            "When you're done with the task body:\n"
+            "1. Run the project's lint/format (npm run lint, ruff check, etc — read package.json / pyproject.toml to find it).\n"
+            "2. Stage ONLY the files you touched. Never `git add -A` or `git add .`.\n"
+            "3. Commit with a conventional message:\n"
+            "     <type>(<scope>): <imperative title>\n"
+            "\n"
+            "     <one-line why>\n"
+            "\n"
+            "     Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n"
+            "   Type ∈ {feat, fix, refactor, docs, chore, test}.\n"
+            "4. DO NOT push. Local commit only.\n"
+            "5. Reply: `✓ task <id> done. files: <N>. commit: <short-sha>. <1-line summary>.`\n"
+            "```\n\n"
+            "If a sub-agent finishes without committing, dispatch a "
+            "`chore` follow-up immediately to stage + commit the leftover "
+            "changes. Uncommitted work is unfinished work — your job is "
+            "to leave a clean tree behind.\n\n"
+            "## DOC CADENCE — after every initiative transition\n\n"
+            "YOU (the architect) do this yourself — it's coordination "
+            "metadata, not feature code:\n\n"
+            "1. Append a section to `.meshkore/log/<UTC-date>.md` "
+            "(today's daily log — singular `log/`, not `logs/`):\n"
+            "```\n"
+            "## <HH:MM UTC> — I<id> closed (architect)\n"
+            "- shipped:        <task ids + commit shas>\n"
+            "- pending-op:     <task ids + exact reason>\n"
+            "- blocked:        <task ids + reason>\n"
+            "- assumptions:    <one line per architect-driven edit, with task id>\n"
+            "```\n"
+            "2. For each assumption-driven edit, leave a one-line note "
+            "in the actual task body so the operator can audit later.\n"
+            "3. If the initiative shipped 100%, set its frontmatter "
+            "`status: done`. If partial+pending-op, leave it `active` "
+            "(it'll be retried next Run all).\n"
+            "4. If you fixed a broken task definition (per matrix row "
+            '"Task body references a deleted file"), the edited body '
+            "stands as the doc of what changed.\n\n"
+            "## CHAT FORMAT — terse status feed, NOT essays\n\n"
+            "Operator-facing chat is a feed. Use this exact vocabulary:\n\n"
+            "  - `↪ I12 DEMO1 → A007 (deploy)`           dispatched\n"
+            "  - `⏳ A007 still running (3m)`            heartbeat while waiting\n"
+            "  - `✓ I12 DEMO1 done (3 files, commit a3b9c)`   finished\n"
+            "  - `⚠ I12 DEMO2 pending-op: Amoy wallet funds + npm run anchor`   blocker, code-side done\n"
+            "  - `✗ I12 DEMO5 blocked: tests fail after 2 retries — see commit f2e1d`   hard fail\n"
+            "  - `➜ I12 closed (2 shipped, 1 pending-op). → I4.`   transition\n\n"
+            "Multi-paragraph deliberations are FORBIDDEN. \"I'd rather "
+            'not halt...", "Proposed plan for the rest of the pass", '
+            '"Given DEMO2 has been blocking..." — none of these '
+            "appear in the chat feed. The feed is verbs + ids + "
+            "outcomes.\n\n"
+            "ALLOWED long-form: a 3-5 line plan block when you START an "
+            "initiative, and the End-of-pass summary at the very end. "
+            "Nothing else.\n\n"
+            "## INITIATIVE TRANSITION BLOCK\n\n"
+            "When you close an initiative — whether 100% shipped, mixed, "
+            "or all pending-op — post EXACTLY this format and then "
+            "immediately read the next initiative:\n\n"
+            "```\n"
+            "➜ I<id> closed.\n"
+            "  shipped:        <task ids>\n"
+            "  pending-op:     <task ids + 1-line reasons>\n"
+            "  blocked:        <task ids + reasons>\n"
+            "  next: I<next-id>\n"
+            "```\n\n"
+            "Then dispatch the first wave of the next initiative in the "
+            "SAME turn. Do not stop. Do not ask. Do not wait.\n\n"
+            "## END-OF-PASS SUMMARY\n\n"
+            "ONLY when every active+next initiative has been processed, "
+            "post this and stop:\n\n"
+            "```\n"
+            "═══ Roadmap pass complete ═══\n"
+            "  shipped:    I12 (3/5), I4 (4/4), I7 (2/2)\n"
+            "  pending-op: I12 (DEMO2: Amoy wallet),\n"
+            "              I3  (DEMO1: CF deploy creds)\n"
+            "  blocked:    none\n"
+            "  pass: <N> sub-agent dispatches, <M> commits, <wallclock>.\n"
+            "\n"
+            "  Operator TODO for next pass:\n"
+            "   - fund Amoy wallet, run `cd apps/chain/anchor-cli && npm run anchor`, paste back the tx hash.\n"
+            "   - paste CLOUDFLARE_API_TOKEN + ACCOUNT_ID into ~/.meshkore/credentials/cloudflare-token.json.\n"
+            "\n"
+            "  Press Run all again when ready.\n"
+            "═══\n"
+            "```\n\n"
+            "This is the ONLY place you voluntarily stop. Anywhere else, "
+            "you're moving.\n\n"
+            "## AUTHORITY — what you may do without asking\n\n"
+            "- Read every file under the cluster root.\n"
+            "- Dispatch + cancel sub-agents via the daemon HTTP API.\n"
+            "- Mark a task `status: done` in frontmatter after verifying.\n"
+            "- Mark a task `status: pending-operator` (free-form `pending_note:`) "
+            "with the exact missing piece.\n"
+            "- Mark a task `status: blocked` with reason after the "
+            "matrix-allowed retries are exhausted.\n"
+            "- Set an initiative's frontmatter `status: done` when fully "
+            "shipped.\n"
+            "- Lightly edit a task body to fix a broken definition or to "
+            "add an `# architect: assumption` note. Keep edits surgical.\n"
+            "- Append to `.meshkore/log/<UTC-date>.md`.\n"
+            "- Pick `lower-id-first` order when tied. Pick `simpler reading` "
+            "when ambiguous. The matrix is your authority for everything.\n\n"
+            "## FORBIDDEN\n\n"
+            "- Asking the operator anything (see Iron Rule).\n"
+            "- Inventing NEW initiatives or NEW tasks. Salvaging existing "
+            "broken definitions is fine; net-new scope is the operator's "
+            "job.\n"
+            "- Running live deploys (`wrangler deploy`, `solana transfer`, "
+            "etc.) — the `deploy` sub-agent does that, under your "
+            "direction, ONLY when the operator's credentials are "
+            "supplied. If creds are missing → matrix → code-side prep + "
+            "pending-op.\n"
+            "- `git push`. Local commits only.\n"
+            "- Touching `.meshkore/credentials/`, `.meshkore/.runtime/`, "
+            "`state.json`.\n"
+            "- Internal-reasoning monologue. The feed is status only.\n"
+            "- Stopping anywhere except the End-of-pass summary."
+        ),
+        "redirect": (
+            "If the operator asks you to write code, edit a task body, "
+            "or apply a fix directly, refuse politely: \"I'm the Roadmap "
+            "Architect — I coordinate, I don't implement. I'll dispatch "
+            'a sub-agent to do that and report back." Then dispatch.'
+        ),
+        "rules_addendum": "",
+    },
     "review": {
         "label": "Review",
         "role": (
@@ -2609,28 +2831,57 @@ class ChatRunner:
             "--include-partial-messages",
             "--permission-mode",
             "bypassPermissions",
+            # Headless: cockpit has no UI to surface interactive question
+            # tools. Disallow them so the model defaults to plain-text
+            # asks in the chat bubble instead of stalling on a hanging
+            # AskUserQuestion / ExitPlanMode call.
+            "--disallowed-tools",
+            "AskUserQuestion,ExitPlanMode",
         ]
         if use_session:
             args[2:2] = ["--session-id", session_id]
-        args.append(self._briefing())
+        # py-1.10.5 — Pipe the briefing through stdin instead of
+        # appending it as a positional argument. claude 2.1.145
+        # rejects a trailing positional that arrives AFTER a
+        # multi-value flag (`--disallowed-tools <comma,list>`) — the
+        # parser consumes our prompt as another disallowed-tool name
+        # or just drops it, and claude exits 1 with stderr:
+        #   "Error: Input must be provided either through stdin or
+        #    as a prompt argument when using --print"
+        # Captured 2026-05-29 by py-1.10.4's stderr drainer (which
+        # had been silently dropping this error for every spawn
+        # since the cockpit's roadmap-architect feature shipped).
+        # Stdin works regardless of argv order, so it's the
+        # forward-compatible answer.
+        briefing = self._briefing()
         env = {
             **os.environ,
             "MESHKORE_IDENTITY": self.identity,
             "MESHKORE_CONV": self.conv,
-            # py-1.6.0 — expose session id to child so the agent can
-            # reference it if it spawns sub-tools.
             "MESHKORE_SESSION_ID": session_id,
         }
         self.proc = subprocess.Popen(
             args,
             cwd=str(self.paths.root),
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
         self.pid = self.proc.pid
+        # Write the briefing to stdin and close. claude reads it
+        # all (EOF on close) then begins streaming results to stdout.
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.write(briefing.encode("utf-8"))
+                self.proc.stdin.close()
+        except (BrokenPipeError, OSError) as e:
+            _log(f"claude({self.conv}) stdin write failed: {e}")
+        _log(
+            f"claude({self.conv}) spawned pid={self.pid} agent_type={self.agent_type} "
+            f"stream={self.stream_id} briefing_len={len(briefing)}"
+        )
         self.hub.broadcast(
             {
                 "type": "task.started",
@@ -2654,6 +2905,31 @@ class ChatRunner:
             }
         )
         threading.Thread(target=self._reader_loop, daemon=True).start()
+        # py-1.10.4 — stderr drainer. Until this lands, stderr=PIPE
+        # was capturing claude's error output but NOBODY READ IT, so
+        # every subprocess crash (prompt too long, blocked tool, env
+        # issue, segfault) surfaced as "empty chat.assistant.final"
+        # with no diagnostic anywhere in the daemon log. The reader
+        # loop above only iterates stdout; PIPE'd stderr fills its
+        # OS buffer (typically 64 KB) and on overflow Linux/Darwin
+        # block claude on its next write — turning a soft failure
+        # into an unkillable zombie. Drain it into the daemon log.
+        threading.Thread(target=self._stderr_drain, daemon=True).start()
+
+    def _stderr_drain(self) -> None:
+        """Read self.proc.stderr line-by-line and forward to the
+        daemon log. Tagged with conv so multiple in-flight runners
+        don't blur together. Cheap — claude rarely emits much on
+        stderr unless it's failing."""
+        if not self.proc or not self.proc.stderr:
+            return
+        for raw in self.proc.stderr:
+            try:
+                line = raw.decode("utf-8", "replace").rstrip()
+            except Exception:
+                continue
+            if line:
+                _log(f"claude({self.conv}) stderr: {line}")
 
     def cancel(self) -> None:
         if self.cancelled:
@@ -2784,12 +3060,24 @@ class ChatRunner:
                 },
             )
         )
+        # py-1.10.4 — surface the exit code in the daemon log so a
+        # silent claude failure (empty stdout, no final, etc.) can
+        # be traced back to e.g. "exited 1 with stderr 'context
+        # length exceeded'". Without this line, every empty-final
+        # looked identical regardless of whether claude crashed,
+        # blocked on a tool, or genuinely had nothing to say.
+        exit_code = self.proc.wait() if self.proc else None
+        text_len = len(cleaned_text or "")
+        _log(
+            f"claude({self.conv}) exit={exit_code} stream={self.stream_id} "
+            f"text_len={text_len} agent_type={self.agent_type}"
+        )
         self.hub.broadcast(
             {
                 "type": "task.finished",
                 "id": f"chat:{self.conv}",
                 "ts": _iso_now(),
-                "exit": self.proc.wait() if self.proc else None,
+                "exit": exit_code,
                 "conv": self.conv,
             }
         )
@@ -3036,6 +3324,225 @@ class TimelineRotator:
             except OSError as e:
                 _log(f"timeline rotator: skipped {f.name}: {e}")
         return rotated
+
+
+class RunStore:
+    """Persistent registry of story runs (py-1.10.0).
+
+    A "run" is the daemon-side first-class representation of "the
+    operator clicked play on initiative X". Each run pins one conv +
+    one agent_id + the ordered list of task ids it has to step
+    through. Status moves running → cancelled|done|failed; the
+    cursor advances per step.
+
+    Storage: `.meshkore/.runtime/runs.json` (atomic tmp+rename).
+    Why .runtime: it's per-machine and gitignored — runs are a
+    coordinator artifact, not a roadmap artifact.
+
+    Why this exists: the previous (V87) design lived in the cockpit's
+    localStorage and the daemon had no concept of a "run". Symptom
+    after reload: storyStore.run resurrected as paused and the UI
+    treated it as active even though the daemon had finished/idled.
+    With the run server-side, GET /runs returns ground truth + the
+    `live` flag (= chat_sessions.has(conv)) so the cockpit always
+    paints the real state.
+
+    Cancellation propagation: chat_cancel(conv) calls
+    `find_by_conv(conv)` and if a run owns the conv with status
+    running/stopping, marks it cancelled + broadcasts run.cancelled.
+    So either entry point — initiative card's ■ stop OR the chat
+    panel's StopBar — converges to the same state.
+    """
+
+    STATUS_RUNNING = "running"
+    STATUS_STOPPING = "stopping"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
+
+    ACTIVE_STATUSES = frozenset({STATUS_RUNNING, STATUS_STOPPING})
+
+    def __init__(self, paths: "Paths", hub: "Hub"):
+        self.paths = paths
+        self.hub = hub
+        self._lock = threading.Lock()
+        # Schema: {"version": 1, "runs": [<run dict>, ...]}
+        self._data: Dict[str, Any] = {"version": 1, "runs": []}
+        self._load()
+
+    # ── persistence ────────────────────────────────────────────────
+    def _runs_path(self) -> Path:
+        return self.paths.runtime / "runs.json"
+
+    def _load(self) -> None:
+        fp = self._runs_path()
+        if not fp.exists():
+            return
+        try:
+            data = json.loads(fp.read_text())
+            if not isinstance(data, dict):
+                return
+            runs = data.get("runs")
+            if isinstance(runs, list):
+                # Filter shape-broken entries silently — better than crash.
+                clean = [r for r in runs if isinstance(r, dict) and r.get("id")]
+                self._data = {"version": 1, "runs": clean}
+        except (OSError, ValueError) as e:
+            _log(f"runs.json load failed: {e}")
+
+    def _save(self) -> None:
+        """Atomic write — tmp then rename — so partial writes don't
+        corrupt the file. Called inside the lock."""
+        fp = self._runs_path()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+            os.replace(tmp, fp)
+        except OSError as e:
+            _log(f"runs.json save failed: {e}")
+
+    # ── mutations ──────────────────────────────────────────────────
+    def create(
+        self,
+        *,
+        initiative_id: str,
+        initiative_title: str,
+        conv: str,
+        agent_id: str,
+        agent_title: str,
+        task_ids: List[str],
+    ) -> Dict[str, Any]:
+        run = {
+            "id": f"run_{uuid.uuid4().hex[:12]}",
+            "initiative_id": initiative_id,
+            "initiative_title": initiative_title,
+            "conv": conv,
+            "agent_id": agent_id,
+            "agent_title": agent_title,
+            "task_ids": list(task_ids),
+            "cursor": 0,
+            "status": self.STATUS_RUNNING,
+            "started_at": _iso_now(),
+            "last_step_at": _iso_now(),
+            "ended_at": None,
+            "stream_id": None,
+            "error": None,
+        }
+        with self._lock:
+            self._data["runs"].append(run)
+            self._save()
+        self.hub.broadcast({"type": "run.started", "run": run})
+        return run
+
+    def cancel(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Mark cancelled. Returns the updated run, or None if unknown.
+        Idempotent: cancelling an already-final run is a no-op."""
+        with self._lock:
+            run = self._find_locked(run_id)
+            if not run:
+                return None
+            if run["status"] not in self.ACTIVE_STATUSES:
+                return run
+            run["status"] = self.STATUS_CANCELLED
+            run["ended_at"] = _iso_now()
+            self._save()
+        self.hub.broadcast({"type": "run.cancelled", "run": run})
+        return run
+
+    def advance(
+        self, run_id: str, cursor: int, stream_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            run = self._find_locked(run_id)
+            if not run:
+                return None
+            if run["status"] not in self.ACTIVE_STATUSES:
+                return run
+            total = len(run["task_ids"])
+            run["cursor"] = max(0, min(cursor, total))
+            run["last_step_at"] = _iso_now()
+            if stream_id is not None:
+                run["stream_id"] = stream_id
+            # Auto-finalise if cursor walked off the end.
+            if run["cursor"] >= total:
+                run["status"] = self.STATUS_DONE
+                run["ended_at"] = _iso_now()
+            self._save()
+        ev_type = "run.done" if run["status"] == self.STATUS_DONE else "run.advanced"
+        self.hub.broadcast({"type": ev_type, "run": run})
+        return run
+
+    def finish(
+        self, run_id: str, status: str, error: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        if status not in (self.STATUS_DONE, self.STATUS_FAILED):
+            return None
+        with self._lock:
+            run = self._find_locked(run_id)
+            if not run:
+                return None
+            if run["status"] not in self.ACTIVE_STATUSES:
+                return run
+            run["status"] = status
+            run["ended_at"] = _iso_now()
+            if error is not None:
+                run["error"] = str(error)
+            self._save()
+        ev_type = "run.done" if status == self.STATUS_DONE else "run.failed"
+        self.hub.broadcast({"type": ev_type, "run": run})
+        return run
+
+    def set_stream(self, run_id: str, stream_id: str) -> Optional[Dict[str, Any]]:
+        """Cockpit calls this after each /chat/dispatch so the run
+        record carries the in-flight stream_id (debuggable trail)."""
+        with self._lock:
+            run = self._find_locked(run_id)
+            if not run:
+                return None
+            run["stream_id"] = stream_id
+            run["last_step_at"] = _iso_now()
+            self._save()
+        return run
+
+    # ── reads ──────────────────────────────────────────────────────
+    def _find_locked(self, run_id: str) -> Optional[Dict[str, Any]]:
+        for r in self._data["runs"]:
+            if r.get("id") == run_id:
+                return r
+        return None
+
+    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            r = self._find_locked(run_id)
+            return dict(r) if r else None
+
+    def find_by_conv(self, conv: str) -> Optional[Dict[str, Any]]:
+        """Return the newest ACTIVE run bound to this conv, or None.
+        Used by chat_cancel to propagate cancellation."""
+        with self._lock:
+            best: Optional[Dict[str, Any]] = None
+            for r in self._data["runs"]:
+                if r.get("conv") != conv:
+                    continue
+                if r.get("status") not in self.ACTIVE_STATUSES:
+                    continue
+                if best is None or (r.get("started_at") or "") > (
+                    best.get("started_at") or ""
+                ):
+                    best = r
+            return dict(best) if best else None
+
+    def list_all(
+        self, active_only: bool = False, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            out = list(self._data["runs"])
+        # Newest first.
+        out.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+        if active_only:
+            out = [r for r in out if r.get("status") in self.ACTIVE_STATUSES]
+        return out[:limit]
 
 
 class ChatSessions:
@@ -3630,6 +4137,17 @@ def make_handler(daemon: "Daemon"):
             self.send_header(
                 "Access-Control-Allow-Headers", "Authorization, Content-Type"
             )
+            # py-1.9.1 — Chrome's Local Network Access (LNA) preflight
+            # blocks any cross-origin request from a public-internet
+            # page (https://architect.meshkore.com) to a private
+            # address (localhost) unless this opt-in header is present.
+            # The canonical transport already routes around LNA via
+            # the daemon.meshkore.com TLS-loopback subdomain, but
+            # enabling it here lets the cockpit fall back to plain
+            # http://localhost:<port>/health as a diagnostic probe
+            # when the TLS handshake fails — that lets us distinguish
+            # "daemon dead" from "daemon alive but no TLS bundle".
+            self.send_header("Access-Control-Allow-Private-Network", "true")
             # py-1.2.0 — Wire-version contract. The architect reads
             # this header on every response so a stale daemon is
             # detected without a separate /health round-trip. The
@@ -3741,6 +4259,47 @@ def make_handler(daemon: "Daemon"):
                 return self._serve_meshkore_file(
                     daemon.paths.roadmap_dir, p[len("/tasks/") :]
                 )
+            # py-1.9.0 — daily narrative logs. `/log` lists every
+            # `.meshkore/log/YYYY-MM-DD.md` file (descending by date),
+            # `/log/<filename>` serves a single file. Both gated by
+            # auth so a curious browser session can't scrape narrative.
+            if p == "/log":
+                if self._need_auth():
+                    return
+                return self._json(200, {"entries": daemon.log_listing()})
+            if p.startswith("/log/"):
+                if self._need_auth():
+                    return
+                return self._serve_meshkore_file(
+                    daemon.paths.log_dir, p[len("/log/") :]
+                )
+            # py-1.9.3 — Per-initiative git activity. Runs git log on
+            # the project root and returns commits whose subject/body
+            # mentions the initiative id, plus the files each commit
+            # touched. The cockpit's expanded InitiativeCard surfaces
+            # this in its Activity tab so the operator can see what
+            # actually shipped for a given initiative.
+            if p.startswith("/initiative/") and p.endswith("/activity"):
+                if self._need_auth():
+                    return
+                iid = p[len("/initiative/") : -len("/activity")]
+                return self._json(200, daemon.initiative_activity(iid))
+            # py-1.10.0 — Story-run coordinator reads.
+            if p == "/runs":
+                if self._need_auth():
+                    return
+                active_only = (q.get("active") or "0").lower() in ("1", "true", "yes")
+                code, body = daemon.runs_list(active_only=active_only)
+                return self._json(code, body)
+            if p.startswith("/runs/"):
+                if self._need_auth():
+                    return
+                run_id = p[len("/runs/") :]
+                # Single-segment id only — control endpoints (/cancel,
+                # /advance, …) live on POST and are matched there.
+                if "/" not in run_id:
+                    code, body = daemon.run_get(run_id)
+                    return self._json(code, body)
             # U-DAEMON-02: credentials listing — names only, never
             # contents. Matches Node's response shape.
             if p == "/credentials":
@@ -3903,6 +4462,33 @@ def make_handler(daemon: "Daemon"):
                     },
                 )
 
+            # py-1.10.0 — Story-run coordinator writes. Endpoints:
+            #  POST /runs                   → create new run
+            #  POST /runs/<id>/cancel       → cancel (also kills chat session)
+            #  POST /runs/<id>/advance      → bump cursor (cockpit-driven)
+            #  POST /runs/<id>/finish       → mark done|failed
+            #  POST /runs/<id>/stream       → record current stream_id
+            if p == "/runs":
+                return self._json(*daemon.run_create(self._read_json_body()))
+            if p.startswith("/runs/"):
+                rest = p[len("/runs/") :]
+                if "/" in rest:
+                    run_id, action = rest.split("/", 1)
+                    if action == "cancel":
+                        return self._json(*daemon.run_cancel(run_id))
+                    if action == "advance":
+                        return self._json(
+                            *daemon.run_advance(run_id, self._read_json_body())
+                        )
+                    if action == "finish":
+                        return self._json(
+                            *daemon.run_finish(run_id, self._read_json_body())
+                        )
+                    if action == "stream":
+                        return self._json(
+                            *daemon.run_set_stream(run_id, self._read_json_body())
+                        )
+
             # U-DAEMON-03 finish: declare a new agent.
             if p == "/agents":
                 return self._json(*daemon.agent_create(self._read_json_body()))
@@ -4056,6 +4642,10 @@ class Daemon:
         self.hub = Hub()
         self.state_manager = StateManager(paths, self.cluster, self.hub)
         self.chat_sessions = ChatSessions()
+        # py-1.10.0 — server-side story-run coordinator. Owns the
+        # initiative ↔ conv ↔ agent ↔ task-list binding so play/stop
+        # has unambiguous identity and survives cockpit reload.
+        self.runs = RunStore(paths, self.hub)
         # py-1.5.0 — persistent archive state (was cockpit-localStorage-only).
         self.chat_archive = ChatArchive(paths)
         # py-1.5.0 — background gzipper for .meshkore/timeline/*.jsonl
@@ -4248,11 +4838,19 @@ class Daemon:
         if not conv:
             return 400, {"error": "conv required"}
         cancelled, dropped = self.chat_sessions.cancel(conv)
+        # py-1.10.0 — propagate to runs. If the cancelled conv belongs
+        # to an active run (started via /runs), mark it cancelled too
+        # and emit run.cancelled. Operator hitting the chat's StopBar
+        # converges with hitting ■ on the initiative card.
+        run = self.runs.find_by_conv(conv)
+        if run is not None:
+            self.runs.cancel(run["id"])
         if not cancelled:
             return 200, {
                 "ok": True,
                 "cancelled": False,
                 "reason": "no active turn for that conv",
+                "run_cancelled": run["id"] if run else None,
             }
         self.hub.broadcast(
             {
@@ -4262,7 +4860,116 @@ class Daemon:
                 "dropped_pending": dropped,
             }
         )
-        return 200, {"ok": True, "cancelled": True, "dropped_pending": dropped}
+        return 200, {
+            "ok": True,
+            "cancelled": True,
+            "dropped_pending": dropped,
+            "run_cancelled": run["id"] if run else None,
+        }
+
+    # ── py-1.10.0: story-run coordinator ────────────────────────────
+    def run_create(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """Create a new story run. The cockpit decides which conv and
+        agent_id to bind (it already manages those); the daemon just
+        records the binding and emits run.started.
+        """
+        initiative_id = str(body.get("initiative_id") or "").strip()
+        if not initiative_id:
+            return 400, {"error": "initiative_id required"}
+        conv = str(body.get("conv") or "").strip()
+        if not conv:
+            return 400, {"error": "conv required"}
+        agent_id = str(body.get("agent_id") or "").strip()
+        if not agent_id:
+            return 400, {"error": "agent_id required"}
+        task_ids_raw = body.get("task_ids") or []
+        if not isinstance(task_ids_raw, list) or not task_ids_raw:
+            return 400, {"error": "task_ids must be a non-empty list"}
+        task_ids = [str(t) for t in task_ids_raw if t]
+        run = self.runs.create(
+            initiative_id=initiative_id,
+            initiative_title=str(body.get("initiative_title") or initiative_id),
+            conv=conv,
+            agent_id=agent_id,
+            agent_title=str(body.get("agent_title") or initiative_id),
+            task_ids=task_ids,
+        )
+        return 201, {"ok": True, "run": run}
+
+    def run_cancel(self, run_id: str) -> Tuple[int, Dict[str, Any]]:
+        run = self.runs.get(run_id)
+        if not run:
+            return 404, {"error": f"unknown run {run_id!r}"}
+        # Cancel the chat session (if live) AND mark the run cancelled.
+        cancelled, dropped = self.chat_sessions.cancel(run["conv"])
+        updated = self.runs.cancel(run_id)
+        if cancelled:
+            self.hub.broadcast(
+                {
+                    "type": "chat.cancelled",
+                    "conv": run["conv"],
+                    "ts": _iso_now(),
+                    "dropped_pending": dropped,
+                }
+            )
+        return 200, {
+            "ok": True,
+            "run": updated,
+            "chat_cancelled": cancelled,
+            "dropped_pending": dropped,
+        }
+
+    def run_advance(
+        self, run_id: str, body: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
+        cursor = body.get("cursor")
+        if not isinstance(cursor, int):
+            return 400, {"error": "cursor (int) required"}
+        stream_id = body.get("stream_id")
+        if stream_id is not None and not isinstance(stream_id, str):
+            return 400, {"error": "stream_id must be string"}
+        updated = self.runs.advance(run_id, cursor, stream_id=stream_id)
+        if updated is None:
+            return 404, {"error": f"unknown run {run_id!r}"}
+        return 200, {"ok": True, "run": updated}
+
+    def run_finish(
+        self, run_id: str, body: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
+        status = str(body.get("status") or "").strip()
+        if status not in (RunStore.STATUS_DONE, RunStore.STATUS_FAILED):
+            return 400, {"error": "status must be 'done' or 'failed'"}
+        updated = self.runs.finish(run_id, status, error=body.get("error"))
+        if updated is None:
+            return 404, {"error": f"unknown run {run_id!r}"}
+        return 200, {"ok": True, "run": updated}
+
+    def run_set_stream(
+        self, run_id: str, body: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
+        stream_id = str(body.get("stream_id") or "").strip()
+        if not stream_id:
+            return 400, {"error": "stream_id required"}
+        updated = self.runs.set_stream(run_id, stream_id)
+        if updated is None:
+            return 404, {"error": f"unknown run {run_id!r}"}
+        return 200, {"ok": True, "run": updated}
+
+    def runs_list(self, active_only: bool = False) -> Tuple[int, Dict[str, Any]]:
+        runs = self.runs.list_all(active_only=active_only)
+        # Decorate each with a derived `live` flag — true when there's
+        # a chat session in flight for the conv right now. Cockpit uses
+        # it to decide play vs stop on the UI.
+        for r in runs:
+            r["live"] = self.chat_sessions.has(r["conv"])
+        return 200, {"runs": runs, "count": len(runs)}
+
+    def run_get(self, run_id: str) -> Tuple[int, Dict[str, Any]]:
+        r = self.runs.get(run_id)
+        if not r:
+            return 404, {"error": f"unknown run {run_id!r}"}
+        r["live"] = self.chat_sessions.has(r["conv"])
+        return 200, {"run": r}
 
     # ── py-1.5.0: daemon-side archive lifecycle ───────────────────────
     def chat_archive_set(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -4662,6 +5369,13 @@ class Daemon:
             "features": self._features(),
             # py-1.2.0 — Standard v7 §10.4 (daemon self-update).
             "daemon": daemon_cfg,
+            # py-1.10.2 — Convs with a live ChatRunner right now.
+            # Cockpit uses this at boot/reconnect to mark agents as
+            # working + show their preparing bubble IMMEDIATELY instead
+            # of waiting for the next WS delta (which can take ~20s if
+            # the runner is mid-tool-call). Empty list when the daemon
+            # has no in-flight turns.
+            "chat_active_convs": self.chat_sessions.list_active(),
             "ts": _iso_now(),
         }
 
@@ -4681,6 +5395,14 @@ class Daemon:
             "files.docs",
             "files.modules",
             "files.tasks",  # U-DAEMON-02
+            "files.log",  # py-1.9.0 — narrative day-logs for Diary tab
+            "initiative.activity",  # py-1.9.3 — per-initiative git commits + files
+            "runs.v1",  # py-1.10.0 — story-run coordinator
+            "runs.cancel",  # POST /runs/<id>/cancel
+            "runs.advance",  # POST /runs/<id>/advance
+            "runs.finish",  # POST /runs/<id>/finish
+            "chat.active_convs",  # py-1.10.2 — /health.chat_active_convs
+            "agents.roadmap-architect",  # py-1.10.3 — coordinator agent type
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -4778,6 +5500,188 @@ class Daemon:
                 }
             )
         return out
+
+    def initiative_activity(self, initiative_id: str) -> Dict[str, Any]:
+        """py-1.9.3 — Walk git log for commits referencing this initiative.
+        Returns at most 50 of the most recent matching commits, each with
+        the files it touched (`git diff-tree --no-commit-id --name-only -r`).
+        Matching is plain substring on subject + body so operators can
+        reference an initiative however they like ("[I-cron-dashboard]",
+        "for cron-dashboard", etc.) — no rigid trailer schema.
+
+        Bounded by 1000 commits scanned + a hard timeout per git call so
+        a 50k-commit repo doesn't melt the daemon. Failures (no git, bad
+        repo, timeout) degrade to an empty payload + an explanatory
+        `error` field; the cockpit just shows "no activity yet".
+        """
+        out: Dict[str, Any] = {
+            "initiative_id": initiative_id,
+            "commits": [],
+            "generated_at": _iso_now(),
+        }
+        if not isinstance(initiative_id, str) or not initiative_id.strip():
+            out["error"] = "invalid initiative id"
+            return out
+        iid = initiative_id.strip()
+
+        import subprocess as _sp
+
+        root = self.paths.root
+
+        # py-1.9.3 — Multi-repo workspaces (meshkore-style: webapp/,
+        # architect/, .meshkore/ each a separate git repo at depth 1)
+        # AND single-repo projects (typical ikamiro-style) both work.
+        # Find every depth ≤ 1 directory that owns a `.git` and scan
+        # each one. The commit row carries a `repo` field so the
+        # cockpit can disambiguate when two repos both reference the
+        # same initiative id.
+        repo_dirs: List[Path] = []
+        if (root / ".git").exists():
+            repo_dirs.append(root)
+        else:
+            try:
+                for child in sorted(root.iterdir()):
+                    if not child.is_dir() or child.name.startswith("."):
+                        continue
+                    if (child / ".git").exists():
+                        repo_dirs.append(child)
+            except OSError:
+                pass
+
+        if not repo_dirs:
+            out["error"] = "no git repos found at project root or depth-1"
+            return out
+
+        def git_in(cwd: Path, *args: str, timeout: float = 4.0) -> Optional[str]:
+            try:
+                r = _sp.run(
+                    ["git", "-C", str(cwd), *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                if r.returncode != 0:
+                    return None
+                return r.stdout
+            except (_sp.TimeoutExpired, FileNotFoundError, OSError):
+                return None
+
+        commits: List[Dict[str, Any]] = []
+        for repo_dir in repo_dirs:
+            repo_label = repo_dir.name if repo_dir != root else "(root)"
+            raw = git_in(
+                repo_dir,
+                "log",
+                "--max-count=1000",
+                "--grep",
+                iid,
+                "-i",
+                "--pretty=format:%H%x09%h%x09%aI%x09%an%x09%s",
+                timeout=6.0,
+            )
+            if raw is None:
+                continue
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 4)
+                if len(parts) != 5:
+                    continue
+                sha, short, ts, author, subject = parts
+                files_raw = (
+                    git_in(
+                        repo_dir,
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        sha,
+                        timeout=3.0,
+                    )
+                    or ""
+                )
+                files = [ln.strip() for ln in files_raw.splitlines() if ln.strip()]
+                commits.append(
+                    {
+                        "repo": repo_label,
+                        "sha": sha,
+                        "short_sha": short,
+                        "ts": ts,
+                        "author": author,
+                        "subject": subject,
+                        "files": files[:200],
+                        "files_truncated": len(files) > 200,
+                    }
+                )
+                if len(commits) >= 50:
+                    break
+            if len(commits) >= 50:
+                break
+
+        # Newest first across repos (each repo's slice already comes
+        # newest-first from git log, but interleaved across repos
+        # needs an explicit ts sort).
+        commits.sort(key=lambda c: c.get("ts") or "", reverse=True)
+        out["commits"] = commits[:50]
+        return out
+
+    def log_listing(self) -> List[Dict[str, Any]]:
+        """py-1.9.0 — Descending-by-date list of `.meshkore/log/*.md`
+        narrative day-files. Just metadata (name, date, size, mtime);
+        callers fetch the body via `/log/<filename>` for paged display
+        in the cockpit Diary tab. Dotfiles + non-.md files are skipped.
+
+        Returned shape:
+            [{ "name": "2026-05-27.md", "date": "2026-05-27",
+               "size": 12345, "mtime": "2026-05-27T21:00:00Z" }]
+        """
+        if not self.paths.log_dir.exists():
+            return []
+        out = []
+        for f in self.paths.log_dir.iterdir():
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            if f.suffix.lower() != ".md":
+                continue
+            # Most filenames are `YYYY-MM-DD.md`. The few that aren't
+            # (handoff notes etc.) get `date: null`.
+            stem = f.stem
+            date = (
+                stem
+                if (
+                    len(stem) == 10
+                    and stem[4] == "-"
+                    and stem[7] == "-"
+                    and stem[:4].isdigit()
+                    and stem[5:7].isdigit()
+                    and stem[8:10].isdigit()
+                )
+                else None
+            )
+            try:
+                st = f.stat()
+                size = st.st_size
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except OSError:
+                size = None
+                mtime = None
+            out.append(
+                {
+                    "name": f.name,
+                    "date": date,
+                    "size": size,
+                    "mtime": mtime,
+                }
+            )
+        # Dated entries descending (newest → oldest), then any extras
+        # (handoff notes etc.) appended in stable filename order.
+        dated = sorted(
+            [e for e in out if e["date"]], key=lambda e: e["date"], reverse=True
+        )
+        extras = sorted([e for e in out if not e["date"]], key=lambda e: e["name"])
+        return dated + extras
 
     def credentials_listing(self) -> List[Dict[str, Any]]:
         """Names + sizes of every file in .meshkore/credentials/.
