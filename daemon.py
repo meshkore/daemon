@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.12"  # 1.10.12 architect: slug-implied agent_type force + sidecar migration (heals stale 'custom' on roadmap-architect-* convs)
+DAEMON_VERSION = "py-1.10.13"  # 1.10.13 custom: roadmap-author auto-trigger when cluster is empty + user describes idea, references online playbook v1
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -1835,7 +1835,37 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "review) exist for narrow service work; everything else is "
             "yours."
         ),
-        "focus": "",  # general coder has no narrowing focus
+        "focus": (
+            "## Roadmap-author auto-trigger (py-1.10.13)\n\n"
+            "If `.meshkore/roadmap/initiatives/` is empty (or every "
+            "initiative has `status: backlog`) AND the operator's last "
+            "message describes WHAT they want to build (a story, a "
+            "feature, a goal — not setup questions, not roadmap "
+            "execution requests), switch into roadmap-author mode.\n\n"
+            "Procedure: WebFetch the playbook below, follow its 8 "
+            "steps, generate the roadmap files directly (no approval "
+            "gate — the operator approved by reaching this state).\n\n"
+            "**Playbook entry point**:\n"
+            "https://meshkore.com/reference/prompts/roadmap-author/v1/INDEX.md\n\n"
+            "The INDEX links to: spec-driven-development, modular-"
+            "phasing, initiative-template, task-template, plus "
+            "cross-refs to the existing stack/database/quality-gates "
+            "standards. Read the INDEX first, then fetch only the "
+            "chunks you need for the current step.\n\n"
+            "Iron rules in this mode:\n"
+            "- Max 3 questions per turn with `[default: X]` brackets.\n"
+            "- Operator types `proceed` → use all defaults.\n"
+            "- Operator types `rework` → exit roadmap-author mode.\n"
+            "- Output terse: glyphs (`✓ spec captured`, `↪ writing 4 initiatives`).\n"
+            "- Once the spec is captured, write the files. No proposal block.\n"
+            "- Modular ALWAYS: I1 is a walking skeleton (deployable, end-to-end).\n"
+            "- Stubs over blocks for missing creds (same pattern as roadmap-architect).\n"
+            "- End with the 4-bucket summary from the playbook, then STOP. "
+            "Do NOT start executing — the operator presses Run All next.\n\n"
+            "If the cluster already has a non-backlog roadmap, this "
+            "trigger does NOT apply — you're in normal coordinator mode "
+            "(refine the existing roadmap, don't recreate)."
+        ),
         "redirect": "",
         "rules_addendum": "",
     },
@@ -5743,6 +5773,7 @@ class Daemon:
             "agents.architect-chain-first.v1",  # py-1.10.10 — chain-first prompt + wallet canonical example + length budgets
             "agents.validation-shortcuts.v1",  # py-1.10.11 — proceed/rework operator shortcuts + ROADMAP-REWORK trigger + chat-input UX
             "agents.slug-implied-type.v1",  # py-1.10.12 — slug-implied agent_type force heals stale conv_meta + drops the SOP-in-prompt lead-in
+            "agents.roadmap-author.v1",  # py-1.10.13 — custom agent auto-triggers roadmap-author playbook (meshkore.com/reference/prompts/roadmap-author/v1/) on empty clusters
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
