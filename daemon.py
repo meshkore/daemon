@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.8"  # 1.10.8 architect: decision-catalog + stub-feature-flag + consult-A001 + 4-bucket end-of-pass (no voluntary halt)
+DAEMON_VERSION = "py-1.10.9"  # 1.10.9 architect: VALIDATION GREEN/RED first turn + batched-questions loop (cockpit-rendered)
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -2134,7 +2134,66 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "You NEVER skip step 1 to ask the operator directly. The "
             "operator pressed Run all to NOT be in the loop. A001 is in "
             "the loop FOR them.\n\n"
-            "## PRE-FLIGHT — your first turn (no halt)\n\n"
+            "## VALIDATION GATE — your very first turn (py-1.10.9)\n\n"
+            "BEFORE the pre-flight block, your very FIRST message of the "
+            "pass is the VALIDATION GATE. One single turn. The cockpit "
+            "parses your output looking for one of two exact markers on "
+            "their own line:\n\n"
+            "```\n"
+            "═══ VALIDATION GREEN ═══\n"
+            "```\n"
+            "OR\n"
+            "```\n"
+            "═══ VALIDATION RED ═══\n"
+            "```\n\n"
+            "Decision procedure:\n\n"
+            "1. Read every active+next initiative + its tasks.\n"
+            "2. For each, classify any unknowns into ONE of these "
+            "buckets:\n"
+            "   - **Catalog-resolvable** (tech/design/api/behaviour silence) → silent default, no halt.\n"
+            "   - **Stub-able** (missing creds, missing accounts, missing tools) → stub-and-flag, no halt.\n"
+            "   - **A001-consultable** (architectural decision that needs project context but not user input) → consult mid-pass, no halt.\n"
+            "   - **SPEC-INCOMPLETE** (the actual product idea has a gap that no AI can fill — what to build, not how) → THIS is the only halt-worthy class.\n"
+            "3. If the SPEC-INCOMPLETE bucket is EMPTY → output:\n"
+            "```\n"
+            "═══ VALIDATION GREEN ═══\n"
+            "Roadmap validated. <N> initiatives scoped, <N> stubs queued, <N> A001 consults predicted.\n"
+            "Starting pass.\n"
+            "```\n"
+            "Then EMIT the pre-flight block (next section) and start "
+            "executing — same turn, no pause.\n\n"
+            "4. If the SPEC-INCOMPLETE bucket is NON-EMPTY → output:\n"
+            "```\n"
+            "═══ VALIDATION RED ═══\n"
+            "I can't run the pass end-to-end without your input on <N> spec-level items.\n"
+            "Everything else (creds, defaults, ambiguity) I will resolve myself.\n"
+            "\n"
+            "Q1 [I9 ROADMAP-EDITOR]: <one specific, narrow question with a default if no answer>\n"
+            "Q2 [I7 CHN1]: <...>\n"
+            "Q3 [...]: <...>\n"
+            "\n"
+            "Answer all in one reply. Format: `Q1: <answer>. Q2: <answer>. Q3: <answer>.`\n"
+            "If you skip any, I'll pick the default and move on.\n"
+            "═══\n"
+            "```\n"
+            "Then STOP this turn. The cockpit renders this block with a "
+            "single textarea. When the operator submits, the next turn "
+            "you receive will be prefixed `[validation-answers]` and "
+            "you re-validate (loop until GREEN, max 2 iterations).\n\n"
+            "Rules for SPEC-INCOMPLETE questions:\n"
+            "- ≤ 5 questions total per validation turn. If you have "
+            "more, you're being too cautious — re-classify into "
+            "catalog/stub/A001.\n"
+            "- Each question must be answerable in ONE sentence.\n"
+            "- Include a default in brackets: `[default: X]`. If the "
+            "operator skips, you use the default.\n"
+            "- Questions are about WHAT to build, never HOW.\n"
+            "- Never a question that can be silently catalog-defaulted "
+            '("which CSS framework?" → Tailwind, not a question).\n\n'
+            "If the operator's answer turn contains literally `proceed` "
+            "or `default` or is empty after [validation-answers], you "
+            "default ALL skipped items and emit GREEN.\n\n"
+            "## PRE-FLIGHT — comes AFTER VALIDATION GREEN\n\n"
             "Your very first message of the pass is the pre-flight block. "
             "Read every active+next initiative + its tasks. Identify:\n"
             "- Initiatives with conceptually-incomplete specs (no "
@@ -5552,6 +5611,7 @@ class Daemon:
             "chat.active_convs",  # py-1.10.2 — /health.chat_active_convs
             "agents.roadmap-architect",  # py-1.10.3 — coordinator agent type
             "agents.architect-consult.v1",  # py-1.10.8 — [architect-consult] addendum forces A001 to decide
+            "agents.validation-gate.v1",  # py-1.10.9 — VALIDATION GREEN/RED first turn + batched questions
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
