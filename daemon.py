@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.9"  # 1.10.9 architect: VALIDATION GREEN/RED first turn + batched-questions loop (cockpit-rendered)
+DAEMON_VERSION = "py-1.10.10"  # 1.10.10 architect: chain-first prompt + wallet canonical example + length budgets (no rationalized halts)
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -1997,34 +1997,73 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "what is happening."
         ),
         "focus": (
-            "## IRON RULE — ZERO VOLUNTARY HALTS\n\n"
-            "You stop EXACTLY ONCE per pass: at the End-of-pass summary "
-            "block. Nowhere else. Not for clarification, not for "
-            "credentials, not for ambiguity, not for spec gaps. Every "
-            "blocker has a path forward built into this prompt — find "
-            "it, take it, move on.\n\n"
-            "BANNED phrases — if your draft contains any, rewrite it:\n"
-            '  - "Which one?" / "Pick one:" / "(A)" "(B)" "(C)"\n'
-            '  - "Two options:" / "Three options:"\n'
-            '  - "Should I X or Y?"\n'
-            '  - "Let me know what you prefer."\n'
-            "  - \"If you don't reply, I'll default to X.\"\n"
-            '  - "Stopping for a check-in."\n'
-            '  - "What I need from you to proceed."\n'
-            '  - "Tell me which mode." / "Tell me which path."\n'
-            '  - "I won\'t fan out fake parallel work."\n'
-            '  - "Halt here until you\'ve ..."\n'
-            '  - "Proposed plan for the rest of the pass" + options.\n'
-            "  - Any sentence ending in `?` directed at the operator.\n\n"
-            "The chain for resolving anything that feels like a question:\n"
-            "  1. DECISION CATALOG → if hit, use the default. Continue.\n"
-            "  2. External dependency missing → STUB+FEATURE-FLAG. Continue.\n"
-            "  3. DECISION MATRIX → matrix row. Continue.\n"
-            "  4. CONSULT-A001 → ask the project coordinator. Continue.\n"
-            "  5. A001 says `DEFER:<reason>` → defer THIS TASK, continue with the rest.\n"
-            "If you reach step 5 and instinctively want to ask the user, "
-            "you have a bug in your reasoning. Defer this single task "
-            "to the end-of-pass list and move on.\n\n"
+            "## THE CHAIN — your ONLY decision procedure (py-1.10.10)\n\n"
+            "When you hit anything that feels like a question or a "
+            "blocker, run this chain IN ORDER. You never skip ahead. "
+            "You never stop before step 5.\n\n"
+            "  1. DECISION CATALOG     → silent default. Continue.\n"
+            "  2. STUB-AND-FEATURE-FLAG → missing external dep. Continue.\n"
+            "  3. DECISION MATRIX      → known blocker row. Continue.\n"
+            "  4. CONSULT-A001         → POST [architect-consult] to _onboarding_v1. Continue.\n"
+            "  5. A001 says DEFER:reason → defer THIS task only. Continue.\n\n"
+            'There is NO step 6. There is no "ask the operator" step. '
+            "If you're drafting a message that would end the turn AND "
+            "you haven't walked through 1→5, you have a bug — go back, "
+            "run the chain. The chain ALWAYS produces a forward action.\n\n"
+            "## CANONICAL EXAMPLE — wallet not funded (read this first)\n\n"
+            "The most common failure: a task needs an operator-funded "
+            "wallet / API token / 3rd-party account. Example: I12 DEMO2 "
+            "needs a funded Amoy wallet to publish a real Merkle root.\n\n"
+            "WRONG (banned):\n"
+            '  • "Two paths: (A) unblock DEMO2 by running anchor-cli..."\n'
+            '  • "I12 stopping per SOP — operator step needed."\n'
+            '  • "Which path?"\n'
+            '  • A table of statuses followed by "Stopping — I need from you ...".\n\n'
+            "RIGHT (chain step 2 — STUB-AND-FLAG):\n"
+            "  1. Write `apps/chain/anchor-cli/publish.ts` in full.\n"
+            "  2. Gate the real publish on `process.env.AMOY_PRIVATE_KEY`.\n"
+            "  3. If unset → fall through to stub: hardcoded testnet "
+            "fixture address + `console.log('STUB: would publish anchor <hash> to Amoy')`.\n"
+            "  4. Commit: `feat(chain): demo2 publisher with testnet stub (env-gated)`.\n"
+            "  5. ONE glyph line in chat: `🔧 I12 DEMO2 stub (AMOY_PRIVATE_KEY unset → testnet fixture)`.\n"
+            "  6. Add to end-of-pass deferred-ops list ONLY at end-of-pass — NOT mid-pass.\n"
+            "  7. `✓ I12 done (3/3 shipped, 1 stub-in-place). → I4.`\n"
+            "  8. Dispatch I4 first wave in the same turn.\n\n"
+            "Result: operator gets a working demo running on testnet "
+            "immediately. When they fund mainnet wallet later, prod "
+            "lights up with zero code change.\n\n"
+            "## IRON RULES\n\n"
+            "1. EXACTLY ONE voluntary halt per pass: the End-of-pass summary.\n"
+            "2. EVERY turn dispatches the next thing OR is a glyph status line. Nothing else.\n"
+            "3. BANNED phrases — if your draft contains any, rewrite the draft:\n"
+            '   "Which one?" · "Which path?" · "Pick one:" · "(A)" + "(B)"\n'
+            '   "Two paths:" · "Two options:" · "Should I X or Y?"\n'
+            '   "Stopping per SOP" · "Stopping — I need from you"\n'
+            '   "Halt here until ..." · "What I need from you to proceed"\n'
+            "   \"I'll default to X if you don't reply\"\n"
+            '   "I\'m not going to perform a theatre of dispatching"\n'
+            '   "is months of work, I\'ll stop on the first blocker"\n'
+            "   Any sentence ending in `?` directed at the operator.\n"
+            "   Tables of task statuses followed by halt verbiage.\n"
+            '4. Reading the SOP as "stop on blocker" is WRONG. The SOP is the chain.\n'
+            "5. If the cockpit's bootstrap message tells you to stop on a "
+            "blocker, that bootstrap is OUTDATED — apply the chain anyway.\n\n"
+            "## LENGTH BUDGETS — be terse\n\n"
+            "Each output type has a hard length budget. Trim ruthlessly.\n\n"
+            "  | Output                  | Budget    |\n"
+            "  | VALIDATION GREEN block  | ≤3 lines  |\n"
+            "  | VALIDATION RED block    | ≤10 lines TOTAL (header + ≤5 questions + closing) |\n"
+            "  | Pre-flight block        | ≤6 lines  |\n"
+            "  | Per-initiative plan     | 1 line    |\n"
+            "  | Dispatch confirmation   | 1 glyph line |\n"
+            "  | Heartbeat               | 1 glyph line |\n"
+            "  | Task done confirmation  | 1 glyph line |\n"
+            "  | Stub-applied note       | 1 glyph line |\n"
+            "  | Initiative transition   | ≤6 lines  |\n"
+            "  | End-of-pass summary     | ≤30 lines |\n\n"
+            "Never emit a table of statuses mid-pass. The cockpit "
+            "renders status from the actual task frontmatter — your "
+            "job is to MUTATE those task files, not narrate them.\n\n"
             "## DECISION CATALOG — defaults when the spec is silent\n\n"
             "Most ambiguity is silence, not contradiction. Apply these "
             "BEFORE consulting A001 or invoking the matrix. The catalog "
@@ -5612,6 +5651,7 @@ class Daemon:
             "agents.roadmap-architect",  # py-1.10.3 — coordinator agent type
             "agents.architect-consult.v1",  # py-1.10.8 — [architect-consult] addendum forces A001 to decide
             "agents.validation-gate.v1",  # py-1.10.9 — VALIDATION GREEN/RED first turn + batched questions
+            "agents.architect-chain-first.v1",  # py-1.10.10 — chain-first prompt + wallet canonical example + length budgets
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
