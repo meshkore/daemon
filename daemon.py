@@ -49,6 +49,7 @@ import signal
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -65,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.13"  # 1.10.13 custom: roadmap-author auto-trigger when cluster is empty + user describes idea, references online playbook v1
+DAEMON_VERSION = "py-1.10.25"  # 1.10.25 dispatch invariants + pass-complete: chat_dispatch refuses 409 on (a) a 2nd live roadmap-architect and (b) duplicate (parent_conv, task_id) parallel dispatches — both bugs observed live in cavioca where the LLM ignored the prompt rules. Wake hook now also detects pass-complete (no actionable tasks remain across active/next initiatives) and forces the architect to emit the 4-bucket end-of-pass summary instead of looping.
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -123,6 +124,11 @@ class Paths:
         self.state_json = self.roadmap_dir / "state.json"
         self.agents_dir = self.meshkore / "agents"
         self.initiatives = self.roadmap_dir / "initiatives"
+        # Standard v11 — optional cycle timebox dimension. One markdown
+        # file per cycle. Tasks opt in via `cycle: <id>` frontmatter.
+        # Missing dir = the operator hasn't adopted cycles; cycles slice
+        # in /state is just an empty list.
+        self.cycles_dir = self.meshkore / "cycles"
         # Cron scheduler (D-CRON-01..05). State file is gitignored
         # under .meshkore/.runtime/; the logs dir holds per-run captures.
         self.crons_state_path = self.runtime / "crons.json"
@@ -949,6 +955,7 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                         if isinstance(fm.get("depends_on"), list)
                         else [],
                         "initiative": str(fm.get("initiative") or "") or None,
+                        "cycle": str(fm.get("cycle") or "") or None,
                         "path": str(md.relative_to(paths.root)),
                     }
                     tasks.append(t)
@@ -1012,8 +1019,36 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                     "child_task_ids": child_ids,
                     "task_total": len(child_ids),
                     "path": str(md.relative_to(paths.root)),
+                    # py-1.10.15 — Roadmap ordering (initiative
+                    # `roadmap-ordering-archive`). The operator curates
+                    # order via a linked-list pointer in each .md
+                    # frontmatter; absent/dangling pointers degrade to
+                    # bucket-sort below. `completed_at` + `commit_sha`
+                    # populate when the daemon auto-archives the
+                    # initiative (D-RM-ARCHIVE-02).
+                    "next": (str(fm.get("next")) if fm.get("next") else None),
+                    "completed_at": str(fm.get("completed_at") or "") or None,
+                    "commit_sha": str(fm.get("commit_sha") or "") or None,
                 }
             )
+
+    # py-1.10.15 — Auto-archive reconcile pass (D-RM-ARCHIVE-02).
+    # MUST run before the linked-list sort so newly-archived items
+    # land in the `done` bucket (the bottom of the active section).
+    _reconcile_initiative_archive(initiatives, tasks, paths)
+
+    # py-1.10.15 — Linked-list ordering (D-RM-LINKED-01). Walks the
+    # operator-curated `next:` chain, then bucket-sorts by:
+    #   0 = active/next with task_total > 0
+    #   1 = active/next with task_total == 0 (empty-at-bottom)
+    #   2 = backlog
+    #   3 = done (archived view filters from here)
+    initiatives = _order_initiatives(initiatives)
+
+    # Standard v11 — cycles slice. Optional timebox dimension. Each
+    # cycle lists the task ids whose frontmatter has `cycle: <this id>`.
+    # Empty list when `.meshkore/cycles/` is absent or empty.
+    cycles = _build_cycles_slice(paths, tasks)
 
     # py-1.1.0 — surface recent timeline events alongside the rest of the
     # state so the architect cockpit can rebuild chat history + task
@@ -1035,6 +1070,7 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
         },
         "docs": docs,
         "initiatives": initiatives,
+        "cycles": cycles,
         "timeline": {
             "recent_events": recent_events,
             "event_count": len(recent_events),
@@ -1043,6 +1079,280 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
         "generated_at": _iso_now(),
         "generator": {"name": "meshcore-py", "version": DAEMON_VERSION},
     }
+
+
+def _build_cycles_slice(
+    paths: Paths, tasks: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Standard v11 — read `.meshkore/cycles/*.md`, join task ids that
+    opted in via `cycle:` frontmatter. Returns [] when the dir is absent
+    or empty so the slice always shows up in /state with a known shape.
+    """
+    cycles: List[Dict[str, Any]] = []
+    if not paths.cycles_dir.exists():
+        return cycles
+    tasks_by_cycle: Dict[str, List[str]] = {}
+    for t in tasks:
+        cid = t.get("cycle")
+        if cid:
+            tasks_by_cycle.setdefault(cid, []).append(t["id"])
+    for md in sorted(paths.cycles_dir.glob("*.md")):
+        if md.name.startswith("_"):
+            continue
+        try:
+            text = md.read_text(errors="replace")
+        except OSError:
+            continue
+        fm = parse_frontmatter(text)
+        cid = fm.get("id")
+        if not cid:
+            continue
+        cid = str(cid)
+        cycles.append(
+            {
+                "id": cid,
+                "title": str(fm.get("title") or cid),
+                "starts": str(fm.get("starts") or ""),
+                "ends": str(fm.get("ends") or ""),
+                "status": str(fm.get("status") or "planned"),
+                "goal": str(fm.get("goal") or ""),
+                "tasks": tasks_by_cycle.get(cid, []),
+                "path": str(md.relative_to(paths.root)),
+            }
+        )
+    return cycles
+
+
+# ── Roadmap ordering (initiative `roadmap-ordering-archive`) ──────────
+# Operator curates initiative order via a `next: <id>` pointer in each
+# `.meshkore/roadmap/initiatives/<id>.md` frontmatter. The daemon walks
+# the chain, then bucket-sorts so:
+#   • initiatives without tasks NEVER appear as the head of the list
+#     (they can't be acted on — Run All can't dispatch them);
+#   • done initiatives drop to the bottom of the payload, where the
+#     cockpit's `vis=archived` filter picks them up chronologically;
+#   • broken / missing `next:` degrades gracefully (orphans fall to end
+#     of their bucket, sorted by `updated`).
+# No central index file: the operator's directive is "modifica las
+# historias relacionadas". Three writes max to move one item.
+
+_ORDER_BUCKET_ACTIVE_WITH_TASKS = 0
+_ORDER_BUCKET_ACTIVE_NO_TASKS = 1
+_ORDER_BUCKET_BACKLOG = 2
+_ORDER_BUCKET_DONE = 3
+
+
+def _order_initiatives(initiatives: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Linked-list walk + bucket sort. Deterministic + stable."""
+    if not initiatives:
+        return initiatives
+    by_id = {it["id"]: it for it in initiatives}
+    edges: Dict[str, str] = {}
+    for it in initiatives:
+        nxt = it.get("next")
+        if nxt and nxt in by_id and nxt != it["id"]:
+            edges[it["id"]] = nxt
+
+    pointed_to = set(edges.values())
+    # Heads = initiatives no one points to. Stable order: by `updated` desc
+    # then id asc, so the most recently-touched chain leads when there
+    # are several disconnected lists.
+    heads = sorted(
+        [i for i in by_id.keys() if i not in pointed_to],
+        key=lambda i: (-_sortable_ts(by_id[i].get("updated")), i),
+    )
+
+    visited: set[str] = set()
+    walked: List[str] = []
+    for h in heads:
+        cur: Optional[str] = h
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            walked.append(cur)
+            cur = edges.get(cur)
+    # Orphans (everything not visited — i.e. members of a pure cycle):
+    # append in `updated` order so they don't randomly shuffle.
+    orphans = sorted(
+        [i for i in by_id.keys() if i not in visited],
+        key=lambda i: (-_sortable_ts(by_id[i].get("updated")), i),
+    )
+    flat_ids = walked + orphans
+
+    def bucket(it: Dict[str, Any]) -> int:
+        status = normalize_status(it.get("status"))
+        if status == "done":
+            return _ORDER_BUCKET_DONE
+        if status == "backlog":
+            return _ORDER_BUCKET_BACKLOG
+        # active / next / in_progress / blocked
+        if int(it.get("task_total") or 0) > 0:
+            return _ORDER_BUCKET_ACTIVE_WITH_TASKS
+        return _ORDER_BUCKET_ACTIVE_NO_TASKS
+
+    # Stable sort: Python's `sorted` preserves the linked-list order
+    # within each bucket.
+    ordered_items = sorted(
+        [by_id[i] for i in flat_ids],
+        key=bucket,
+    )
+    return ordered_items
+
+
+def _sortable_ts(v: Any) -> float:
+    """Best-effort ISO/YYYY-MM-DD → epoch seconds. 0 on parse failure
+    so items without `updated` sort last (because we negate the key)."""
+    s = str(v or "").strip()
+    if not s:
+        return 0.0
+    try:
+        # Strip trailing Z if present (Python 3.10 fromisoformat doesn't
+        # accept it on older versions; 3.11+ does — be conservative).
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
+
+def _reconcile_initiative_archive(
+    initiatives: List[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    paths: "Paths",
+) -> None:
+    """Auto-archive (D-RM-ARCHIVE-02). For every initiative with
+    status ∈ {active, next, in_progress} and task_total > 0 whose
+    child tasks are ALL `status: done`, flip its frontmatter to
+    `status: done`, populate `completed_at` (ISO UTC), and stamp the
+    cluster's git HEAD into `commit_sha`. Idempotent — second pass
+    sees `status: done` already and skips."""
+    # tasks_by_initiative reused so we don't iterate N×M times.
+    children: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tasks:
+        iid = t.get("initiative")
+        if iid:
+            children.setdefault(iid, []).append(t)
+
+    head_sha: Optional[str] = None
+    head_sha_attempted = False
+    iso_now = _iso_now()
+
+    for it in initiatives:
+        status = normalize_status(it.get("status"))
+        if status in ("done", "backlog"):
+            continue
+        kids = children.get(it["id"], [])
+        if not kids:
+            continue
+        if not all(normalize_status(k.get("status")) == "done" for k in kids):
+            continue
+        # Triggered. Compute the git SHA once per state build.
+        if not head_sha_attempted:
+            head_sha_attempted = True
+            head_sha = _git_head_sha(paths.root)
+        new_fields = {
+            "status": "done",
+            "completed_at": iso_now,
+        }
+        if head_sha:
+            new_fields["commit_sha"] = head_sha
+        try:
+            fp = paths.root / it["path"]
+            if _patch_frontmatter(fp, new_fields):
+                # Reflect into the in-memory dict so this /state response
+                # already shows the archive — the cockpit doesn't have to
+                # poll again to see the transition.
+                it["status"] = "done"
+                it["completed_at"] = iso_now
+                if head_sha:
+                    it["commit_sha"] = head_sha
+                _log(
+                    f"roadmap: auto-archived initiative {it['id']} "
+                    f"({len(kids)} tasks done, commit={head_sha or 'none'})"
+                )
+                _debug_emit(
+                    "init-archive",
+                    msg=f"initiative {it['id']} auto-archived",
+                    data={
+                        "initiative_id": it["id"],
+                        "tasks_done": len(kids),
+                        "commit_sha": head_sha,
+                        "completed_at": iso_now,
+                    },
+                )
+        except OSError as e:
+            _log(f"roadmap: archive write failed for {it['id']}: {e}")
+
+
+def _git_head_sha(root: "Path") -> Optional[str]:
+    """`git rev-parse HEAD` in `root`. Returns None if the cluster isn't
+    a git repo or git is unavailable — auto-archive still proceeds with
+    `commit_sha: null`."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            sha = proc.stdout.strip()
+            return sha or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _patch_frontmatter(fp: "Path", patch: Dict[str, str]) -> bool:
+    """Idempotent frontmatter merge. Writes only the fields in `patch`
+    that differ from current. Preserves field order: known fields keep
+    their position, new fields append in `patch` order. Returns True
+    iff the file was actually rewritten."""
+    text = fp.read_text(errors="replace")
+    m = _FM_RE.match(text)
+    if not m:
+        # No frontmatter to patch — refuse rather than corrupt.
+        return False
+    fm_block = m.group(1)
+    rest = text[m.end() :]
+    # Parse current to compare values; we keep the original lines to
+    # preserve formatting (quotes, lists) on untouched fields.
+    current = parse_simple_yaml(fm_block)
+    changed = False
+    for k, v in patch.items():
+        if str(current.get(k) or "") != str(v):
+            changed = True
+            break
+    if not changed:
+        return False
+    # Rewrite: keep existing lines for unchanged keys, replace the
+    # `key: ...` line in-place for changed keys, append new keys at
+    # the end of the FM block.
+    lines = fm_block.splitlines()
+    handled: set[str] = set()
+    new_lines: List[str] = []
+    for line in lines:
+        # Match `key: value` (top-level, no leading whitespace).
+        if ":" in line and not line.startswith((" ", "\t", "-", "#")):
+            key = line.split(":", 1)[0].strip()
+            if key in patch:
+                new_lines.append(f"{key}: {patch[key]}")
+                handled.add(key)
+                continue
+        new_lines.append(line)
+    for k, v in patch.items():
+        if k not in handled:
+            new_lines.append(f"{k}: {v}")
+    new_fm = "\n".join(new_lines)
+    if not new_fm.endswith("\n"):
+        new_fm += "\n"
+    new_text = "---\n" + new_fm + "---\n" + rest.lstrip("\n")
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
+    tmp.write_text(new_text)
+    os.replace(tmp, fp)
+    return True
 
 
 def normalize_status(s: Any) -> str:
@@ -1613,6 +1923,39 @@ class StateIntegrityChecker:
                             " the initiative file or update the task's"
                             " `initiative:` frontmatter to an existing id"
                             f" (current: {sorted(initiative_ids)})."
+                        ),
+                    }
+                )
+        # Rule: every task's `cycle:` (Standard v11, optional) should
+        # reference an existing cycle file under `.meshkore/cycles/`.
+        # Missing key = task is not in any cycle (fine). Present but
+        # unknown id = warn-not-block (typo / renamed cycle).
+        cycle_ids: set = set()
+        cycles_dir = self.paths.cycles_dir
+        if cycles_dir.exists():
+            for cf in cycles_dir.glob("*.md"):
+                if cf.name.startswith("_"):
+                    continue
+                cid = self._read_id(cf)
+                if cid:
+                    cycle_ids.add(cid)
+        for tf in self.project.task_files():
+            cyc = self._read_field(tf, "cycle")
+            if cyc and cyc not in cycle_ids:
+                tid = self._read_id(tf)
+                violations.append(
+                    {
+                        "kind": "task_cycle_broken",
+                        "task_id": tid or tf.name,
+                        "cycle_ref": cyc,
+                        "fix": (
+                            f"Task `{tid or tf.name}` references cycle"
+                            f" `{cyc}` which does not exist under"
+                            " `.meshkore/cycles/`. Either create the cycle"
+                            " file or update the task's `cycle:` frontmatter"
+                            f" to an existing id (current: {sorted(cycle_ids)})"
+                            " — or remove the key if the task isn't in a"
+                            " cycle."
                         ),
                     }
                 )
@@ -2194,7 +2537,16 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "| Tool not installed on host | Write the script anyway. Add to deferred-ops with `install <tool>`. |\n"
             "| Task body references a deleted file | Edit body to point at the current equivalent, OR mark `blocked: stale-spec`. |\n"
             "| Daemon HTTP 5xx on dispatch | Wait 5s, retry once. Still 5xx → `blocked: daemon-dispatch`. |\n"
+            "| Daemon connection reset / `Recv failure` / `Connection refused` | You're hitting the TLS-wrapped loopback over plain HTTP. Re-issue against the `https://daemon.meshkore.com:<port>` Base URL from `## Daemon endpoints` (NOT halt). Only after BOTH schemes fail twice → emit `═══ VALIDATION RED ═══` with the question, never an abort. |\n"
             "| Genuine manual artifact required (faucet, domain registration) | Add to deferred-ops with the exact 1-line action. Move on. |\n\n"
+            "## HALT RULE — restated\n\n"
+            "The ONLY voluntary halts are: (a) the VALIDATION RED block on "
+            "your first turn, (b) the end-of-pass summary. Any infra or "
+            "transport failure mid-pass → matrix row → if no row matches, "
+            "consult A001. NEVER abort the pass with a `Halting the pass` "
+            "message of your own design. Pre-flight that touches the "
+            "daemon: if it fails, emit `═══ VALIDATION RED ═══` with a "
+            "single question — do NOT exit before the gate.\n\n"
             "## CONSULT-A001 PROTOCOL — when nothing above applies\n\n"
             "A001 is the project coordinator. It lives at conv "
             "`_onboarding_v1` (always-present, can't be archived). It "
@@ -2203,15 +2555,18 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "catalog/stub/matrix don't apply, A001 is your decision-"
             "maker — NOT the user.\n\n"
             "Procedure:\n"
-            "1. POST `localhost:<port>/chat/dispatch` with:\n"
+            "1. POST `<daemon-base>/chat/dispatch` (use the exact Base URL from `## Daemon endpoints you should know` above — `https://daemon.meshkore.com:<port>` when TLS is on, never plain `http://localhost:<port>` against a TLS-wrapped socket) with:\n"
             "```json\n"
             "{\n"
             '  "conv": "_onboarding_v1",\n'
             '  "text": "[architect-consult] <one-line question>. Context: <2-3 lines>. Options I see: <list>. Pick one — do not bounce to user. If truly unanswerable, reply DEFER:<reason>.",\n'
-            '  "author": "architect"\n'
+            '  "author": "architect",\n'
+            '  "parent_conv": "<YOUR own conv id>"\n'
             "}\n"
             "```\n"
-            "2. Wait for A001's response (poll `/state` or `/runs` for the new assistant turn on `_onboarding_v1`).\n"
+            "2. End your turn. The daemon will wake you with a "
+            "`[architect-wake]` message the instant A001 replies (py-1.10.16). "
+            "**Do NOT poll** — that mechanism is gone and burns tokens.\n"
             "3. Surface the exchange in your OWN chat feed as exactly 2 lines:\n"
             "```\n"
             "❔ → A001: <your one-line question>\n"
@@ -2340,19 +2695,35 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             '  "agent_type": "custom|deploy|db|testing|docs|review",\n'
             '  "agent_id": "A<NNN>",\n'
             '  "initiative_id": "<id>",\n'
-            '  "task_id": "<id>"\n'
+            '  "task_id": "<id>",\n'
+            '  "parent_conv": "<YOUR own conv id>"\n'
             "}\n"
             "```\n"
             "Pick `agent_type` by what the task needs. Default `custom`. "
             "Token at `.meshkore/credentials/portal-token` → `Authorization: Bearer <token>`.\n\n"
-            "4. Poll `GET /state` or `/runs` until each sub-agent finishes. "
-            "Heartbeat every 2-3 minutes with `⏳ A007 still running (Nm)`.\n"
-            "5. Verify the finish: file mutations exist, claimed commit sha resolves.\n"
-            "6. Next wave for this initiative. Repeat until done or "
-            "every remaining task is deferred-ops/blocked.\n"
-            "7. Post the initiative transition block (see below).\n"
-            "8. Move to next initiative IMMEDIATELY. No pause, no "
-            "confirmation.\n\n"
+            "**`parent_conv` is mandatory (py-1.10.16).** It tells the "
+            "daemon you own this subagent. The daemon will post a "
+            "`[architect-wake] Subagent <id> finished. Result preview: …` "
+            "user-turn back to YOUR conv the instant the subagent's "
+            "`chat.assistant.final` fires — that's how this whole loop "
+            "stays automatic. **You do NOT poll.** **You do NOT exit "
+            "with 'Pass continues on next sub-agent completion / "
+            "heartbeat tick'** — that string is a hallucination of a "
+            "mechanism that doesn't exist; only the wake hook resumes "
+            "you, and it only fires when `parent_conv` is set.\n\n"
+            "4. After dispatching the wave: emit a one-line ack per "
+            "subagent (`↪ A007 → I12 / T-DEMO1 (custom)`), THEN end "
+            "your turn. The daemon wakes you on each subagent final.\n"
+            "5. On each `[architect-wake]`: read the preview, verify "
+            "file mutations + claimed commit sha, mark the task "
+            "done/blocked, dispatch the next slot if the wave has "
+            "capacity. When all subagents of the current initiative "
+            "have replied, post the initiative transition block and "
+            "dispatch the first wave of the next initiative — in the "
+            "SAME turn.\n"
+            "6. End-of-pass: once no more initiatives have actionable "
+            "tasks, emit the 4-bucket summary and end your turn. No "
+            "wake will come; the operator picks up from there.\n\n"
             "## COMMIT CADENCE\n\n"
             "Every dispatch to a `custom`/`deploy`/`db`/`testing` "
             "sub-agent ends with this block in the prompt:\n\n"
@@ -2639,6 +3010,12 @@ class BriefingPipeline:
             port = int(self.paths.port_file.read_text().strip())
         except (OSError, ValueError):
             port = 5570
+        # py-1.10.14 — single source of truth for the in-prompt base URL.
+        # HTTPS over `daemon.meshkore.com:<port>` when the TLS bundle is
+        # present (the default since D-TLS-01), plain HTTP only as
+        # back-compat. Plain `http://localhost:<port>` against a
+        # TLS-wrapped socket returns RST and breaks every spawned agent.
+        base = _daemon_base_url(port)
 
         # py-1.7.0 — Universal rules: every agent type sees these every
         # turn. Short, load-bearing. These are NOT role-specific.
@@ -2646,7 +3023,7 @@ class BriefingPipeline:
             "## Universal rules (every agent, every turn)",
             "",
             "- Don't push to git unless the user explicitly asks.",
-            f"- Don't invent version numbers; ask `POST localhost:{port}/version/next`.",
+            f"- Don't invent version numbers; ask `POST {base}/version/next`.",
             "- Never edit `.meshkore/credentials/`, `.meshkore/.runtime/` or generated `state.json`.",
             "- The cockpit auto-refreshes ~2s after any write under `.meshkore/` — don't tell the user to reload.",
             "- Reply concisely. The portal renders your stdout as the chat answer.",
@@ -2656,16 +3033,20 @@ class BriefingPipeline:
             "- `.meshkore/` — everything the cluster knows lives here. The operator never edits it by hand; you do.",
             "- `.meshkore/modules/<id>/` — module-scoped work. Tasks live at `.meshkore/modules/<id>/tasks/*.md`.",
             "- `.meshkore/roadmap/initiatives/*.md` — initiatives (work-streams). Status: `active` / `next` / `backlog` / `done`.",
-            "- `.meshkore/log/<UTC-date>.md` — daily activity log. **Append a 1-paragraph entry when you mutate ≥3 files in a turn**, single-file touch-ups don't need one.",
+            "- `.meshkore/log/<UTC-date>.md` — daily activity log (diary). **One short paragraph per relevant event** (1–4 sentences, ≤ 1 200 chars). NEVER paste full diffs, full task lists, full file dumps — point at the artifact (`commit <sha>`, `task <id>`) and summarise the outcome. The diary must stay readable end-to-end; a turn that mutates ≥3 files writes ONE summary line, not one per file.",
             "- `.meshkore/docs/coverage.md` — coverage matrix (requirement → which task delivers it).",
             "- `.meshkore/agents/_types/<agent-type>/memory.md` — your role's long-term memory (see below).",
             "",
             "## Daemon endpoints you should know",
             "",
-            f"- `POST localhost:{port}/version/next` — get the next valid version for a key (never invent numbers).",
-            f"- `POST localhost:{port}/log/append` (or just append to `.meshkore/log/<UTC-date>.md` directly) — operator activity log.",
-            f"- `GET  localhost:{port}/state` — current cluster state (initiatives, tasks, modules, integrity flags).",
-            f"- `POST localhost:{port}/chat/dispatch` — used by the cockpit; you receive your prompt via this path, you don't call it.",
+            f"- Base URL: `{base}` (use exactly this — the loopback listener uses TLS; plain `http://localhost:<port>` is reset by the socket).",
+            f"- `POST {base}/version/next` — get the next valid version for a key (never invent numbers).",
+            f"- `POST {base}/log/append` (or just append to `.meshkore/log/<UTC-date>.md` directly) — operator activity log.",
+            f"- `GET  {base}/state` — current cluster state (initiatives, tasks, modules, integrity flags).",
+            f"- `POST {base}/chat/dispatch` — used by the cockpit; you receive your prompt via this path, you don't call it.",
+            f"- `GET  {base}/debug/tail?last=<secs>&tag=<csv>&level=<min>` — structured JSONL of everything that just happened (chat-dispatch, architect-wake, subagent-final, init-archive, http, cockpit logs). 30-min rolling window. Read this BEFORE asking the operator anything — most bugs reveal themselves here. See `.meshkore/docs/conventions/debug-stream.md`.",
+            "- Privileged endpoints (`/chat/dispatch`, `/version/next`, `/log/append`, `/runs`, …) require `Authorization: Bearer <portal-token>`; the token lives at `.meshkore/credentials/portal-token`. `/health` and `/state` are open.",
+            "- If a request fails with `Connection reset by peer` or `Recv failure`, you're talking to the TLS socket over plain HTTP — switch the scheme to `https://` and retry. This is NOT a daemon outage.",
             "",
             "## How to flag persistent learnings",
             "",
@@ -2966,6 +3347,11 @@ class BriefingPipeline:
                     f"- **Broken initiative ref** task=`{v.get('task_id')}`"
                     f" → initiative=`{v.get('initiative_ref')}` — {fix}"
                 )
+            elif kind == "task_cycle_broken":
+                lines.append(
+                    f"- **Broken cycle ref** task=`{v.get('task_id')}`"
+                    f" → cycle=`{v.get('cycle_ref')}` — {fix}"
+                )
             elif kind == "initiative_without_tasks":
                 lines.append(
                     f"- **Initiative without tasks** `{v.get('initiative_id')}`"
@@ -3095,6 +3481,7 @@ class ChatRunner:
         context_docs: Optional[List[Dict[str, Any]]] = None,
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
+        daemon: Optional["Daemon"] = None,
     ):
         self.paths = paths
         self.cluster = cluster
@@ -3116,6 +3503,13 @@ class ChatRunner:
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
+        # py-1.10.16 — Back-reference for the architect-wake hook
+        # (initiative `architect-wake-on-subagent`). When the
+        # subprocess emits `chat.assistant.final`, the runner calls
+        # `daemon._maybe_wake_parent_architect(...)` so the architect
+        # is automatically re-dispatched as each subagent completes.
+        # Optional so tests / standalone uses don't need a daemon.
+        self.daemon = daemon
 
     def _briefing(self) -> str:
         # py-1.4.0 — the briefing is now composed by BriefingPipeline.
@@ -3419,6 +3813,20 @@ class ChatRunner:
             f"claude({self.conv}) exit={exit_code} stream={self.stream_id} "
             f"text_len={text_len} agent_type={self.agent_type}"
         )
+        _debug_emit(
+            "subagent-final",
+            msg=f"{self.conv} exit={exit_code} text_len={text_len}",
+            lvl=("warn" if exit_code not in (None, 0) else "info"),
+            conv=self.conv,
+            agent_id=self.agent_id,
+            data={
+                "agent_type": self.agent_type,
+                "exit": exit_code,
+                "text_len": text_len,
+                "stream_id": self.stream_id,
+                "preview": (cleaned_text or "")[:200],
+            },
+        )
         self.hub.broadcast(
             {
                 "type": "task.finished",
@@ -3428,6 +3836,22 @@ class ChatRunner:
                 "conv": self.conv,
             }
         )
+        # py-1.10.16 — Architect wake hook. If this conv was dispatched
+        # by a roadmap-architect (parent_conv recorded in conv_meta),
+        # post a `[architect-wake]` turn back to the parent so the
+        # pass resumes the moment the subagent finishes. Without this,
+        # the architect would have to poll inside its own turn (burns
+        # tokens) or rely on the operator to nudge it.
+        if self.daemon is not None:
+            try:
+                self.daemon._maybe_wake_parent_architect(
+                    child_conv=self.conv,
+                    child_agent_id=self.agent_id,
+                    child_final_text=cleaned_text,
+                    child_exit=exit_code,
+                )
+            except Exception as e:
+                _log(f"architect wake hook failed for {self.conv}: {e}")
         self.done.set()
 
     def _harvest_remember_lines(self, text: str) -> Tuple[str, List[str]]:
@@ -4377,8 +4801,16 @@ class StateManager:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._fs_signature = ""
+        # py-1.10.19 — Backref set by Daemon.__init__ so `state()` can
+        # add the live `chat_activity` join without a global lookup.
+        # `None` during initial rebuild (before the Daemon exists),
+        # safe because that path doesn't go through `state()`.
+        self._daemon: Optional["Daemon"] = None
         self.rebuild()
         threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    def bind_daemon(self, daemon: "Daemon") -> None:
+        self._daemon = daemon
 
     def state(self) -> Dict[str, Any]:
         # py-1.4.2 — Always recompute `timeline.recent_events` on demand.
@@ -4398,6 +4830,17 @@ class StateManager:
             "event_count": len(events),
             "limit": TIMELINE_RECENT_LIMIT,
         }
+        # py-1.10.19 — Live activity join. Initiative `agent-activity-surface`.
+        # Computed on demand (the live set changes every dispatch and
+        # is cheaper to rebuild than to invalidate the FS-signature
+        # cache for). Empty list when the daemon hasn't been bound yet.
+        if self._daemon is not None:
+            try:
+                snap["chat_activity"] = self._daemon.chat_activity()
+            except Exception:
+                snap["chat_activity"] = []
+        else:
+            snap["chat_activity"] = []
         return snap
 
     def rebuild(self, broadcast: bool = True) -> None:
@@ -4433,6 +4876,9 @@ class StateManager:
             self.paths.docs_dir,
             self.paths.initiatives,
             self.paths.public,
+            # Standard v11 — watch cycles so adding/editing a cycle file
+            # broadcasts state.rebuilt and the cockpit refreshes.
+            self.paths.cycles_dir,
         ):
             if not root.exists():
                 continue
@@ -4456,6 +4902,47 @@ def make_handler(daemon: "Daemon"):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # silence default access log
             return
+
+        def setup(self):
+            # py-1.10.19 — capture wall-clock start for the debug stream's
+            # `http` hook. BaseHTTPRequestHandler builds one Handler per
+            # request, so this attribute is naturally per-request.
+            self._http_t0 = time.time()
+            super().setup()
+
+        def log_request(self, code="-", size="-"):  # noqa: D401
+            # py-1.10.19 — emit one structured `http` event per response.
+            # Mutes `/health` and `/state` (polled every ~2 s by the
+            # cockpit; would drown the stream). `send_response` calls
+            # this for both `_json()` and `send_error()` paths, so it's
+            # the single funnel for every wire-level reply.
+            try:
+                path_only = urllib.parse.urlsplit(self.path or "").path
+                if path_only in ("/health", "/state"):
+                    return
+                if path_only.startswith("/state/"):
+                    return
+                try:
+                    code_int = int(code)
+                except (TypeError, ValueError):
+                    code_int = 0
+                dur_ms = int(
+                    (time.time() - getattr(self, "_http_t0", time.time())) * 1000
+                )
+                lvl = "warn" if code_int >= 400 else "info"
+                _debug_emit(
+                    "http",
+                    msg=f"{self.command} {path_only} → {code_int} ({dur_ms} ms)",
+                    lvl=lvl,
+                    data={
+                        "method": self.command,
+                        "path": path_only,
+                        "status": code_int,
+                        "duration_ms": dur_ms,
+                    },
+                )
+            except Exception:
+                pass
 
         # ── helpers ────────────────────────────────────────────────────
         def _path(self) -> Tuple[str, Dict[str, str]]:
@@ -4567,6 +5054,35 @@ def make_handler(daemon: "Daemon"):
                 )
             if p == "/state":
                 return self._json(200, daemon.state_manager.state())
+            # py-1.10.17 — debug stream tail. Auth required because the
+            # stream contains conv ids, agent ids, and prompt previews
+            # that aren't meant for the public internet.
+            if p == "/debug/tail":
+                if self._need_auth():
+                    return
+                if _DEBUG_LOG is None:
+                    return self._json(200, {"events": [], "retained_secs": 0})
+                try:
+                    last_secs = int(q.get("last") or "300")
+                except ValueError:
+                    last_secs = 300
+                tag_csv = (q.get("tag") or "").strip()
+                tags = set(t for t in tag_csv.split(",") if t) or None
+                lvl = (q.get("level") or "debug").lower()
+                events, retained = _DEBUG_LOG.tail(
+                    last_secs=last_secs,
+                    tags=tags,
+                    min_level=lvl,
+                )
+                return self._json(
+                    200,
+                    {
+                        "events": events,
+                        "retained_secs": retained,
+                        "window_secs": last_secs,
+                        "generated_at": _iso_now(),
+                    },
+                )
             # U-DAEMON-02: subset reads. Matches Node's contract:
             # GET /state/cluster, /state/modules, /state/roadmap, etc.
             if p.startswith("/state/"):
@@ -4765,6 +5281,40 @@ def make_handler(daemon: "Daemon"):
             # the cockpit's auto-update flow on a version mismatch.
             if p == "/self-update":
                 return self._json(*daemon.self_update(self._read_json_body()))
+
+            # py-1.10.17 — cockpit log ingestion for the debug stream.
+            # Body: one event `{tag, msg?, lvl?, conv?, agent_id?, data?}`
+            # or `{events: [...]}`. `src` is always overwritten to
+            # `cockpit` so a forged `src: "daemon"` from the wire is
+            # impossible.
+            if p == "/debug/log":
+                if _DEBUG_LOG is None:
+                    return self._json(503, {"error": "debug stream not ready"})
+                body = self._read_json_body()
+                events = body.get("events") if isinstance(body, dict) else None
+                if not isinstance(events, list):
+                    events = [body] if isinstance(body, dict) else []
+                accepted = 0
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    tag = str(ev.get("tag") or "log")[:64]
+                    msg = str(ev.get("msg") or "")[:4000]
+                    lvl = str(ev.get("lvl") or "info")
+                    conv = ev.get("conv")
+                    agent_id = ev.get("agent_id")
+                    data = ev.get("data") if isinstance(ev.get("data"), dict) else None
+                    _DEBUG_LOG.emit(
+                        tag=tag,
+                        msg=msg,
+                        lvl=lvl,
+                        src="cockpit",
+                        conv=(str(conv) if conv else None),
+                        agent_id=(str(agent_id) if agent_id else None),
+                        data=data,
+                    )
+                    accepted += 1
+                return self._json(200, {"accepted": accepted})
 
             # U-DAEMON-06: chat dispatch + cancel.
             if p == "/chat/dispatch":
@@ -4988,6 +5538,10 @@ class Daemon:
         self.port = _pick_port(paths, requested_port or self.cluster.architect_port)
         self.hub = Hub()
         self.state_manager = StateManager(paths, self.cluster, self.hub)
+        # py-1.10.19 — StateManager needs a daemon backref so its
+        # `state()` can pull live chat_activity. Bound here, after
+        # both objects exist.
+        self.state_manager.bind_daemon(self)
         self.chat_sessions = ChatSessions()
         # py-1.10.0 — server-side story-run coordinator. Owns the
         # initiative ↔ conv ↔ agent ↔ task-list binding so play/stop
@@ -5024,6 +5578,9 @@ class Daemon:
         context_docs: Optional[List[Dict[str, Any]]] = None,
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
+        parent_conv: Optional[str] = None,
+        initiative_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
         prompt re-spawns automatically when the current turn finishes.
@@ -5049,7 +5606,17 @@ class Daemon:
             )
             resolved_type = slug_implied
         # Persist whatever we end up with so subsequent turns inherit it.
-        self._conv_meta_set(conv, resolved_type, resolved_id)
+        # `parent_conv` / `initiative_id` / `task_id` only overwrite the
+        # sidecar when explicitly provided — silent updates (chained
+        # re-spawns) reuse whatever was written on the first dispatch.
+        self._conv_meta_set(
+            conv,
+            resolved_type,
+            resolved_id,
+            parent_conv=parent_conv,
+            initiative_id=initiative_id,
+            task_id=task_id,
+        )
         runner = ChatRunner(
             paths=self.paths,
             cluster=self.cluster,
@@ -5060,6 +5627,7 @@ class Daemon:
             context_docs=context_docs or [],
             agent_type=resolved_type,
             agent_id=resolved_id,
+            daemon=self,
         )
         runner.spawn()
         # Chained turns (auto-spawn when a queued prompt lands) inherit
@@ -5110,7 +5678,13 @@ class Daemon:
         )
 
     def _conv_meta_set(
-        self, conv: str, agent_type: str, agent_id: Optional[str]
+        self,
+        conv: str,
+        agent_type: str,
+        agent_id: Optional[str],
+        parent_conv: Optional[str] = None,
+        initiative_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         try:
             all_meta = self._conv_meta_load()
@@ -5118,6 +5692,24 @@ class Daemon:
             entry["agent_type"] = _agent_type_normalised(agent_type)
             if agent_id:
                 entry["agent_id"] = agent_id
+            # py-1.10.16 — Parent-child conv linkage for the architect
+            # wake protocol (initiative `architect-wake-on-subagent`).
+            # The architect dispatches a subagent with `parent_conv: <me>`
+            # so that when the subagent's final fires, the daemon can
+            # post a `[architect-wake]` turn back to the architect's
+            # conv. Persisted so a daemon restart preserves the linkage.
+            if parent_conv:
+                entry["parent_conv"] = parent_conv
+            # py-1.10.19 — Initiative + task linkage. Drives the
+            # cockpit's per-initiative working spinner + per-task
+            # blink in the roadmap (initiative `agent-activity-surface`).
+            # Stored alongside parent_conv so a daemon restart preserves
+            # the full join, and the architect wake hook can quote them
+            # back to the parent ("subagent A101 on I1/D-DBG-01 finished").
+            if initiative_id:
+                entry["initiative_id"] = initiative_id
+            if task_id:
+                entry["task_id"] = task_id
             all_meta[conv] = entry
             p = self._conv_meta_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -5126,6 +5718,104 @@ class Daemon:
             tmp.replace(p)
         except Exception as e:
             _log(f"conv_meta write failed: {e}")
+
+    def _conv_meta_parent(self, conv: str) -> Optional[str]:
+        """Return the parent conv id recorded for `conv`, if any."""
+        meta = self._conv_meta_load().get(conv) or {}
+        p = meta.get("parent_conv")
+        return str(p) if p else None
+
+    def _dispatch_mutex_check(
+        self,
+        *,
+        conv: str,
+        agent_type: Optional[str],
+        parent_conv: Optional[str],
+        task_id: Optional[str],
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """py-1.10.25 — server-side enforcement of dispatch invariants
+        the architect prompt claims but the LLM sometimes ignores.
+        Returns `None` to allow the dispatch, or `(409, body)` to reject.
+
+        Invariants enforced (both observed broken in cavioca 2026-05-30):
+
+        1. **Single live roadmap-architect.** At most one
+           `roadmap-architect-*` conv may have a live ChatRunner. A
+           wake to the SAME conv is allowed (it's just the next turn
+           on the existing architect); a dispatch to a DIFFERENT
+           `roadmap-architect-*` while one is alive is refused.
+
+        2. **No parallel dispatch on the same (parent_conv, task_id).**
+           If the architect already dispatched task `T` and that conv
+           is still streaming, a second dispatch on the same (parent,
+           task) pair is refused. Prevents two subagents racing on
+           the same file commits.
+
+        The architect catches 409s on its bash tool and (per the
+        prompt addendum below) should treat them as "wait for the
+        wake, don't retry". Cockpit reads the `hint` and surfaces
+        a soft notice.
+        """
+        is_architect_target = (agent_type == "roadmap-architect") or conv.startswith(
+            "roadmap-architect-"
+        )
+        live = self.chat_sessions.list_active()
+
+        # Invariant 1: single live roadmap-architect.
+        # Match BOTH by slug AND by stored agent_type in conv_meta —
+        # the slug is the canonical signal for cockpit-spawned convs
+        # but custom-named convs can also carry the agent_type via
+        # /chat/dispatch body, and we must catch both.
+        if is_architect_target:
+            all_meta = self._conv_meta_load()
+            others: List[str] = []
+            for c in live:
+                if c == conv:
+                    continue
+                slug_arch = c.startswith("roadmap-architect-")
+                meta_arch = (
+                    _agent_type_normalised((all_meta.get(c) or {}).get("agent_type"))
+                    == "roadmap-architect"
+                )
+                if slug_arch or meta_arch:
+                    others.append(c)
+            if others:
+                return 409, {
+                    "error": "roadmap-architect-already-live",
+                    "hint": (
+                        "Another roadmap-architect conv is already running. "
+                        "Stop it first (POST /chat/cancel) before spawning a new one."
+                    ),
+                    "existing_convs": others,
+                    "requested_conv": conv,
+                }
+
+        # Invariant 2: no parallel dispatch on same (parent_conv, task_id).
+        # Only meaningful when both parent_conv and task_id are set —
+        # i.e., the architect dispatching a subagent. Without these
+        # tags the dispatch is operator-driven and the operator owns
+        # the de-dup decision.
+        if parent_conv and task_id:
+            all_meta = self._conv_meta_load()
+            for live_conv in live:
+                if live_conv == conv:
+                    continue
+                m = all_meta.get(live_conv) or {}
+                if m.get("parent_conv") == parent_conv and m.get("task_id") == task_id:
+                    return 409, {
+                        "error": "task-already-dispatched",
+                        "hint": (
+                            f"Task `{task_id}` (parent `{parent_conv}`) "
+                            f"already has a live dispatch: `{live_conv}`. "
+                            "Wait for the [architect-wake] on its final; "
+                            "do not retry while it's still running."
+                        ),
+                        "existing_conv": live_conv,
+                        "parent_conv": parent_conv,
+                        "task_id": task_id,
+                    }
+
+        return None
 
     def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         text = str(body.get("text") or "").strip()
@@ -5142,6 +5832,50 @@ class Daemon:
         # cockpit reconnects keep the same role.
         agent_type = body.get("agent_type")
         agent_id = body.get("agent_id")
+        # py-1.10.16 — `parent_conv` (initiative `architect-wake-on-subagent`).
+        # When the architect dispatches a subagent, it passes its own
+        # conv id so the daemon can re-dispatch a wake turn the moment
+        # the subagent's `chat.assistant.final` fires. Optional;
+        # missing = the conv has no parent (cockpit-initiated chat).
+        parent_conv = body.get("parent_conv")
+        if parent_conv is not None:
+            parent_conv = str(parent_conv).strip() or None
+        # py-1.10.19 — `initiative_id` + `task_id` (initiative
+        # `agent-activity-surface`). Both already flow on the wire
+        # (architect prompt + story-runner cockpit dispatch); now
+        # they're persisted so /state can join them and the cockpit
+        # can render per-initiative / per-task working state without
+        # heuristics on the conv slug.
+        initiative_id = body.get("initiative_id")
+        if initiative_id is not None:
+            initiative_id = str(initiative_id).strip() or None
+        task_id = body.get("task_id")
+        if task_id is not None:
+            task_id = str(task_id).strip() or None
+        # py-1.10.25 — Daemon-side dispatch mutex. Enforces invariants
+        # the architect prompt already claims but the LLM intermittently
+        # violates (observed in cavioca 2026-05-30: same task got 4
+        # parallel dispatches, two roadmap-architect convs running
+        # simultaneously, etc.). Rejected requests return 409 with a
+        # `hint` field naming the existing conv so the caller can
+        # decide what to do (architect: wait for the wake; cockpit:
+        # surface the conflict).
+        mutex_err = self._dispatch_mutex_check(
+            conv=conv,
+            agent_type=agent_type,
+            parent_conv=parent_conv,
+            task_id=task_id,
+        )
+        if mutex_err is not None:
+            code_err, body_err = mutex_err
+            _debug_emit(
+                "chat-dispatch.refused",
+                msg=body_err.get("error", "refused"),
+                lvl="warn",
+                conv=conv,
+                data=body_err,
+            )
+            return code_err, body_err
         # py-1.4.0 — Accept cockpit-attached context as part of the
         # briefing pipeline. Previously this field was silently
         # dropped, which broke V46/V78b onboarding (the cockpit
@@ -5179,6 +5913,22 @@ class Daemon:
                 "message": "turn in progress — your prompt will be merged into the next turn",
             }
         # 3) New turn.
+        _debug_emit(
+            "chat-dispatch",
+            msg=f"new turn (conv={conv}, type={agent_type or 'custom'})",
+            conv=conv,
+            agent_id=agent_id,
+            data={
+                "agent_type": agent_type,
+                "parent_conv": parent_conv,
+                "initiative_id": initiative_id,
+                "task_id": task_id,
+                "text_len": len(text),
+                "text_preview": text[:200],
+                "context_docs": len(context_docs),
+                "author": author,
+            },
+        )
         try:
             runner = self._spawn_chat_turn(
                 conv,
@@ -5186,6 +5936,9 @@ class Daemon:
                 context_docs=context_docs,
                 agent_type=agent_type,
                 agent_id=agent_id,
+                parent_conv=parent_conv,
+                initiative_id=initiative_id,
+                task_id=task_id,
             )
         except Exception as e:
             return 400, {"error": str(e)}
@@ -5197,6 +5950,241 @@ class Daemon:
             "stream_id": runner.stream_id,
             "agent_type": _agent_type_normalised(agent_type),
         }
+
+    # py-1.10.24 — Per-task unproductive-final counter (cavioca incident:
+    # API2 went into plan-mode 3 times, architect kept retrying instead of
+    # following matrix rule "blocked after 2 failures"). When the wake
+    # hook detects a subagent final with NO commit hash AND NO success
+    # marker, it bumps this counter and surfaces the count in the wake
+    # message so the architect can't pretend it doesn't know.
+    # Reset on Daemon restart — Run All sessions are bounded.
+    _COMMIT_PATTERNS = (
+        re.compile(r"\bcommit[:\s]+([0-9a-f]{6,40})\b", re.IGNORECASE),
+        re.compile(r"^\s*✓\s+task\s+\S+\s+done\b", re.IGNORECASE | re.MULTILINE),
+    )
+
+    def _classify_subagent_final(self, preview: str, exit_code: Optional[int]) -> str:
+        """Return one of: 'success' | 'no-commit' | 'error'. The
+        architect prompt's DECISION MATRIX treats anything other than
+        'success' as a failure; this method just makes the call
+        deterministic so the wake message can name it."""
+        if exit_code not in (None, 0):
+            return "error"
+        text = preview or ""
+        if any(p.search(text) for p in self._COMMIT_PATTERNS):
+            return "success"
+        return "no-commit"
+
+    def _roadmap_pass_complete(self) -> bool:
+        """py-1.10.25 — True iff no active/next initiative has any
+        non-terminal task left. Used by the architect-wake hook to
+        flip the message into "emit the summary and stop" mode when
+        the pass has run out of actionable work.
+
+        Terminal task statuses (count as 'done for the pass'):
+        `done`, `blocked`, `cancelled`. Anything else (`next`,
+        `active`, `in_progress`, `pending-operator`, …) still needs
+        an agent.
+
+        Falls back to False on any error — better to keep retrying
+        than to falsely terminate a live pass."""
+        try:
+            snap = self.state_manager.state()
+            inits = snap.get("initiatives") or []
+            tasks_by_init: Dict[str, List[Dict[str, Any]]] = {}
+            for t in (snap.get("roadmap") or {}).get("tasks") or []:
+                iid = t.get("initiative")
+                if iid:
+                    tasks_by_init.setdefault(iid, []).append(t)
+            terminal = {"done", "blocked", "cancelled"}
+            for it in inits:
+                status = normalize_status(it.get("status"))
+                if status in ("done", "backlog"):
+                    continue
+                # active/next/in_progress — does it have actionable tasks?
+                kids = tasks_by_init.get(it.get("id"), [])
+                if any(normalize_status(k.get("status")) not in terminal for k in kids):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _bump_task_failure(self, task_id: Optional[str]) -> int:
+        """Increment + return the cumulative unproductive-final count
+        for `task_id` since daemon boot. Returns 0 when task_id is
+        missing (untrackable)."""
+        if not task_id:
+            return 0
+        if not hasattr(self, "_task_failures"):
+            self._task_failures: Dict[str, int] = {}
+        self._task_failures[task_id] = self._task_failures.get(task_id, 0) + 1
+        return self._task_failures[task_id]
+
+    def _maybe_wake_parent_architect(
+        self,
+        *,
+        child_conv: str,
+        child_agent_id: Optional[str],
+        child_final_text: str,
+        child_exit: Optional[int],
+    ) -> None:
+        """Architect-wake hook (initiative `architect-wake-on-subagent`).
+
+        When a child conv emits `chat.assistant.final`, look up its
+        recorded `parent_conv`. If the parent is a roadmap-architect
+        conv, post a `[architect-wake]` user turn back to it so the
+        pass resumes automatically. If the architect is mid-turn the
+        wake is merged into its pending queue (chat_sessions.queue);
+        if it has already exited the wake spawns a fresh turn. Both
+        paths are correct and converge on the same outcome.
+
+        py-1.10.24 — Wake message now annotates the outcome explicitly
+        ('success' / 'no-commit' / 'error') + the cumulative unproductive
+        count per task_id so the architect cannot ignore the
+        DECISION MATRIX rule "Sub-agent failed twice → mark blocked".
+
+        No-op when: no parent recorded; parent isn't a roadmap-architect
+        conv; parent conv has been archived/cancelled. Quiet failures —
+        a missing wake never blocks the child's final from being
+        broadcast.
+        """
+        parent_conv = self._conv_meta_parent(child_conv)
+        if not parent_conv:
+            _debug_emit(
+                "architect-wake.skipped",
+                msg=f"no parent_conv recorded for {child_conv}",
+                lvl="debug",
+                conv=child_conv,
+                agent_id=child_agent_id,
+            )
+            return
+        parent_type = _agent_type_from_conv_slug(parent_conv)
+        if parent_type != "roadmap-architect":
+            # Wake hook is roadmap-architect-only for now. Generalising
+            # to any parent type is on roadmap (would let custom agents
+            # spawn worker children with auto-resume too) but needs
+            # cycle-protection design first.
+            _debug_emit(
+                "architect-wake.skipped",
+                msg=f"parent {parent_conv} is not a roadmap-architect conv",
+                lvl="debug",
+                conv=child_conv,
+                data={"parent_conv": parent_conv, "parent_type": parent_type},
+            )
+            return
+        # Build a compact wake message. Architect needs the child id +
+        # a preview of the answer to know whether the task succeeded.
+        preview = (child_final_text or "").strip()
+        if len(preview) > 800:
+            preview = preview[:800].rstrip() + " …(truncated)"
+        agent_tag = f" ({child_agent_id})" if child_agent_id else ""
+        exit_tag = f" exit={child_exit}" if child_exit not in (None, 0) else ""
+        # py-1.10.24 — Classify the outcome + count failures per task.
+        outcome = self._classify_subagent_final(preview, child_exit)
+        # Pull the task_id the child was working on so we can name it
+        # in the wake AND bump the counter.
+        child_meta = self._conv_meta_load().get(child_conv) or {}
+        task_id = child_meta.get("task_id") or None
+        initiative_id = child_meta.get("initiative_id") or None
+        fail_count = 0
+        verdict_line = ""
+        if outcome == "success":
+            verdict_line = "VERDICT: ✓ success (commit detected in preview)"
+        else:
+            fail_count = self._bump_task_failure(task_id)
+            kind = (
+                "no-commit (subagent didn't ship)"
+                if outcome == "no-commit"
+                else f"error (exit={child_exit})"
+            )
+            if fail_count >= 2:
+                verdict_line = (
+                    f"VERDICT: ✗ {kind} — task `{task_id or '?'}` has now "
+                    f"failed {fail_count}× this session. **MATRIX RULE: "
+                    f"sub-agent failed twice → mark this task `blocked` "
+                    f"with the reason and MOVE ON. Do NOT retry a third "
+                    f"time.**"
+                )
+            else:
+                verdict_line = (
+                    f"VERDICT: ✗ {kind} — task `{task_id or '?'}` fail #{fail_count}. "
+                    f"One retry allowed by matrix; after that mark blocked."
+                )
+        task_tag = f" (init={initiative_id}, task={task_id})" if task_id else ""
+        # py-1.10.25 — Pass-complete detection. When no active/next
+        # initiative has any task left in {next, active, in_progress},
+        # the architect is done and the wake forces the 4-bucket
+        # end-of-pass summary instead of allowing more dispatches.
+        pass_complete = self._roadmap_pass_complete()
+        if pass_complete:
+            continuation = (
+                "**END-OF-PASS DETECTED.** The roadmap has NO remaining "
+                "actionable tasks (every active/next initiative is either "
+                "fully shipped or fully blocked). DO NOT dispatch more "
+                "subagents. Emit the 4-bucket summary NOW (shipped / "
+                "stubs-in-place / deferred-ops / decisions, + "
+                "spec-needs-clarification if any), then end your turn. "
+                "The pass is closed."
+            )
+        else:
+            continuation = (
+                "Continue the roadmap pass: apply the verdict, mark "
+                "the originating task done/blocked accordingly, then dispatch "
+                "the next wave (or emit the end-of-pass summary if everything "
+                "actionable is shipped or blocked)."
+            )
+        wake_text = (
+            f"[architect-wake] Subagent `{child_conv}`{agent_tag}{task_tag} finished{exit_tag}.\n\n"
+            f"{verdict_line}\n\n"
+            f"Result preview:\n{preview}\n\n"
+            f"{continuation}"
+        )
+        _debug_emit(
+            "architect-wake",
+            msg=f"waking {parent_conv} on {outcome} of {child_conv}"
+            + (f" (task {task_id} fail#{fail_count})" if fail_count else ""),
+            conv=parent_conv,
+            agent_id=child_agent_id,
+            lvl=("warn" if outcome != "success" and fail_count >= 2 else "info"),
+            data={
+                "child_conv": child_conv,
+                "child_exit": child_exit,
+                "outcome": outcome,
+                "task_id": task_id,
+                "initiative_id": initiative_id,
+                "task_fail_count": fail_count,
+                "preview_len": len(preview),
+                "preview_head": preview[:200],
+            },
+        )
+        try:
+            code, resp = self.chat_dispatch(
+                {
+                    "conv": parent_conv,
+                    "text": wake_text,
+                    "author": "architect-wake",
+                    "agent_type": "roadmap-architect",
+                }
+            )
+            if code >= 400:
+                _log(
+                    f"architect-wake dispatch to {parent_conv} returned {code}: {resp}"
+                )
+                _debug_emit(
+                    "architect-wake.failed",
+                    msg=f"chat_dispatch returned {code}",
+                    lvl="warn",
+                    conv=parent_conv,
+                    data={"code": code, "resp": resp},
+                )
+        except Exception as e:
+            _log(f"architect-wake dispatch raised for {parent_conv}: {e}")
+            _debug_emit(
+                "architect-wake.failed",
+                msg=f"chat_dispatch raised: {e}",
+                lvl="error",
+                conv=parent_conv,
+            )
 
     def chat_cancel(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         conv = str(body.get("conv") or "").strip()
@@ -5741,8 +6729,89 @@ class Daemon:
             # the runner is mid-tool-call). Empty list when the daemon
             # has no in-flight turns.
             "chat_active_convs": self.chat_sessions.list_active(),
+            # py-1.10.19 — Full activity join. Each entry covers either
+            # a LIVE conv (its own ChatRunner is running) or a parent
+            # COORDINATING conv (own runner idle, but at least one
+            # child whose `parent_conv` points here is live). Cockpit
+            # consumes this for the per-initiative working spinner +
+            # 'Waiting on A101' pill + ChatRail coordinating chip.
+            "chat_activity": self.chat_activity(),
+            # py-1.10.21 — Debug stream advertisement. `enabled` is the
+            # operator-controlled flag (`cluster.yaml.debug.enabled`,
+            # default true). Cockpit's debug-transport gates its POST
+            # /debug/log buffer on this — when disabled it drains
+            # silently instead of round-tripping.
+            "debug": {
+                "enabled": _DEBUG_LOG is not None,
+                "path": (
+                    str(self.paths.runtime / "debug.jsonl")
+                    if _DEBUG_LOG is not None
+                    else None
+                ),
+            },
             "ts": _iso_now(),
         }
+
+    def chat_activity(self) -> List[Dict[str, Any]]:
+        """Join `chat_sessions.list_active()` with `conv_meta` so the
+        cockpit (and any future external observer) can see, in one
+        request: which convs are streaming, which initiative + task
+        they target, and which parent convs are coordinating live
+        children but not running themselves. Initiative
+        `agent-activity-surface`, feature flag `chat.activity.v1`."""
+        live = set(self.chat_sessions.list_active())
+        all_meta = self._conv_meta_load()
+
+        def _meta(c: str) -> Dict[str, Any]:
+            return all_meta.get(c) or {}
+
+        entries: List[Dict[str, Any]] = []
+        for conv in sorted(live):
+            m = _meta(conv)
+            entries.append(
+                {
+                    "conv": conv,
+                    "agent_id": m.get("agent_id"),
+                    "agent_type": _agent_type_normalised(m.get("agent_type")),
+                    "parent_conv": m.get("parent_conv"),
+                    "initiative_id": m.get("initiative_id"),
+                    "task_id": m.get("task_id"),
+                    "live": True,
+                    "waiting_on": [],
+                }
+            )
+
+        # Coordinating parents: convs that are NOT live themselves but
+        # appear as `parent_conv` of one or more live convs.
+        children_by_parent: Dict[str, List[str]] = {}
+        for conv in live:
+            p = _meta(conv).get("parent_conv")
+            if p:
+                children_by_parent.setdefault(p, []).append(conv)
+
+        for parent, children in children_by_parent.items():
+            if parent in live:
+                # Already on the list — promote its `waiting_on`.
+                for e in entries:
+                    if e["conv"] == parent:
+                        e["waiting_on"] = sorted(children)
+                        break
+                continue
+            pm = _meta(parent)
+            entries.append(
+                {
+                    "conv": parent,
+                    "agent_id": pm.get("agent_id"),
+                    "agent_type": _agent_type_normalised(pm.get("agent_type")),
+                    "parent_conv": pm.get("parent_conv"),
+                    "initiative_id": pm.get("initiative_id"),
+                    "task_id": pm.get("task_id"),
+                    "live": False,
+                    "waiting_on": sorted(children),
+                }
+            )
+
+        return entries
 
     def _features(self) -> List[str]:
         feats = [
@@ -5774,6 +6843,12 @@ class Daemon:
             "agents.validation-shortcuts.v1",  # py-1.10.11 — proceed/rework operator shortcuts + ROADMAP-REWORK trigger + chat-input UX
             "agents.slug-implied-type.v1",  # py-1.10.12 — slug-implied agent_type force heals stale conv_meta + drops the SOP-in-prompt lead-in
             "agents.roadmap-author.v1",  # py-1.10.13 — custom agent auto-triggers roadmap-author playbook (meshkore.com/reference/prompts/roadmap-author/v1/) on empty clusters
+            "agents.briefing-https.v1",  # py-1.10.14 — agent briefings emit https://daemon.meshkore.com:<port> URLs when TLS bundle present (architect no longer aborts on TLS RST against plain http://localhost)
+            "roadmap.linked-list.v1",  # py-1.10.15 — state.initiatives[] ordered by linked-list walk + bucket sort (empty-at-bottom, done at end)
+            "roadmap.auto-archive.v1",  # py-1.10.15 — initiatives with all-done child tasks get status/completed_at/commit_sha written by the daemon on every /state build
+            "agents.architect-wake.v1",  # py-1.10.16 — subagent's chat.assistant.final triggers an automatic [architect-wake] dispatch to the parent_conv recorded in conv_meta; replaces architect-side polling
+            "debug.stream.v1",  # py-1.10.17 — structured JSONL at .meshkore/.runtime/debug.jsonl, GET /debug/tail + POST /debug/log, 30-min rolling retention. Replaces ad-hoc screenshots as the cross-component observability channel.
+            "chat.activity.v1",  # py-1.10.20 — /state.chat_activity + /health.chat_activity expose live convs + coordinating parents with waiting_on[]. Drives the cockpit's per-initiative spinner, per-task blink, ChatRail 'coordinating' chip, and 'Waiting on A###' chat pill.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -6080,6 +7155,22 @@ class Daemon:
     # ── lifecycle ──────────────────────────────────────────────────────
     def serve_forever(self) -> None:
         self._write_runtime()
+        # py-1.10.17 — Initialise the debug stream singleton FIRST so
+        # boot-time `_log()` calls below already land in debug.jsonl.
+        # py-1.10.21 — Honour `cluster.yaml.debug.enabled: false` for
+        # downstream clusters that don't want the disk footprint.
+        # Default is ON (this is MeshKore-native dogfooding).
+        global _DEBUG_LOG
+        if _debug_enabled(self.cluster):
+            _DEBUG_LOG = DebugLog(self.paths.runtime / "debug.jsonl")
+            _debug_emit(
+                "boot",
+                msg=f"daemon {DAEMON_VERSION} starting on port {self.port}",
+                data={"identity": self.identity, "cluster": self.cluster.id},
+            )
+        else:
+            _DEBUG_LOG = None
+            _log("debug stream: disabled by cluster.yaml.debug.enabled=false")
         handler = make_handler(self)
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         self.server.daemon_threads = True
@@ -6161,8 +7252,290 @@ def _iso_now() -> str:
     )
 
 
+# ── Debug stream (initiative `debug-stream`, py-1.10.17) ──────────────
+# Module-level singleton so `_log()` and any free function can emit
+# without threading a `daemon` ref through every call site.
+_DEBUG_LOG: Optional["DebugLog"] = None
+
+
 def _log(msg: str) -> None:
     print(f"[meshcore-py {_iso_now()}] {msg}", flush=True)
+    # py-1.10.17 — mirror every daemon log line into the debug stream
+    # so a single tail covers the unstructured prose + the structured
+    # event hooks (architect-wake, chat-dispatch, …) below.
+    if _DEBUG_LOG is not None:
+        try:
+            _DEBUG_LOG.emit(tag="log", lvl="info", msg=msg, src="daemon")
+        except Exception:
+            # Debug stream failures must never block the program.
+            pass
+
+
+class DebugLog:
+    """Append-only JSONL debug stream.
+
+    Path: `.meshkore/.runtime/debug.jsonl`. Each line is one event:
+        {"ts": "...", "src": "daemon|cockpit|agent", "lvl": "...",
+         "tag": "...", "conv"?: ..., "agent_id"?: ..., "msg": "...",
+         "data"?: { ... }}
+
+    Retention: when the file exceeds `MAX_BYTES`, the writer reads it
+    back, keeps only events whose `ts` falls within `RETAIN_SECS` of
+    the current instant, and atomically rewrites the file. Worst-case
+    trim cost: O(file_size) but bounded by MAX_BYTES.
+
+    Thread-safe. Failures never raise — the daemon must keep running
+    even if the log disk is full or read-only."""
+
+    MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+    RETAIN_SECS = 30 * 60  # 30 min
+    TRIM_CHECK_EVERY = 50  # check size every N appends, not every time
+
+    def __init__(self, path: "Path") -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._writes_since_check = 0
+        # Touch the file so subsequent appends never hit ENOENT mid-write.
+        if not self.path.exists():
+            try:
+                self.path.write_text("")
+            except OSError:
+                pass
+        # py-1.10.21 — Trim once on boot. A long-running daemon that
+        # writes < TRIM_CHECK_EVERY events between restarts (low-traffic
+        # day) was leaving the file with stale head events that
+        # predated the rolling window by hours. One trim at startup
+        # gives the operator a clean window immediately.
+        with self._lock:
+            self._maybe_trim_locked()
+
+    def emit(
+        self,
+        *,
+        tag: str,
+        msg: str = "",
+        lvl: str = "info",
+        src: str = "daemon",
+        conv: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        rec: Dict[str, Any] = {
+            "ts": _iso_now(),
+            "src": src,
+            "lvl": lvl,
+            "tag": tag,
+            "msg": msg,
+        }
+        if conv:
+            rec["conv"] = conv
+        if agent_id:
+            rec["agent_id"] = agent_id
+        if data:
+            # Best-effort redaction. Token-like values get masked.
+            rec["data"] = _debug_redact(data)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with self._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                return
+            self._writes_since_check += 1
+            if self._writes_since_check >= self.TRIM_CHECK_EVERY:
+                self._writes_since_check = 0
+                self._maybe_trim_locked()
+
+    def _maybe_trim_locked(self) -> None:
+        # py-1.10.21 — Trim by EITHER size OR age. The original code
+        # only checked size, so on low-traffic days the file kept
+        # events from 2-3 hours ago even though the convention says
+        # "30 min rolling window". We now also inspect the first line
+        # cheaply: if it's older than RETAIN_SECS we know the head is
+        # stale and read the full file to rewrite.
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        cutoff = time.time() - self.RETAIN_SECS
+        need_trim = size > self.MAX_BYTES
+        if not need_trim:
+            # Cheap age probe: read just the first non-empty line.
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            ts_str = str(rec.get("ts") or "")
+                            norm = (
+                                ts_str[:-1] + "+00:00"
+                                if ts_str.endswith("Z")
+                                else ts_str
+                            )
+                            head_ts = datetime.fromisoformat(norm).timestamp()
+                            if head_ts < cutoff:
+                                need_trim = True
+                        except (ValueError, TypeError):
+                            pass
+                        break
+            except OSError:
+                return
+        if not need_trim:
+            return
+        try:
+            raw = self.path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        kept: List[str] = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            ts_str = ""
+            try:
+                rec = json.loads(line)
+                ts_str = rec.get("ts") or ""
+            except (ValueError, TypeError):
+                continue
+            try:
+                # ts ends with Z; strptime via fromisoformat after Z→+00:00.
+                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
+                if datetime.fromisoformat(norm).timestamp() >= cutoff:
+                    kept.append(line)
+            except (ValueError, TypeError):
+                continue
+        new_blob = "\n".join(kept) + ("\n" if kept else "")
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            tmp.write_text(new_blob, encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            return
+
+    def tail(
+        self,
+        *,
+        last_secs: int = 300,
+        tags: Optional[set[str]] = None,
+        min_level: str = "debug",
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return (events, retained_secs). `retained_secs` is the
+        actual age of the oldest event still on disk — useful to detect
+        when the operator asked for a window wider than retention."""
+        levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+        min_rank = levels.get(min_level.lower(), 0)
+        cutoff = time.time() - max(1, last_secs)
+        out: List[Dict[str, Any]] = []
+        oldest_ts: Optional[float] = None
+        try:
+            raw = self.path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return out, 0
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            ts_str = str(rec.get("ts") or "")
+            try:
+                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
+                ts = datetime.fromisoformat(norm).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+            if ts < cutoff:
+                continue
+            if tags and rec.get("tag") not in tags:
+                continue
+            if levels.get(str(rec.get("lvl") or "info"), 1) < min_rank:
+                continue
+            out.append(rec)
+        retained = int(time.time() - oldest_ts) if oldest_ts else 0
+        return out, retained
+
+
+_REDACT_KEYS = {
+    "token",
+    "authorization",
+    "bearer",
+    "api_key",
+    "apikey",
+    "secret",
+    "password",
+}
+
+
+def _debug_redact(data: Any) -> Any:
+    """Best-effort scrub of token-like values in arbitrary payloads."""
+    if isinstance(data, dict):
+        out: Dict[str, Any] = {}
+        for k, v in data.items():
+            if str(k).lower() in _REDACT_KEYS:
+                out[k] = "<redacted>"
+            else:
+                out[k] = _debug_redact(v)
+        return out
+    if isinstance(data, list):
+        return [_debug_redact(x) for x in data]
+    if isinstance(data, str) and len(data) > 24 and data.startswith("Bearer "):
+        return "Bearer <redacted>"
+    return data
+
+
+def _debug_emit(
+    tag: str,
+    *,
+    msg: str = "",
+    lvl: str = "info",
+    src: str = "daemon",
+    conv: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Convenience: skip the `if _DEBUG_LOG is not None:` dance at
+    every emit site. No-op when the daemon hasn't initialised yet OR
+    when the operator opted out via `cluster.yaml.debug.enabled: false`
+    (py-1.10.21)."""
+    if _DEBUG_LOG is None:
+        return
+    try:
+        _DEBUG_LOG.emit(
+            tag=tag,
+            msg=msg,
+            lvl=lvl,
+            src=src,
+            conv=conv,
+            agent_id=agent_id,
+            data=data,
+        )
+    except Exception:
+        pass
+
+
+def _debug_enabled(cluster: "Cluster") -> bool:
+    """Read `cluster.yaml.debug.enabled` (default `True`). Falsy disables
+    DebugLog initialisation entirely — no file written, /debug/tail
+    returns empty, /debug/log accepts but drops. py-1.10.21. Note the
+    default is ON for MeshKore native development; downstream clusters
+    that want zero disk footprint flip it to false."""
+    try:
+        block = cluster.data.get("debug") if isinstance(cluster.data, dict) else None
+        if not isinstance(block, dict):
+            return True
+        v = block.get("enabled")
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        return True
 
 
 def _hostname_default() -> str:
@@ -6198,6 +7571,23 @@ def _ensure_token(paths: Paths) -> str:
 # TLS — loopback subdomain (D-TLS-01)
 
 
+def _daemon_base_url(port: int) -> str:
+    """Authoritative base URL for in-prompt daemon endpoints.
+
+    py-1.10.14 — when the TLS bundle is present the listener wraps its
+    socket and plain HTTP returns RST. Subprocess agents that the
+    daemon spawns (architect, custom, deploy, …) get their endpoint
+    URLs baked into the briefing string; previously those were always
+    `http://localhost:<port>`, which silently broke the moment TLS was
+    enabled. Now: prefer `https://daemon.meshkore.com:<port>` whenever
+    the bundle exists, falling back to plain HTTP only when it's not.
+    Same logic as `Daemon.health().endpoint`, kept in sync here because
+    the briefing is composed off the request path (no daemon ref)."""
+    if _find_tls_bundle() is not None:
+        return f"https://daemon.meshkore.com:{port}"
+    return f"http://localhost:{port}"
+
+
 def _find_tls_bundle() -> Optional[Tuple[Path, Path]]:
     """Locate (cert, key) next to daemon.py. Returns None if either
     file is missing — daemon then falls back to plain HTTP, so older
@@ -6228,7 +7618,13 @@ def _build_tls_context(cert_path: Path, key_path: Path) -> Optional[ssl.SSLConte
 
 
 def _port_free(port: int) -> bool:
+    # py-1.10.18 — Use SO_REUSEADDR for the probe bind too. Without it,
+    # a port still in kernel TIME_WAIT (from a daemon that exited
+    # seconds ago) reads as busy and the daemon migrates to the next
+    # port. ThreadingHTTPServer enables reuse on the real listener, so
+    # the actual bind succeeds — the test bind just lied.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", port))
             return True
@@ -6327,6 +7723,284 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
     return out
 
 
+# Boot self-update tunables. Module-level so opt-out / restart-loop
+# back-off behaviour is auditable from one place.
+_BOOT_PROBE_THROTTLE_SECS = 60  # don't hit the CDN more than 1×/min
+_BOOT_PROBE_TIMEOUT_SECS = 4  # boot must never hang waiting on CDN
+_BOOT_BACKUPS_TO_KEEP = 3  # daemon.py.bak, .bak.1, .bak.2
+
+
+def _boot_self_update_if_needed(paths: Paths, args: Dict[str, Any]) -> None:
+    """Probe `cluster.yaml.daemon.auto_update_source` at boot and replace
+    ourselves before the listener opens if the CDN serves a newer
+    `DAEMON_VERSION`. py-1.10.22, hardened py-1.10.23. Initiative
+    `daemon-boot-self-update`.
+
+    Hardening (py-1.10.23):
+      • Throttle: a stamp file at `.meshkore/.runtime/last-boot-update-check`
+        carries the wall-clock + outcome of the last probe. Restarting
+        the daemon faster than `_BOOT_PROBE_THROTTLE_SECS` skips the
+        probe — a crash-restart loop won't DDoS the CDN.
+      • Always-log: every restart logs one `boot self-update: <verb>`
+        line so the operator can read the boot log and see exactly
+        what happened (skip-throttled, skip-disabled, no-update,
+        updated, failed).
+      • Backup rotation: previous `daemon.py.bak` shifts to `.bak.1`,
+        `.bak.1` shifts to `.bak.2`, oldest is dropped. Three rollback
+        points protects against "new version regresses but already on
+        CDN" scenarios.
+      • TLS bundle parallel refresh: when the auto_update_source URL
+        ends with `/daemon.py`, we also try `<dir>/tls/{fullchain.pem,
+        privkey.pem}` so a daemon that updates also gets the matching
+        cert. Falls back gracefully if either file 404s.
+
+    Opt-outs (unchanged):
+      • `cluster.yaml.daemon.auto_update: false`         — no auto-update at all.
+      • `cluster.yaml.daemon.auto_update_on_boot: false` — only the boot probe is skipped (HTTP /self-update still works).
+      • env `MESHKORE_DAEMON_NO_BOOT_UPDATE=1`           — operator/script override.
+      • env `MESHKORE_DAEMON_FORCE_BOOT_UPDATE=1`        — bypass the throttle (operator just published a fix and wants every restart to pick it up).
+      • env `MESHKORE_DAEMON_SELF_UPDATED=1`             — set by the re-exec'd child to prevent infinite update loops.
+    """
+    if os.environ.get("MESHKORE_DAEMON_NO_BOOT_UPDATE") == "1":
+        _log("boot self-update: skipped (MESHKORE_DAEMON_NO_BOOT_UPDATE=1)")
+        return
+    if os.environ.get("MESHKORE_DAEMON_SELF_UPDATED") == "1":
+        # Post-update child. Confirm + clear the throttle for next time.
+        _log(f"boot self-update: re-exec confirmed, now running {DAEMON_VERSION}")
+        _boot_update_stamp(paths, outcome="re-exec-confirmed")
+        return
+    # Tolerant YAML — we don't need a full Cluster object yet.
+    cfg: Dict[str, Any] = {}
+    try:
+        if paths.cluster_yaml.exists():
+            cfg = parse_simple_yaml(paths.cluster_yaml.read_text())
+    except Exception:
+        cfg = {}
+    d_block = cfg.get("daemon") if isinstance(cfg, dict) else None
+    if not isinstance(d_block, dict):
+        d_block = {}
+    if d_block.get("auto_update") is False:
+        _log("boot self-update: skipped (cluster.yaml.daemon.auto_update=false)")
+        return
+    if d_block.get("auto_update_on_boot") is False:
+        _log(
+            "boot self-update: skipped (cluster.yaml.daemon.auto_update_on_boot=false)"
+        )
+        return
+    # Throttle check — protects the CDN from a crash-restart loop.
+    force = os.environ.get("MESHKORE_DAEMON_FORCE_BOOT_UPDATE") == "1"
+    if not force:
+        recent = _boot_update_last_check_age(paths)
+        if recent is not None and recent < _BOOT_PROBE_THROTTLE_SECS:
+            _log(
+                f"boot self-update: skipped (throttled, last check "
+                f"{int(recent)}s ago < {_BOOT_PROBE_THROTTLE_SECS}s)"
+            )
+            return
+    url = str(
+        d_block.get("auto_update_source")
+        or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+    ).strip()
+    if not url:
+        _log("boot self-update: skipped (empty auto_update_source)")
+        return
+    if not (url.startswith("https://") or url.startswith("http://localhost")):
+        _log(f"boot self-update: skipped (rejected URL scheme: {url[:40]!r})")
+        return
+    import urllib.request
+    import ast
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"meshcore-py/{DAEMON_VERSION} boot-self-update"},
+        )
+        with urllib.request.urlopen(req, timeout=_BOOT_PROBE_TIMEOUT_SECS) as r:
+            payload = r.read()
+    except Exception as e:
+        _log(f"boot self-update: skipped (download failed: {e})")
+        _boot_update_stamp(paths, outcome=f"download-failed: {e}"[:120])
+        return
+    if b"DAEMON_VERSION" not in payload:
+        _log("boot self-update: skipped (payload lacks DAEMON_VERSION marker)")
+        _boot_update_stamp(paths, outcome="no-version-marker")
+        return
+    try:
+        ast.parse(payload)
+    except SyntaxError as e:
+        _log(f"boot self-update: skipped (syntax error in payload: {e})")
+        _boot_update_stamp(paths, outcome=f"syntax-error: {e}"[:120])
+        return
+    m = re.search(rb'(?m)^DAEMON_VERSION\s*=\s*"([^"]+)"', payload)
+    if not m:
+        _log("boot self-update: skipped (cannot locate DAEMON_VERSION literal)")
+        _boot_update_stamp(paths, outcome="version-literal-not-found")
+        return
+    new_version = m.group(1).decode("ascii", errors="replace")
+    if not _version_is_newer(new_version, DAEMON_VERSION):
+        _log(f"boot self-update: no update (CDN={new_version}, local={DAEMON_VERSION})")
+        _boot_update_stamp(paths, outcome=f"no-update (cdn={new_version})")
+        return
+    _log(
+        f"boot self-update: CDN serves {new_version}, we are "
+        f"{DAEMON_VERSION} — swapping + re-exec"
+    )
+    scripts_dir = paths.scripts_dir
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    current = scripts_dir / "daemon.py"
+    new_path = scripts_dir / "daemon.py.new"
+    try:
+        new_path.write_bytes(payload)
+        if current.exists():
+            _rotate_daemon_backups(scripts_dir, current)
+        new_path.replace(current)
+    except Exception as e:
+        _log(f"boot self-update: swap failed ({e}) — keeping current version")
+        try:
+            new_path.unlink()
+        except Exception:
+            pass
+        _boot_update_stamp(paths, outcome=f"swap-failed: {e}"[:120])
+        return
+    # Best-effort TLS bundle refresh — parity with the HTTP /self-update
+    # path. If the CDN serves daemon.py at <base>/scripts/daemon.py we
+    # also try <base>/scripts/tls/{fullchain.pem,privkey.pem}.
+    if url.endswith("/daemon.py"):
+        _refresh_tls_bundle_from_cdn(scripts_dir, url, new_version)
+    _boot_update_stamp(paths, outcome=f"updated {DAEMON_VERSION}->{new_version}")
+    env = dict(os.environ)
+    env["MESHKORE_DAEMON_SELF_UPDATED"] = "1"
+    _log(f"boot self-update: re-execing into {new_version}")
+    try:
+        os.execve(sys.executable, [sys.executable, str(current), *sys.argv[1:]], env)
+    except Exception as e:
+        _log(
+            f"boot self-update: execve failed ({e}) — keep running old in-memory code; next restart picks up new file"
+        )
+        return
+
+
+def _boot_update_stamp(paths: Paths, *, outcome: str) -> None:
+    """Persist `{ts, outcome, version}` so the throttle check at the
+    next boot has something to read. Quiet on I/O errors."""
+    try:
+        paths.runtime.mkdir(parents=True, exist_ok=True)
+        stamp = paths.runtime / "last-boot-update-check"
+        stamp.write_text(
+            json.dumps(
+                {
+                    "ts": _iso_now(),
+                    "epoch": int(time.time()),
+                    "outcome": outcome,
+                    "version": DAEMON_VERSION,
+                },
+                indent=2,
+            )
+        )
+    except OSError:
+        pass
+
+
+def _boot_update_last_check_age(paths: Paths) -> Optional[float]:
+    """Seconds since the last boot probe, or None if no stamp exists /
+    is unreadable. Caller decides what to do with `None` (we treat it
+    as 'no recent check, go ahead and probe')."""
+    stamp = paths.runtime / "last-boot-update-check"
+    try:
+        if not stamp.exists():
+            return None
+        data = json.loads(stamp.read_text() or "{}")
+        epoch = float(data.get("epoch") or 0)
+        if epoch <= 0:
+            return None
+        age = time.time() - epoch
+        return max(0.0, age)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _rotate_daemon_backups(scripts_dir: "Path", current: "Path") -> None:
+    """Shift daemon.py.bak.1 → .bak.2, daemon.py.bak → .bak.1, then
+    write the current binary to .bak. Keeps `_BOOT_BACKUPS_TO_KEEP`
+    rollback points; oldest gets dropped. Idempotent + tolerant — any
+    missing intermediate just skips that shift."""
+    import shutil
+
+    for i in range(_BOOT_BACKUPS_TO_KEEP - 1, 0, -1):
+        src = scripts_dir / (f"daemon.py.bak.{i - 1}" if i > 1 else "daemon.py.bak")
+        dst = scripts_dir / f"daemon.py.bak.{i}"
+        try:
+            if src.exists():
+                src.replace(dst)
+        except OSError:
+            pass
+    try:
+        shutil.copy2(current, scripts_dir / "daemon.py.bak")
+    except OSError as e:
+        _log(f"boot self-update: backup write failed ({e}) — proceeding anyway")
+
+
+def _refresh_tls_bundle_from_cdn(
+    scripts_dir: "Path", daemon_url: str, ver: str
+) -> None:
+    """Pull `<daemon-dir>/tls/{fullchain.pem,privkey.pem}` to keep the
+    cert in lockstep with daemon.py. py-1.8.0 introduced this for the
+    HTTP /self-update path; py-1.10.23 mirrors it on boot. Failures
+    keep the existing on-disk bundle — never wedges the daemon."""
+    import urllib.request
+
+    tls_dir = scripts_dir / "tls"
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    base_url = daemon_url[: -len("/daemon.py")] + "/tls"
+    for fname, mode in (("fullchain.pem", 0o644), ("privkey.pem", 0o600)):
+        try:
+            treq = urllib.request.Request(
+                f"{base_url}/{fname}",
+                headers={"User-Agent": f"meshcore-py/{ver} boot-tls-refresh"},
+            )
+            with urllib.request.urlopen(treq, timeout=_BOOT_PROBE_TIMEOUT_SECS) as r:
+                payload = r.read()
+            if not payload.startswith(b"-----BEGIN"):
+                _log(f"boot self-update: tls/{fname} skipped (not PEM)")
+                continue
+            target = tls_dir / fname
+            target.write_bytes(payload)
+            try:
+                os.chmod(target, mode)
+            except OSError:
+                pass
+            _log(f"boot self-update: refreshed tls/{fname}")
+        except Exception as e:
+            _log(f"boot self-update: tls/{fname} refresh skipped ({e})")
+
+
+def _version_is_newer(a: str, b: str) -> bool:
+    """True iff version `a` is strictly newer than `b`. Both look like
+    `py-1.10.21`. Compares the dotted tuple after stripping the prefix;
+    any non-numeric chunk sorts last (so `py-1.10.21-rc1` < `py-1.10.21`
+    is intentional — release wins over pre-release)."""
+
+    def parse(v: str) -> Tuple[int, ...]:
+        core = v.strip()
+        if core.startswith("py-"):
+            core = core[3:]
+        # Drop any trailing -suffix
+        if "-" in core:
+            core = core.split("-", 1)[0]
+        out: List[int] = []
+        for chunk in core.split("."):
+            try:
+                out.append(int(chunk))
+            except ValueError:
+                out.append(-1)  # unknown chunks rank last
+        return tuple(out)
+
+    try:
+        return parse(a) > parse(b)
+    except Exception:
+        return False
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     paths = Paths(args["root"])
@@ -6337,6 +8011,14 @@ def main() -> None:
             "\n   or pass --root <path>. See https://meshkore.com/standard for"
             "\n   the canonical layout.\n"
         )
+    # py-1.10.22 — Boot self-update. Pulls auto_update_source from the
+    # CDN before the listener opens; if the CDN serves a newer
+    # DAEMON_VERSION, atomic-swaps daemon.py and re-execs us. This is
+    # what prevents the "stale daemon silently breaks Run All" failure
+    # mode where an operator-spawned cluster keeps running py-1.10.13
+    # forever (architect-wake hook absent → architect stuck idle).
+    # Opt-out per-cluster via `cluster.yaml.daemon.auto_update_on_boot: false`.
+    _boot_self_update_if_needed(paths, args)
     daemon = Daemon(paths, identity=args["identity"], requested_port=args["port"])
 
     # Graceful shutdown on signal
