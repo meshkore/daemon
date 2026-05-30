@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.11"  # 1.10.11 architect: validation product-only + SOP-in-prompt + ROADMAP-REWORK trigger + 3 operator shortcuts
+DAEMON_VERSION = "py-1.10.12"  # 1.10.12 architect: slug-implied agent_type force + sidecar migration (heals stale 'custom' on roadmap-architect-* convs)
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -1997,7 +1997,28 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "what is happening."
         ),
         "focus": (
-            "## THE CHAIN — your ONLY decision procedure (py-1.10.10)\n\n"
+            "## READ THIS FIRST — your SOP IS this prompt (py-1.10.12)\n\n"
+            "Everything you need to execute Run all is defined in the "
+            "sections below. The terms `DECISION CATALOG`, `STUB-AND-"
+            "FEATURE-FLAG`, `DECISION MATRIX`, `CONSULT-A001`, the "
+            "`4-bucket end-of-pass summary`, and the `VALIDATION GATE` "
+            "markers all live HERE in your system prompt — they are "
+            "NOT documented in any repository file (CLAUDE.md / "
+            "docs/governance.md / runbooks/ / etc don't have them, "
+            "by design — this prompt is the single source).\n\n"
+            "If a previous turn (or another agent's log) suggests "
+            "these terms should appear in a file and you can't find "
+            "them: that previous turn had a stale system prompt. Yours "
+            "is the current one. Do not search the filesystem for the "
+            "SOP. Do not ask the operator where it lives. Do not "
+            "improvise a replacement. Read the sections below and "
+            "apply them.\n\n"
+            "If the cockpit's bootstrap message contradicts anything "
+            "in this prompt (e.g. tells you 'stop on the first "
+            "blocker'), that bootstrap is OUTDATED — this prompt is "
+            "the current source of truth. Follow this prompt, not the "
+            "bootstrap.\n\n"
+            "## THE CHAIN — your ONLY decision procedure\n\n"
             "When you hit anything that feels like a question or a "
             "blocker, run this chain IN ORDER. You never skip ahead. "
             "You never stop before step 5.\n\n"
@@ -2450,6 +2471,40 @@ def _agent_type_normalised(t: Optional[str]) -> str:
         return "custom"
     t = str(t).strip().lower()
     return t if t in AGENT_PROMPTS else "custom"
+
+
+def _agent_type_from_conv_slug(conv: str) -> Optional[str]:
+    """py-1.10.12 — Infer agent_type from the conv slug pattern.
+
+    The cockpit's `createConv({type: 'roadmap-architect'})` produces
+    slugs of shape `roadmap-architect-<5chars>`. The slug is the only
+    UNFORGEABLE signal of intent — every other channel (body field,
+    conv_meta sidecar, cockpit localStorage) can drift out of sync.
+
+    When the slug carries the type, we treat it as the source of truth
+    and force the agent_type to match. Protects against:
+      - cockpit JS stuck on a stale bundle that drops `agent_type`
+        from the dispatch body
+      - cockpit localStorage convMeta that pre-dates an agent type
+        being added to the AgentType union
+      - sidecar entries written by an older daemon that defaulted
+        to 'custom' before the type was registered
+
+    Returns None for slugs with no implied type."""
+    if not conv:
+        return None
+    for prefix, implied in (
+        ("roadmap-architect-", "roadmap-architect"),
+        ("deploy-", "deploy"),
+        ("db-", "db"),
+        ("testing-", "testing"),
+        ("audit-", "audit"),
+        ("docs-", "docs"),
+        ("review-", "review"),
+    ):
+        if conv.startswith(prefix) and implied in AGENT_PROMPTS:
+            return implied
+    return None
 
 
 class BriefingPipeline:
@@ -4951,6 +5006,18 @@ class Daemon:
             resolved_type = agent_type
         if agent_id:
             resolved_id = agent_id
+        # py-1.10.12 — Slug-implied type wins. The conv slug
+        # (roadmap-architect-<N>) is unforgeable signal of intent.
+        # If the body/sidecar disagree, the slug is right and they
+        # are drift. Heals stale ikamiro-style conv_meta where the
+        # body field never carried the agent_type.
+        slug_implied = _agent_type_from_conv_slug(conv)
+        if slug_implied and resolved_type != slug_implied:
+            _log(
+                f"conv {conv}: slug implies agent_type={slug_implied!r} "
+                f"but resolved={resolved_type!r}; forcing slug-implied"
+            )
+            resolved_type = slug_implied
         # Persist whatever we end up with so subsequent turns inherit it.
         self._conv_meta_set(conv, resolved_type, resolved_id)
         runner = ChatRunner(
@@ -5001,8 +5068,14 @@ class Daemon:
 
     def _conv_meta_get(self, conv: str) -> Tuple[str, Optional[str]]:
         meta = self._conv_meta_load().get(conv) or {}
+        # py-1.10.12 — Slug-implied type wins on read too. Heals any
+        # historic sidecar entry written before py-1.10.12 that has
+        # the wrong agent_type (e.g. ikamiro had several
+        # roadmap-architect-* convs persisted as 'custom').
+        slug_implied = _agent_type_from_conv_slug(conv)
+        recorded = _agent_type_normalised(meta.get("agent_type"))
         return (
-            _agent_type_normalised(meta.get("agent_type")),
+            slug_implied if slug_implied else recorded,
             (meta.get("agent_id") or None),
         )
 
@@ -5669,6 +5742,7 @@ class Daemon:
             "agents.validation-gate.v1",  # py-1.10.9 — VALIDATION GREEN/RED first turn + batched questions
             "agents.architect-chain-first.v1",  # py-1.10.10 — chain-first prompt + wallet canonical example + length budgets
             "agents.validation-shortcuts.v1",  # py-1.10.11 — proceed/rework operator shortcuts + ROADMAP-REWORK trigger + chat-input UX
+            "agents.slug-implied-type.v1",  # py-1.10.12 — slug-implied agent_type force heals stale conv_meta + drops the SOP-in-prompt lead-in
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
