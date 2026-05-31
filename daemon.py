@@ -66,7 +66,12 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.10.25"  # 1.10.25 dispatch invariants + pass-complete: chat_dispatch refuses 409 on (a) a 2nd live roadmap-architect and (b) duplicate (parent_conv, task_id) parallel dispatches — both bugs observed live in cavioca where the LLM ignored the prompt rules. Wake hook now also detects pass-complete (no actionable tasks remain across active/next initiatives) and forces the architect to emit the 4-bucket end-of-pass summary instead of looping.
+DAEMON_VERSION = "py-1.12.0"  # 1.12.0 — roadmap safety net. 4 NEW invariants on top of the 1.10.25/.28 set, all enforced server-side at chat_dispatch time:
+#   Invariant 4 — Wave cap. At most WAVE_CAP (default 3, cluster.yaml.architect.wave_cap) work-* subagents alive at once per parent_conv. Bounds quota burn during a wave + prevents architect prompt bugs from spawning 7 parallel.
+#   Invariant 5 — Required join keys. work-* conv dispatch MUST carry both initiative_id AND task_id. Closes the bypass where dispatch without these fields skipped Invariants 2+3.
+#   Invariant 6 — Depends-on gate. Task being dispatched must have its `depends_on:` frontmatter satisfied (every referenced task is `done`). Refuses 409 with the missing list. Prevents the architect from racing a downstream task before its upstream finishes.
+#   Invariant 7 — Claimed-commit verification. The wake hook classifier now runs `git cat-file -e <sha>` on every commit hash the subagent claimed. If the sha doesn't exist in the repo, the verdict is downgraded from 'success' to 'no-commit' so the architect doesn't credit phantom work. Catches subagents that hallucinate commit SHAs.
+# Together: tighter token spend (wave cap), no ghost commits accepted as done (verification), no impossible dispatches accepted (depends_on), no bypasses of the linear-init policy (required join keys). py-1.11.3 credentials CRUD preserved.
 
 # ── TLS bundle (D-TLS-01) ─────────────────────────────────────────────
 # Wildcard cert for *.daemon.meshkore.com (public CF A record → 127.0.0.1)
@@ -124,11 +129,6 @@ class Paths:
         self.state_json = self.roadmap_dir / "state.json"
         self.agents_dir = self.meshkore / "agents"
         self.initiatives = self.roadmap_dir / "initiatives"
-        # Standard v11 — optional cycle timebox dimension. One markdown
-        # file per cycle. Tasks opt in via `cycle: <id>` frontmatter.
-        # Missing dir = the operator hasn't adopted cycles; cycles slice
-        # in /state is just an empty list.
-        self.cycles_dir = self.meshkore / "cycles"
         # Cron scheduler (D-CRON-01..05). State file is gitignored
         # under .meshkore/.runtime/; the logs dir holds per-run captures.
         self.crons_state_path = self.runtime / "crons.json"
@@ -168,6 +168,35 @@ _CRON_DEFAULTS = {
     "retention_runs": 30,
     "destructive": False,
 }
+
+
+# py-1.11.3 — Credentials CRUD constants.
+#
+# Names must be filesystem-safe and reasonably short. Pattern lets the
+# operator use kebab/snake/dot conventions (cloudflare-token,
+# openrouter.env, fly_org_id) without ever escaping the credentials
+# directory.
+_CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# Protected names cannot be written or deleted via the API. portal-token
+# is the daemon's own auth secret — letting the cockpit overwrite it
+# would lock the cockpit out of the daemon on the very next request.
+CREDENTIAL_PROTECTED_NAMES = frozenset({"portal-token"})
+
+
+def _validate_credential_name(name: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Returns None when the name is OK, or a (code, body) error tuple
+    ready to ship back to the client. Used by every credential CRUD
+    endpoint as the first gate."""
+    if not isinstance(name, str) or not name:
+        return 400, {"error": "credential name required"}
+    if not _CREDENTIAL_NAME_RE.match(name):
+        return 400, {
+            "error": "invalid credential name; allowed: A-Za-z0-9._- (≤64 chars, must start with alnum)",
+        }
+    if "/" in name or ".." in name:
+        return 400, {"error": "path separators not allowed in credential name"}
+    return None
 
 
 def _validate_cron_expr(expr: str) -> Optional[str]:
@@ -955,7 +984,6 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                         if isinstance(fm.get("depends_on"), list)
                         else [],
                         "initiative": str(fm.get("initiative") or "") or None,
-                        "cycle": str(fm.get("cycle") or "") or None,
                         "path": str(md.relative_to(paths.root)),
                     }
                     tasks.append(t)
@@ -1045,17 +1073,11 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
     #   3 = done (archived view filters from here)
     initiatives = _order_initiatives(initiatives)
 
-    # Standard v11 — cycles slice. Optional timebox dimension. Each
-    # cycle lists the task ids whose frontmatter has `cycle: <this id>`.
-    # Empty list when `.meshkore/cycles/` is absent or empty.
-    cycles = _build_cycles_slice(paths, tasks)
-
-    # py-1.1.0 — surface recent timeline events alongside the rest of the
-    # state so the architect cockpit can rebuild chat history + task
-    # lifecycle on every reload. JSONL files in .meshkore/timeline/ are
-    # already the source of truth; this just promotes the most recent
-    # slice into the same payload the cockpit fetches at boot.
-    recent_events = _recent_timeline_events(paths, limit=TIMELINE_RECENT_LIMIT)
+    # py-1.11.1 — `timeline.recent_events` removed from /state. The
+    # cockpit lazy-loads per-conv history via GET /chat/conv/<id>/messages
+    # when the operator focuses the conv; the boot snapshot
+    # (/chat/snapshot) carries enough conv metadata to render the rail
+    # immediately without replaying any events.
     return {
         "$schema": "https://meshkore.com/standard.json",
         "cluster": {
@@ -1070,57 +1092,9 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
         },
         "docs": docs,
         "initiatives": initiatives,
-        "cycles": cycles,
-        "timeline": {
-            "recent_events": recent_events,
-            "event_count": len(recent_events),
-            "limit": TIMELINE_RECENT_LIMIT,
-        },
         "generated_at": _iso_now(),
         "generator": {"name": "meshcore-py", "version": DAEMON_VERSION},
     }
-
-
-def _build_cycles_slice(
-    paths: Paths, tasks: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Standard v11 — read `.meshkore/cycles/*.md`, join task ids that
-    opted in via `cycle:` frontmatter. Returns [] when the dir is absent
-    or empty so the slice always shows up in /state with a known shape.
-    """
-    cycles: List[Dict[str, Any]] = []
-    if not paths.cycles_dir.exists():
-        return cycles
-    tasks_by_cycle: Dict[str, List[str]] = {}
-    for t in tasks:
-        cid = t.get("cycle")
-        if cid:
-            tasks_by_cycle.setdefault(cid, []).append(t["id"])
-    for md in sorted(paths.cycles_dir.glob("*.md")):
-        if md.name.startswith("_"):
-            continue
-        try:
-            text = md.read_text(errors="replace")
-        except OSError:
-            continue
-        fm = parse_frontmatter(text)
-        cid = fm.get("id")
-        if not cid:
-            continue
-        cid = str(cid)
-        cycles.append(
-            {
-                "id": cid,
-                "title": str(fm.get("title") or cid),
-                "starts": str(fm.get("starts") or ""),
-                "ends": str(fm.get("ends") or ""),
-                "status": str(fm.get("status") or "planned"),
-                "goal": str(fm.get("goal") or ""),
-                "tasks": tasks_by_cycle.get(cid, []),
-                "path": str(md.relative_to(paths.root)),
-            }
-        )
-    return cycles
 
 
 # ── Roadmap ordering (initiative `roadmap-ordering-archive`) ──────────
@@ -1599,41 +1573,10 @@ def _read_timeline_file(path: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _recent_timeline_events(
-    paths: "Paths", limit: int = TIMELINE_RECENT_LIMIT
-) -> List[Dict[str, Any]]:
-    """Return the most recent `limit` events across all timeline files,
-    sorted chronologically (oldest first — the order the architect's
-    indexEvents() expects).
-
-    The cockpit reconstructs convMap + taskMap from these on every load,
-    so chat history and task lifecycle survive page reloads. Without
-    this, the .meshkore/timeline/*.jsonl files are still on disk but the
-    cockpit can't see them — they just sit there until the next time
-    claude-code rebuilds context from them on a chat turn.
-
-    We walk files newest→oldest so even a multi-day history is read
-    efficiently; once we have `limit` events we stop.
-    """
-    if not paths.timeline_dir.exists():
-        return []
-    events: List[Dict[str, Any]] = []
-    # py-1.5.0 — _iter_timeline_files also picks up rotated .jsonl.gz
-    # files. Reverse sort: newest dates first so we hit `limit` early
-    # on long-running clusters without reading old archived months.
-    for f in sorted(_iter_timeline_files(paths), reverse=True):
-        file_events = _read_timeline_file(f)
-        # Walk this file newest-line-last → newest-line-first.
-        for ev in reversed(file_events):
-            events.append(ev)
-            if len(events) >= limit:
-                break
-        if len(events) >= limit:
-            break
-    # Architect expects oldest-first (it sorts by ts ascending anyway,
-    # but giving the right order avoids a re-sort hot path).
-    events.sort(key=lambda e: e.get("ts") or "")
-    return events
+# py-1.11.1 — `_recent_timeline_events` removed (it powered the boot
+# replay channel /state.timeline.recent_events, deleted in Phase 2).
+# Per-conv message reads now go through `Daemon.chat_conv_messages`
+# which filters the same JSONL files by conv id with pagination.
 
 
 def _append_timeline(paths: "Paths", event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1926,39 +1869,6 @@ class StateIntegrityChecker:
                         ),
                     }
                 )
-        # Rule: every task's `cycle:` (Standard v11, optional) should
-        # reference an existing cycle file under `.meshkore/cycles/`.
-        # Missing key = task is not in any cycle (fine). Present but
-        # unknown id = warn-not-block (typo / renamed cycle).
-        cycle_ids: set = set()
-        cycles_dir = self.paths.cycles_dir
-        if cycles_dir.exists():
-            for cf in cycles_dir.glob("*.md"):
-                if cf.name.startswith("_"):
-                    continue
-                cid = self._read_id(cf)
-                if cid:
-                    cycle_ids.add(cid)
-        for tf in self.project.task_files():
-            cyc = self._read_field(tf, "cycle")
-            if cyc and cyc not in cycle_ids:
-                tid = self._read_id(tf)
-                violations.append(
-                    {
-                        "kind": "task_cycle_broken",
-                        "task_id": tid or tf.name,
-                        "cycle_ref": cyc,
-                        "fix": (
-                            f"Task `{tid or tf.name}` references cycle"
-                            f" `{cyc}` which does not exist under"
-                            " `.meshkore/cycles/`. Either create the cycle"
-                            " file or update the task's `cycle:` frontmatter"
-                            f" to an existing id (current: {sorted(cycle_ids)})"
-                            " — or remove the key if the task isn't in a"
-                            " cycle."
-                        ),
-                    }
-                )
         # Rule: every initiative whose status is `active` or `next`
         # should have ≥1 child task. `backlog` / `done` are exempt.
         # This catches "I created an initiative and forgot the tasks".
@@ -2167,6 +2077,30 @@ class StateIntegrityChecker:
 # Why declarative: scaling. Adding a new agent type later = one entry
 # here, no `if agent_type == 'foo':` branches scattered across the
 # briefing pipeline. The pipeline reads from this dict.
+def _agent_manifest(agent_type: str) -> Dict[str, str]:
+    """py-1.10.27 — Per-agent platform+model manifest.
+
+    Reads optional `platform` / `model` fields from `AGENT_PROMPTS[agent_type]`
+    (falls back to claude-code/auto for any type that doesn't declare them —
+    everything ships through Claude Code today, but DeepSeek / Codex / direct
+    Anthropic API agents will declare their own values when wired). The
+    returned `quota_key` is the persistence + pause-state key used by
+    QuotaState — different agent types that share a platform+model share
+    a quota pool.
+
+    Future extension: if a single agent_type spans multiple models (e.g.
+    a router that picks Claude or DeepSeek per turn), this returns the
+    DEFAULT entry; the dispatch path can override per-turn."""
+    p = AGENT_PROMPTS.get(agent_type) or AGENT_PROMPTS.get("custom") or {}
+    platform = str(p.get("platform") or "claude-code")
+    model = str(p.get("model") or "auto")
+    return {
+        "platform": platform,
+        "model": model,
+        "quota_key": f"{platform}/{model}",
+    }
+
+
 AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
     "custom": {
         "label": "General coder",
@@ -2683,7 +2617,23 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "```\n\n"
             "Then dispatch the first wave on the first initiative. No "
             "intermediate ack.\n\n"
-            "## EXECUTION LOOP\n\n"
+            "## EXECUTION LOOP — LINEAR INITIATIVES (py-1.10.28)\n\n"
+            "**One initiative at a time.** Operator product decision: "
+            "close phases cleanly. Parallel work is allowed INSIDE a "
+            "single initiative (when its tasks are independent); never "
+            "across initiatives. Do NOT dispatch into initiative N+1 "
+            "while ANY task on N still has a live subagent. The daemon "
+            "enforces this server-side — a dispatch with mixed "
+            "`initiative_id` while another initiative is in-flight "
+            "returns 409 `initiative-already-in-flight`. If you see "
+            "that response, the matrix says: WAIT for the live "
+            "initiative to drain (next [architect-wake] will fire when "
+            "its last subagent finishes); then move on. Do NOT retry "
+            "the cross-initiative dispatch.\n\n"
+            "Rationale: avoids half-finished initiatives, makes the "
+            "operator's view of progress monotonic, reduces quota burn "
+            "on speculative parallel work that may need to be discarded "
+            "if an upstream task fails.\n\n"
             "For each active+next initiative, lower-id first:\n\n"
             "1. Read `.meshkore/roadmap/initiatives/<id>.md` and its tasks.\n"
             "2. Plan in ONE line: `Plan I12: DEMO1+DEMO3 parallel, DEMO2 sequential after.`\n"
@@ -2716,11 +2666,14 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "your turn. The daemon wakes you on each subagent final.\n"
             "5. On each `[architect-wake]`: read the preview, verify "
             "file mutations + claimed commit sha, mark the task "
-            "done/blocked, dispatch the next slot if the wave has "
-            "capacity. When all subagents of the current initiative "
-            "have replied, post the initiative transition block and "
-            "dispatch the first wave of the next initiative — in the "
-            "SAME turn.\n"
+            "done/blocked, dispatch the next slot **of the same "
+            "initiative** if it still has actionable tasks AND the "
+            "wave has capacity. Initiative I is CLOSED only when "
+            "every task of I is `done` or `blocked`. ONLY THEN — same "
+            "turn or next wake — post the initiative transition block "
+            "and dispatch the first wave of the next initiative. "
+            "Daemon rejects (`409 initiative-already-in-flight`) any "
+            "cross-initiative dispatch while I still has live work.\n"
             "6. End-of-pass: once no more initiatives have actionable "
             "tasks, emit the 4-bucket summary and end your turn. No "
             "wake will come; the operator picks up from there.\n\n"
@@ -3347,11 +3300,6 @@ class BriefingPipeline:
                     f"- **Broken initiative ref** task=`{v.get('task_id')}`"
                     f" → initiative=`{v.get('initiative_ref')}` — {fix}"
                 )
-            elif kind == "task_cycle_broken":
-                lines.append(
-                    f"- **Broken cycle ref** task=`{v.get('task_id')}`"
-                    f" → cycle=`{v.get('cycle_ref')}` — {fix}"
-                )
             elif kind == "initiative_without_tasks":
                 lines.append(
                     f"- **Initiative without tasks** `{v.get('initiative_id')}`"
@@ -3852,6 +3800,41 @@ class ChatRunner:
                 )
             except Exception as e:
                 _log(f"architect wake hook failed for {self.conv}: {e}")
+            # py-1.11.0 — Broadcast conv.activity for this conv with
+            # live=false override. Fires before ChatSessions._wait pops
+            # us from `_s`; the override ensures the cockpit sees the
+            # right state regardless of the race.
+            try:
+                self.daemon._broadcast_conv_activity(self.conv, live_override=False)
+            except Exception as e:
+                _log(f"conv.activity broadcast on final failed for {self.conv}: {e}")
+            # py-1.11.2 — Auto-archive finished `work-*` subagent convs.
+            # They're single-purpose one-task workers; nothing else lands
+            # on them after the final. Keeps the rail clean without the
+            # cockpit needing a `scheduleSubagentAutoArchive` timer of
+            # its own. Master `_onboarding_v1` and roadmap-architect-*
+            # convs are explicitly NOT auto-archived (they carry the
+            # pass summary + project narrative). Operators can unarchive
+            # from the History panel to inspect a failed worker.
+            if self.conv.startswith(
+                "work-"
+            ) and not self.daemon.chat_archive.is_archived(self.conv):
+                try:
+                    entry = self.daemon.chat_archive.archive(
+                        self.conv,
+                        by="auto-subagent-finish",
+                    )
+                    self.hub.broadcast(
+                        {
+                            "type": "conv.archived",
+                            "conv": self.conv,
+                            "archived_at": entry.get("archived_at"),
+                            "by": entry.get("by"),
+                            "ts": entry.get("archived_at"),
+                        }
+                    )
+                except Exception as e:
+                    _log(f"auto-archive of {self.conv} failed: {e}")
         self.done.set()
 
     def _harvest_remember_lines(self, text: str) -> Tuple[str, List[str]]:
@@ -4801,10 +4784,11 @@ class StateManager:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._fs_signature = ""
-        # py-1.10.19 — Backref set by Daemon.__init__ so `state()` can
-        # add the live `chat_activity` join without a global lookup.
-        # `None` during initial rebuild (before the Daemon exists),
-        # safe because that path doesn't go through `state()`.
+        # Backref set by Daemon.__init__. Currently unused after the
+        # py-1.11.1 chat-state cleanup (the `state()` method no longer
+        # joins live chat data — that lives on /chat/snapshot now), but
+        # kept around for future cross-system reads that may need a
+        # daemon handle without a global lookup.
         self._daemon: Optional["Daemon"] = None
         self.rebuild()
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -4813,35 +4797,14 @@ class StateManager:
         self._daemon = daemon
 
     def state(self) -> Dict[str, Any]:
-        # py-1.4.2 — Always recompute `timeline.recent_events` on demand.
-        # The cached `_state` skips chat-event-driven rebuilds (the FS
-        # signature only watches modules/, docs/, roadmap/initiatives/,
-        # public/ — not timeline/, because chat persists on every turn
-        # and would thrash the signature). Result: on a fresh GET /state
-        # the cached payload would be missing the latest chat.assistant.*
-        # events even though they're on disk in
-        # .meshkore/timeline/<date>.jsonl. Cockpit reloads were losing
-        # the agent's most recent reply.
+        # py-1.11.1 — `timeline.recent_events` and `chat_activity`
+        # removed from /state. Chat lives on its own surface:
+        # `/chat/snapshot` (boot conv list with live/coordinating/
+        # waiting_on flags), `/chat/conv/<id>/messages` (paginated
+        # history), `conv.*` WS events (live deltas). /state is now
+        # purely cluster + modules + roadmap + docs.
         with self._lock:
-            snap = dict(self._state)
-        events = _recent_timeline_events(self.paths, limit=TIMELINE_RECENT_LIMIT)
-        snap["timeline"] = {
-            "recent_events": events,
-            "event_count": len(events),
-            "limit": TIMELINE_RECENT_LIMIT,
-        }
-        # py-1.10.19 — Live activity join. Initiative `agent-activity-surface`.
-        # Computed on demand (the live set changes every dispatch and
-        # is cheaper to rebuild than to invalidate the FS-signature
-        # cache for). Empty list when the daemon hasn't been bound yet.
-        if self._daemon is not None:
-            try:
-                snap["chat_activity"] = self._daemon.chat_activity()
-            except Exception:
-                snap["chat_activity"] = []
-        else:
-            snap["chat_activity"] = []
-        return snap
+            return dict(self._state)
 
     def rebuild(self, broadcast: bool = True) -> None:
         self.cluster.reload()
@@ -4876,9 +4839,6 @@ class StateManager:
             self.paths.docs_dir,
             self.paths.initiatives,
             self.paths.public,
-            # Standard v11 — watch cycles so adding/editing a cycle file
-            # broadcasts state.rebuilt and the cockpit refreshes.
-            self.paths.cycles_dir,
         ):
             if not root.exists():
                 continue
@@ -4967,7 +4927,9 @@ def make_handler(daemon: "Daemon"):
             # talks to localhost. CORS-allow any origin since the bearer
             # token gates the privileged routes.
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+            )
             self.send_header(
                 "Access-Control-Allow-Headers", "Authorization, Content-Type"
             )
@@ -5054,6 +5016,20 @@ def make_handler(daemon: "Daemon"):
                 )
             if p == "/state":
                 return self._json(200, daemon.state_manager.state())
+            # py-1.10.27 — Quota state read endpoint. Full per-key
+            # ledger including probe history; richer than /health.quota
+            # (which is just a snapshot). Auth-required because probe
+            # history exposes conv ids.
+            if p == "/quota":
+                if self._need_auth():
+                    return
+                return self._json(
+                    200,
+                    {
+                        "by_key": daemon.quota.view(),
+                        "generated_at": _iso_now(),
+                    },
+                )
             # py-1.10.17 — debug stream tail. Auth required because the
             # stream contains conv ids, agent ids, and prompt previews
             # that aren't meant for the public internet.
@@ -5169,6 +5145,14 @@ def make_handler(daemon: "Daemon"):
                 if self._need_auth():
                     return
                 return self._json(200, daemon.credentials_listing())
+            # py-1.11.3 — Single-credential read. Cockpit only fetches
+            # the value when the operator clicks "reveal". Auth required.
+            if p.startswith("/credentials/"):
+                if self._need_auth():
+                    return
+                name = p[len("/credentials/") :]
+                code, body = daemon.credential_read(name)
+                return self._json(code, body)
             # py-1.5.0 — Daemon-side archive state. Anonymous read so the
             # cockpit can sync from boot before the token is pasted.
             if p == "/chat/archives":
@@ -5178,6 +5162,52 @@ def make_handler(daemon: "Daemon"):
                         "archived": daemon.chat_archive.list(),
                     },
                 )
+            # py-1.11.0 — chat-state-rearchitecture (initiative
+            # `chat-state-rearchitecture`). Canonical conv list +
+            # boot snapshot + per-conv meta + paginated history.
+            # Anonymous reads to mirror /chat/archives — the cockpit
+            # consumes them before the token is pasted, and conv ids
+            # are not secrets (they appear in the timeline events that
+            # /state already serves anonymously).
+            if p == "/chat/snapshot":
+                return self._json(200, daemon.chat_snapshot())
+            if p == "/chat/convs":
+                return self._json(
+                    200,
+                    {
+                        "convs": daemon.chat_convs(),
+                        "generated_at": _iso_now(),
+                    },
+                )
+            # Path-prefixed routes for one conv: /chat/conv/<id>/meta
+            # and /chat/conv/<id>/messages. URL-encode the id when it
+            # contains chars outside [A-Za-z0-9_-] (rare; conv ids are
+            # ASCII-clean by convention but the architect's slugs can
+            # carry hyphens that are already safe).
+            if p.startswith("/chat/conv/"):
+                rest = p[len("/chat/conv/") :]
+                if rest.endswith("/meta"):
+                    cid = urllib.parse.unquote(rest[: -len("/meta")])
+                    if not cid:
+                        return self._json(400, {"error": "conv id required"})
+                    return self._json(200, daemon.chat_conv_meta(cid))
+                if rest.endswith("/messages"):
+                    cid = urllib.parse.unquote(rest[: -len("/messages")])
+                    if not cid:
+                        return self._json(400, {"error": "conv id required"})
+                    before = q.get("before") or None
+                    try:
+                        limit = int(q.get("limit") or "200")
+                    except ValueError:
+                        limit = 200
+                    return self._json(
+                        200,
+                        daemon.chat_conv_messages(
+                            cid,
+                            before_ts=before,
+                            limit=limit,
+                        ),
+                    )
             # D-CRON-02..05: scheduler introspection.
             if p == "/cron/list":
                 if self._need_auth():
@@ -5316,6 +5346,82 @@ def make_handler(daemon: "Daemon"):
                     accepted += 1
                 return self._json(200, {"accepted": accepted})
 
+            # py-1.10.26 — Manual agent-type pause / unpause. Used by
+            # the operator when they know they're about to hit the
+            # 5-hour wall (preventive pause) or when they've manually
+            # cleared a rate-limit and want to resume early.
+            #   POST /agent-types/<type>/pause       body: {duration_secs?, reason?}
+            #   POST /agent-types/<type>/unpause     body: {}
+            if p.startswith("/agent-types/") and p.endswith("/pause"):
+                t = p[len("/agent-types/") : -len("/pause")]
+                body = self._read_json_body() or {}
+                entry = daemon._pause_agent_type(
+                    t,
+                    reason=str(body.get("reason") or "operator-paused"),
+                    duration_secs=body.get("duration_secs"),
+                )
+                _debug_emit(
+                    "agent-type.pause",
+                    msg=f"operator paused {t} until {entry.get('expires_at')}",
+                    lvl="warn",
+                    data={"agent_type": t, **entry},
+                )
+                return self._json(200, {"ok": True, "agent_type": t, **entry})
+            if p.startswith("/agent-types/") and p.endswith("/unpause"):
+                t = p[len("/agent-types/") : -len("/unpause")]
+                cleared = daemon._unpause_agent_type(t)
+                _debug_emit(
+                    "agent-type.unpause",
+                    msg=f"operator unpaused {t}",
+                    lvl="info",
+                    data={"agent_type": t, "was_paused": cleared},
+                )
+                return self._json(
+                    200, {"ok": True, "agent_type": t, "was_paused": cleared}
+                )
+
+            # py-1.10.27 — Direct quota-key control. More precise than
+            # /agent-types/<t>/{pause,unpause} because it targets the
+            # (platform, model) pool directly — useful when multiple
+            # types share a pool and the operator wants explicit
+            # confirmation about what's being paused.
+            #   POST /quota/<key>/pause     body: {duration_secs?, reason?}
+            #   POST /quota/<key>/unpause   body: {}
+            # NOTE: `<key>` contains a `/` so the URL is /quota/claude-code/auto/pause.
+            if p.startswith("/quota/") and (
+                p.endswith("/pause") or p.endswith("/unpause")
+            ):
+                tail = p[len("/quota/") :]
+                if tail.endswith("/pause"):
+                    key = tail[: -len("/pause")]
+                    body = self._read_json_body() or {}
+                    entry = daemon.quota.pause(
+                        key,
+                        reason=str(body.get("reason") or "operator-paused"),
+                        duration_secs=body.get("duration_secs"),
+                    )
+                    _debug_emit(
+                        "quota.pause",
+                        msg=f"operator paused {key} until {entry.get('paused_until')}",
+                        lvl="warn",
+                        data={"quota_key": key, **entry},
+                    )
+                    return self._json(
+                        200, {"ok": True, "quota_key": key, "entry": entry}
+                    )
+                else:
+                    key = tail[: -len("/unpause")]
+                    cleared = daemon.quota.unpause(key)
+                    _debug_emit(
+                        "quota.unpause",
+                        msg=f"operator unpaused {key}",
+                        lvl="info",
+                        data={"quota_key": key, "was_paused": cleared},
+                    )
+                    return self._json(
+                        200, {"ok": True, "quota_key": key, "was_paused": cleared}
+                    )
+
             # U-DAEMON-06: chat dispatch + cancel.
             if p == "/chat/dispatch":
                 return self._json(*daemon.chat_dispatch(self._read_json_body()))
@@ -5422,6 +5528,43 @@ def make_handler(daemon: "Daemon"):
             if p.startswith("/admission/"):
                 return self._json(501, {"error": "admission flow not implemented yet"})
 
+            # py-1.11.3 — POST /credentials/<name> is treated as
+            # write-or-create (alias of PUT). Some HTTP clients can't
+            # send PUT; routing both verbs to the same handler keeps
+            # the cockpit's `chatDispatch`-shaped fetch usable.
+            if p.startswith("/credentials/"):
+                name = p[len("/credentials/") :]
+                body = self._read_json_body()
+                value = body.get("value") if isinstance(body, dict) else None
+                code, resp = daemon.credential_write(
+                    name, value if isinstance(value, str) else ""
+                )
+                return self._json(code, resp)
+
+            return self._json(404, {"error": "not found", "path": p})
+
+        def do_PUT(self):  # noqa: N802
+            p, _ = self._path()
+            if self._need_auth():
+                return
+            if p.startswith("/credentials/"):
+                name = p[len("/credentials/") :]
+                body = self._read_json_body()
+                value = body.get("value") if isinstance(body, dict) else None
+                code, resp = daemon.credential_write(
+                    name, value if isinstance(value, str) else ""
+                )
+                return self._json(code, resp)
+            return self._json(404, {"error": "not found", "path": p})
+
+        def do_DELETE(self):  # noqa: N802
+            p, _ = self._path()
+            if self._need_auth():
+                return
+            if p.startswith("/credentials/"):
+                name = p[len("/credentials/") :]
+                code, resp = daemon.credential_delete(name)
+                return self._json(code, resp)
             return self._json(404, {"error": "not found", "path": p})
 
         # ── helpers used by do_POST handlers ───────────────────────────
@@ -5513,6 +5656,370 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Quota state (py-1.10.27 — initiative `quota-aware-dispatch`)
+#
+# Persistent per-(platform, model) rate-limit ledger. Tracks which
+# upstream LLM pools are currently exhausted, with the exact expiry
+# instant + history of probe attempts. Survives daemon restart at
+# `.meshkore/.runtime/quota-state.json` so a quick relaunch doesn't
+# lose the "Claude Pro window doesn't reset until 06:23 UTC" datum
+# and waste tokens re-discovering it.
+#
+# Replaces the py-1.10.26 in-memory `_agent_type_pauses` dict.
+# `/health.paused_agent_types` is kept as a back-compat projection so
+# the existing cockpit banner keeps working without changes.
+
+
+class QuotaState:
+    """Append-only ledger of (platform, model) → pause-state.
+
+    File format (`.meshkore/.runtime/quota-state.json`):
+
+        {
+          "version": 1,
+          "updated_at": "...",
+          "by_key": {
+            "claude-code/auto": {
+              "platform": "claude-code",
+              "model": "auto",
+              "paused": true,
+              "paused_at": "...",
+              "paused_until": "...",
+              "paused_until_epoch": 1780202625,
+              "reason": "Claude AI usage limit reached (work-…)",
+              "first_rate_limit_at": "...",
+              "consecutive_rate_limits": 2,
+              "probes": [
+                {"at": "...", "conv": "probe-…", "outcome": "rate-limited"}
+              ],
+              "last_success_at": "...",
+              "last_success_conv": "work-…"
+            }
+          }
+        }
+
+    All writes go through `_persist_locked` (tmp + atomic rename).
+    All reads return defensive copies — callers must NOT mutate the
+    returned dicts directly.
+    """
+
+    # Conservative default: claude-code Pro/Max rolling window is 5h
+    # but the practical sliding window resets in chunks. 60 min is the
+    # smallest useful probe interval that still lets a long block clear
+    # in under an hour. Operator can extend via the pause endpoint.
+    DEFAULT_PAUSE_SECS = 60 * 60
+    MAX_PROBE_HISTORY = 20
+
+    def __init__(self, path: "Path") -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._data = self._load()
+
+    def _load(self) -> Dict[str, Any]:
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text() or "{}")
+                if isinstance(raw, dict) and "by_key" in raw:
+                    return raw
+        except Exception as e:
+            _log(f"quota-state: load failed ({e}) — starting empty")
+        return {"version": 1, "by_key": {}, "updated_at": _iso_now()}
+
+    def _persist_locked(self) -> None:
+        self._data["updated_at"] = _iso_now()
+        try:
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+            tmp.replace(self.path)
+        except OSError as e:
+            _log(f"quota-state: persist failed ({e})")
+
+    def _entry(self, key: str) -> Dict[str, Any]:
+        return self._data.setdefault("by_key", {}).setdefault(
+            key,
+            {
+                "platform": key.split("/", 1)[0] if "/" in key else key,
+                "model": key.split("/", 1)[1] if "/" in key else "auto",
+                "paused": False,
+                "probes": [],
+                "consecutive_rate_limits": 0,
+            },
+        )
+
+    def is_paused(self, key: str) -> bool:
+        """True iff `key` has an unexpired pause. Reaps stale entries."""
+        with self._lock:
+            e = self._data.get("by_key", {}).get(key)
+            if not e or not e.get("paused"):
+                return False
+            until = int(e.get("paused_until_epoch") or 0)
+            if until <= int(time.time()):
+                e["paused"] = False
+                self._persist_locked()
+                return False
+            return True
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            e = self._data.get("by_key", {}).get(key)
+            return dict(e) if e else None
+
+    def pause(
+        self,
+        key: str,
+        *,
+        reason: str,
+        duration_secs: Optional[int] = None,
+        platform: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        secs = max(60, int(duration_secs or self.DEFAULT_PAUSE_SECS))
+        now = int(time.time())
+        until = now + secs
+        with self._lock:
+            e = self._entry(key)
+            if platform:
+                e["platform"] = platform
+            if model:
+                e["model"] = model
+            # Track consecutive lockouts so the prober can escalate
+            # the cooldown if the same key keeps coming back locked.
+            if e.get("paused") and (e.get("paused_until_epoch") or 0) > now:
+                e["consecutive_rate_limits"] = (
+                    int(e.get("consecutive_rate_limits") or 0) + 1
+                )
+            else:
+                # First lockout in this streak — note the start time.
+                e["consecutive_rate_limits"] = (
+                    int(e.get("consecutive_rate_limits") or 0) + 1
+                )
+                e["first_rate_limit_at"] = _iso_now()
+            e["paused"] = True
+            e["paused_at"] = _iso_now()
+            e["paused_until"] = _iso_at(until)
+            e["paused_until_epoch"] = until
+            e["reason"] = (reason or "")[:240]
+            self._persist_locked()
+            return dict(e)
+
+    def unpause(self, key: str) -> bool:
+        with self._lock:
+            e = self._data.get("by_key", {}).get(key)
+            if not e or not e.get("paused"):
+                return False
+            e["paused"] = False
+            e["consecutive_rate_limits"] = 0
+            self._persist_locked()
+            return True
+
+    def record_probe(
+        self,
+        key: str,
+        conv: str,
+        outcome: str,
+    ) -> None:
+        """Append a probe outcome to the per-key history. Trims to
+        MAX_PROBE_HISTORY so the file doesn't grow unbounded."""
+        with self._lock:
+            e = self._entry(key)
+            probes = e.setdefault("probes", [])
+            probes.append({"at": _iso_now(), "conv": conv, "outcome": outcome})
+            if len(probes) > self.MAX_PROBE_HISTORY:
+                del probes[: len(probes) - self.MAX_PROBE_HISTORY]
+            if outcome == "success":
+                e["last_success_at"] = _iso_now()
+                e["last_success_conv"] = conv
+                e["paused"] = False
+                e["consecutive_rate_limits"] = 0
+            self._persist_locked()
+
+    def record_success(self, key: str, conv: str) -> None:
+        """Mark a non-probe success — resets the consecutive-fail
+        counter so a transient rate-limit doesn't escalate forever."""
+        with self._lock:
+            e = self._entry(key)
+            e["last_success_at"] = _iso_now()
+            e["last_success_conv"] = conv
+            e["consecutive_rate_limits"] = 0
+            self._persist_locked()
+
+    def keys_due_for_probe(self, *, max_age_secs: int = 60) -> List[str]:
+        """Paused keys whose `paused_until` elapsed at least
+        `max_age_secs` seconds ago AND haven't been probed in the
+        last 60s. Used by QuotaProber to pick what to probe."""
+        out: List[str] = []
+        now = int(time.time())
+        with self._lock:
+            for key, e in (self._data.get("by_key") or {}).items():
+                if not e.get("paused"):
+                    continue
+                until = int(e.get("paused_until_epoch") or 0)
+                if now - until < max_age_secs:
+                    continue
+                # Throttle probe rate per key — never more than 1/min.
+                last_probe = (e.get("probes") or [])[-1:]
+                if last_probe:
+                    try:
+                        probe_ts = datetime.fromisoformat(
+                            str(last_probe[0].get("at") or "").replace("Z", "+00:00")
+                        ).timestamp()
+                        if now - probe_ts < 60:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                out.append(key)
+        return out
+
+    def view(self) -> Dict[str, Dict[str, Any]]:
+        """Snapshot of all entries, with stale 'paused' flags reaped.
+        Read-only for /health + /quota consumers."""
+        now = int(time.time())
+        out: Dict[str, Dict[str, Any]] = {}
+        with self._lock:
+            for key, e in (self._data.get("by_key") or {}).items():
+                e2 = dict(e)
+                if e2.get("paused") and int(e2.get("paused_until_epoch") or 0) <= now:
+                    e2["paused"] = False
+                out[key] = e2
+        return out
+
+    def paused_view(self) -> Dict[str, Dict[str, Any]]:
+        """Subset of view() including only currently-paused keys."""
+        return {k: v for k, v in self.view().items() if v.get("paused")}
+
+
+class QuotaProber:
+    """py-1.10.27 — Background thread that probes paused quota keys.
+
+    Every TICK_SECS, scans `QuotaState.keys_due_for_probe()` and
+    dispatches a minimal Claude Code subprocess against each. Reads
+    the final, classifies, and either un-pauses the key (probe
+    succeeded → quota is back) or extends the pause by another
+    DEFAULT cooldown (probe still rate-limited → still locked).
+
+    The probe runs INSIDE the daemon, NOT through `/chat/dispatch`,
+    so it bypasses the dispatch mutex (the pause itself is what we're
+    testing against). It does NOT touch the timeline (we don't want
+    `chat.user` events for `probe-…` cluttering the cockpit).
+
+    Cost: one ~10-token Claude Code invocation per paused key per
+    hour. Negligible vs the cost of looping into a wall."""
+
+    TICK_SECS = 60
+    PROBE_PROMPT = (
+        "This is an automated quota probe from the meshcore daemon. "
+        "Reply with exactly the single word `pong` and nothing else. "
+        "Do not use tools. Do not commit. End your turn immediately."
+    )
+    PROBE_PROMPT_TIMEOUT_SECS = 90  # subprocess wall-clock cap
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self.daemon = daemon
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        _log(f"quota-prober: started (tick={self.TICK_SECS}s)")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.TICK_SECS):
+            try:
+                due = self.daemon.quota.keys_due_for_probe()
+                for key in due:
+                    if self._stop.is_set():
+                        break
+                    self._probe_one(key)
+            except Exception as e:
+                _log(f"quota-prober: tick failed ({e})")
+
+    def _probe_one(self, key: str) -> None:
+        # Resolve an agent_type for this key (any type whose manifest
+        # matches; we use the first hit since they share a quota pool).
+        agent_type = self._agent_type_for_key(key)
+        probe_conv = f"probe-{key.replace('/', '-')}-{int(time.time())}"
+        _log(f"quota-prober: probing {key} via {agent_type} (conv={probe_conv})")
+        _debug_emit(
+            "quota.probe.start",
+            msg=f"probing {key}",
+            conv=probe_conv,
+            data={"quota_key": key, "agent_type": agent_type},
+        )
+        try:
+            runner = self.daemon._spawn_chat_turn(
+                probe_conv,
+                self.PROBE_PROMPT,
+                agent_type=agent_type,
+                # No parent_conv on purpose — keeps the wake hook out.
+            )
+        except Exception as e:
+            _log(f"quota-prober: spawn failed for {key}: {e}")
+            self.daemon.quota.record_probe(key, probe_conv, "spawn-failed")
+            return
+        # Block until the subprocess ends or our timeout fires.
+        runner.done.wait(timeout=self.PROBE_PROMPT_TIMEOUT_SECS)
+        if not runner.done.is_set():
+            _log(
+                f"quota-prober: {key} timed out after {self.PROBE_PROMPT_TIMEOUT_SECS}s — cancelling"
+            )
+            try:
+                runner.cancel()
+            except Exception:
+                pass
+            self.daemon.quota.record_probe(key, probe_conv, "timeout")
+            return
+        # Classify the final.
+        preview = (runner._cumulative_text or "").strip()
+        exit_code = runner.proc.returncode if runner.proc else None
+        outcome = self.daemon._classify_subagent_final(preview, exit_code)
+        _debug_emit(
+            "quota.probe.result",
+            msg=f"probe {key} → {outcome}",
+            conv=probe_conv,
+            lvl=("info" if outcome == "success" else "warn"),
+            data={
+                "quota_key": key,
+                "outcome": outcome,
+                "exit": exit_code,
+                "preview_head": preview[:200],
+            },
+        )
+        # success → unpause (quota window has reset)
+        # rate-limited → keep pause, bump consecutive counter (auto-extends)
+        # no-commit / error → treat as inconclusive: leave pause as-is,
+        #                     record probe so the operator can see history.
+        if outcome == "success":
+            self.daemon.quota.record_probe(key, probe_conv, "success")
+            _log(f"quota-prober: {key} CLEARED (probe succeeded)")
+        elif outcome == "rate-limited":
+            # Extend the pause by another default cooldown.
+            self.daemon.quota.pause(
+                key,
+                reason=f"probe still rate-limited ({probe_conv})",
+            )
+            self.daemon.quota.record_probe(key, probe_conv, "rate-limited")
+            _log(f"quota-prober: {key} STILL LOCKED (probe rate-limited again)")
+        else:
+            self.daemon.quota.record_probe(key, probe_conv, outcome)
+            _log(f"quota-prober: {key} probe inconclusive ({outcome})")
+
+    def _agent_type_for_key(self, quota_key: str) -> str:
+        """Pick any agent_type whose manifest maps to this quota_key.
+        Falls back to 'custom' which is always present."""
+        for t in AGENT_PROMPTS.keys():
+            if _agent_manifest(t)["quota_key"] == quota_key:
+                return t
+        return "custom"
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Daemon orchestrator
 
 
@@ -5538,11 +6045,18 @@ class Daemon:
         self.port = _pick_port(paths, requested_port or self.cluster.architect_port)
         self.hub = Hub()
         self.state_manager = StateManager(paths, self.cluster, self.hub)
-        # py-1.10.19 — StateManager needs a daemon backref so its
-        # `state()` can pull live chat_activity. Bound here, after
+        # StateManager keeps a daemon backref for future cross-system
+        # reads. Currently unused after the py-1.11.1 chat-state cleanup
+        # (chat data is no longer joined into /state). Bound here, after
         # both objects exist.
         self.state_manager.bind_daemon(self)
         self.chat_sessions = ChatSessions()
+        # py-1.10.27 — Persistent quota state. Replaces the in-memory
+        # `_agent_type_pauses` dict from py-1.10.26. State is keyed by
+        # `<platform>/<model>` (the "quota_key" from _agent_manifest)
+        # and survives daemon restart at .meshkore/.runtime/quota-state.json.
+        # Multiple agent_types that share platform+model share the pool.
+        self.quota = QuotaState(self.paths.runtime / "quota-state.json")
         # py-1.10.0 — server-side story-run coordinator. Owns the
         # initiative ↔ conv ↔ agent ↔ task-list binding so play/stop
         # has unambiguous identity and survives cockpit reload.
@@ -5646,6 +6160,14 @@ class Daemon:
                 agent_id=chain_id,
             ),
         )
+        # py-1.11.0 — snapshot.v1 contract: emit conv.activity AFTER
+        # ChatSessions.start() registers the conv so the broadcast's
+        # `live` flag is true (matches what /chat/convs would return).
+        # Also emit for the parent so its `coordinating` + `waiting_on`
+        # flip in one round-trip instead of waiting for state.rebuilt.
+        self._broadcast_conv_activity(conv)
+        if parent_conv:
+            self._broadcast_conv_activity(parent_conv)
         return runner
 
     # py-1.7.0 — conv → (agent_type, agent_id) sidecar. Lets the daemon
@@ -5688,6 +6210,8 @@ class Daemon:
     ) -> None:
         try:
             all_meta = self._conv_meta_load()
+            existed_before = conv in all_meta
+            before = dict(all_meta.get(conv) or {})
             entry = all_meta.get(conv) or {}
             entry["agent_type"] = _agent_type_normalised(agent_type)
             if agent_id:
@@ -5716,6 +6240,27 @@ class Daemon:
             tmp = p.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(all_meta, indent=2, sort_keys=True))
             tmp.replace(p)
+            # py-1.11.0 — Broadcast conv.created (first-time) or
+            # conv.meta_updated (subsequent) so cockpits update the rail
+            # WITHOUT waiting for a state.rebuilt + refetch. The hub may
+            # not be wired yet during boot — guard with hasattr.
+            if getattr(self, "hub", None) is not None:
+                try:
+                    payload = {
+                        "conv": conv,
+                        "agent_type": entry.get("agent_type"),
+                        "agent_id": entry.get("agent_id"),
+                        "parent_conv": entry.get("parent_conv"),
+                        "initiative_id": entry.get("initiative_id"),
+                        "task_id": entry.get("task_id"),
+                        "ts": _iso_now(),
+                    }
+                    if not existed_before:
+                        self.hub.broadcast({"type": "conv.created", **payload})
+                    elif before != entry:
+                        self.hub.broadcast({"type": "conv.meta_updated", **payload})
+                except Exception as bx:
+                    _log(f"conv meta broadcast failed: {bx}")
         except Exception as e:
             _log(f"conv_meta write failed: {e}")
 
@@ -5732,6 +6277,7 @@ class Daemon:
         agent_type: Optional[str],
         parent_conv: Optional[str],
         task_id: Optional[str],
+        initiative_id: Optional[str] = None,
     ) -> Optional[Tuple[int, Dict[str, Any]]]:
         """py-1.10.25 — server-side enforcement of dispatch invariants
         the architect prompt claims but the LLM sometimes ignores.
@@ -5756,6 +6302,33 @@ class Daemon:
         wake, don't retry". Cockpit reads the `hint` and surfaces
         a soft notice.
         """
+        # py-1.10.26 — Pause check FIRST. If the agent_type is in
+        # cool-down because of a recent rate-limit hit, refuse 503
+        # with a hint that names the ETA. Architect prompt update
+        # below tells it to NOT retry — wait, or switch type.
+        # `roadmap-architect` itself is exempted (we don't want to
+        # lock the coordinator out of its own conv just because a
+        # subagent hit a wall). The architect can still narrate +
+        # dispatch other types or different convs.
+        norm_target = _agent_type_normalised(agent_type)
+        if norm_target != "roadmap-architect":
+            pause = self._agent_type_is_paused(norm_target)
+            if pause is not None:
+                return 503, {
+                    "error": "agent-type-paused",
+                    "agent_type": norm_target,
+                    "reason": pause.get("reason"),
+                    "expires_at": pause.get("expires_at"),
+                    "expires_epoch": pause.get("expires_epoch"),
+                    "hint": (
+                        f"Agent type `{norm_target}` is paused until "
+                        f"{pause.get('expires_at')} (rate-limit cooldown). "
+                        "Wait for the window to reset, switch to a "
+                        "different agent_type, or `POST /agent-types/"
+                        f"{norm_target}/unpause` to override."
+                    ),
+                }
+
         is_architect_target = (agent_type == "roadmap-architect") or conv.startswith(
             "roadmap-architect-"
         )
@@ -5790,32 +6363,241 @@ class Daemon:
                     "requested_conv": conv,
                 }
 
-        # Invariant 2: no parallel dispatch on same (parent_conv, task_id).
-        # Only meaningful when both parent_conv and task_id are set —
-        # i.e., the architect dispatching a subagent. Without these
-        # tags the dispatch is operator-driven and the operator owns
-        # the de-dup decision.
-        if parent_conv and task_id:
+        # Invariants 2 + 3 both need the conv_meta sidecar.
+        if parent_conv:
             all_meta = self._conv_meta_load()
-            for live_conv in live:
-                if live_conv == conv:
-                    continue
-                m = all_meta.get(live_conv) or {}
-                if m.get("parent_conv") == parent_conv and m.get("task_id") == task_id:
+
+            # Invariant 2: no parallel dispatch on same (parent_conv, task_id).
+            # Only meaningful when both parent_conv and task_id are set —
+            # i.e., the architect dispatching a subagent.
+            if task_id:
+                for live_conv in live:
+                    if live_conv == conv:
+                        continue
+                    m = all_meta.get(live_conv) or {}
+                    if (
+                        m.get("parent_conv") == parent_conv
+                        and m.get("task_id") == task_id
+                    ):
+                        return 409, {
+                            "error": "task-already-dispatched",
+                            "hint": (
+                                f"Task `{task_id}` (parent `{parent_conv}`) "
+                                f"already has a live dispatch: `{live_conv}`. "
+                                "Wait for the [architect-wake] on its final; "
+                                "do not retry while it's still running."
+                            ),
+                            "existing_conv": live_conv,
+                            "parent_conv": parent_conv,
+                            "task_id": task_id,
+                        }
+
+            # Invariant 3 (py-1.10.28): single initiative in-flight per
+            # architect. Operator's product decision (2026-05-31): "una
+            # iniciativa a la vez, tareas en paralelo DENTRO pero no
+            # mezclando entre iniciativas". The architect is allowed
+            # to dispatch parallel tasks within initiative I, but
+            # cannot start I+1 while ANY task on I still has a live
+            # subagent. The 409 hint names the live initiative(s) so
+            # the architect knows what it's waiting on. Linear-roadmap
+            # mode prevents half-finished initiatives + reduces quota
+            # burn on speculative parallel work.
+            if initiative_id:
+                live_initiatives: set = set()
+                for live_conv in live:
+                    if live_conv == conv:
+                        continue
+                    m = all_meta.get(live_conv) or {}
+                    if m.get("parent_conv") != parent_conv:
+                        continue
+                    other = m.get("initiative_id")
+                    if other:
+                        live_initiatives.add(other)
+                if live_initiatives and initiative_id not in live_initiatives:
                     return 409, {
-                        "error": "task-already-dispatched",
+                        "error": "initiative-already-in-flight",
                         "hint": (
-                            f"Task `{task_id}` (parent `{parent_conv}`) "
-                            f"already has a live dispatch: `{live_conv}`. "
-                            "Wait for the [architect-wake] on its final; "
-                            "do not retry while it's still running."
+                            "Linear-roadmap mode: another initiative still "
+                            f"has live subagents (`{', '.join(sorted(live_initiatives))}`). "
+                            f"Wait for ALL its tasks to finish (or mark them "
+                            f"blocked) before dispatching into "
+                            f"`{initiative_id}`. Parallel work is allowed "
+                            "INSIDE a single initiative, never across."
                         ),
-                        "existing_conv": live_conv,
+                        "live_initiatives": sorted(live_initiatives),
+                        "requested_initiative": initiative_id,
                         "parent_conv": parent_conv,
-                        "task_id": task_id,
                     }
 
+        # py-1.12.0 — Worker-dispatch invariants. Only fire when this
+        # dispatch is creating/touching a `work-*` subagent slot. The
+        # architect's own dispatches (roadmap-architect-*) and the
+        # operator's free-form custom convs sidestep these checks —
+        # they're not "worker dispatches", they're conversation starts.
+        is_worker_dispatch = conv.startswith("work-")
+        if is_worker_dispatch:
+            # Invariant 5: required join keys. work-* dispatches MUST
+            # carry both `initiative_id` AND `task_id` so that
+            # Invariants 2+3 actually fire. Pre-py-1.12.0 a dispatch
+            # missing either field would silently slip past the
+            # mutex (line 6325 was guarded by `if task_id:`, line 6354
+            # by `if initiative_id:`). The architect prompt already
+            # requires both fields; this turns "should send" into
+            # "must send" with a clear 400 if it forgets.
+            if not initiative_id or not task_id:
+                missing = []
+                if not initiative_id:
+                    missing.append("initiative_id")
+                if not task_id:
+                    missing.append("task_id")
+                return 400, {
+                    "error": "worker-dispatch-missing-join-keys",
+                    "missing": missing,
+                    "hint": (
+                        f"`{conv}` is a work-* subagent dispatch — it MUST "
+                        f"include both `initiative_id` AND `task_id` in the "
+                        f"POST body so the daemon can enforce linear-init + "
+                        f"depends_on. Missing: {', '.join(missing)}. Re-read "
+                        f"the SOP `EXECUTION LOOP — LINEAR INITIATIVES` block."
+                    ),
+                }
+
+            # Invariant 4: wave cap. The architect prompt promises
+            # "max 3 parallel"; enforce it here so a runaway loop or a
+            # confused turn can't spawn 7 workers and 5x the quota burn.
+            # Cap is configurable via cluster.yaml.architect.wave_cap;
+            # default 3 (matches the prompt). Per-parent_conv so two
+            # operators on the same cluster (different architect convs)
+            # each get their own wave budget.
+            cap = self._wave_cap()
+            if parent_conv:
+                same_wave = 0
+                all_meta_w = self._conv_meta_load()
+                for live_conv in live:
+                    if live_conv == conv:
+                        continue
+                    if not live_conv.startswith("work-"):
+                        continue
+                    m = all_meta_w.get(live_conv) or {}
+                    if m.get("parent_conv") == parent_conv:
+                        same_wave += 1
+                if same_wave >= cap:
+                    return 429, {
+                        "error": "wave-cap-reached",
+                        "wave_cap": cap,
+                        "current_wave_size": same_wave,
+                        "parent_conv": parent_conv,
+                        "hint": (
+                            f"This architect already has {same_wave} work-* "
+                            f"subagent(s) in flight (cap={cap}). Wait for a "
+                            f"slot to free up via [architect-wake] before "
+                            f"dispatching the next task. Operator can raise "
+                            f"the cap via `cluster.yaml.architect.wave_cap` "
+                            f"(higher = faster, more quota burn + more "
+                            f"chance of git-race)."
+                        ),
+                    }
+
+            # Invariant 6: depends-on gate. Refuse the dispatch if the
+            # target task's `depends_on:` frontmatter lists upstream
+            # tasks that are NOT marked `done`. The architect should
+            # already serialise via depends_on at the prompt level —
+            # this is the server-side belt to the prompt's braces.
+            # Cheap: reads one task .md file + checks the upstream
+            # statuses we already cache in `_state['roadmap']['tasks']`.
+            missing_deps = self._unfinished_dependencies(task_id, initiative_id)
+            if missing_deps:
+                return 409, {
+                    "error": "task-dependencies-not-done",
+                    "task_id": task_id,
+                    "initiative_id": initiative_id,
+                    "missing": missing_deps,
+                    "hint": (
+                        f"Task `{task_id}` declares `depends_on: "
+                        f"{missing_deps}` in its frontmatter but those "
+                        f"upstream task(s) are not `done` yet. Finish "
+                        f"them first (or remove the dependency if it's "
+                        f"stale). Do NOT retry this dispatch until then."
+                    ),
+                }
+
         return None
+
+    def _wave_cap(self) -> int:
+        """Return the per-architect parallel-worker cap. Read from
+        cluster.yaml.architect.wave_cap; default 3 (matches the
+        roadmap-architect prompt's stated bound). Operator can widen
+        for throughput or narrow for cost."""
+        try:
+            raw = (self.cluster.data.get("architect") or {}).get("wave_cap")
+            if raw is None:
+                return 3
+            n = int(raw)
+            return max(1, min(10, n))  # clamp to a sane range
+        except Exception:
+            return 3
+
+    def _unfinished_dependencies(
+        self,
+        task_id: Optional[str],
+        initiative_id: Optional[str],
+    ) -> List[str]:
+        """Read the target task's frontmatter and return the subset of
+        `depends_on:` references whose current status is NOT `done`.
+        Empty list = green light. Returns [] silently on any IO error
+        (we don't want a missing file or a bad parse to deadlock the
+        architect — the dispatch proceeds and the subagent will hit
+        the real problem with a clearer error)."""
+        if not task_id or not initiative_id:
+            return []
+        try:
+            # Locate the task .md file under .meshkore/roadmap/initiatives/<init>/<task>.md
+            # OR the legacy flat layout. Honour either.
+            candidates = [
+                self.paths.roadmap_dir
+                / "initiatives"
+                / initiative_id
+                / f"{task_id}.md",
+                self.paths.roadmap_dir / "tasks" / f"{task_id}.md",
+            ]
+            task_path: Optional[Path] = None
+            for c in candidates:
+                if c.exists():
+                    task_path = c
+                    break
+            if task_path is None:
+                return []
+            raw = task_path.read_text(errors="replace")
+            front = parse_frontmatter(raw)
+            deps_raw = front.get("depends_on") if isinstance(front, dict) else None
+            if not deps_raw:
+                return []
+            # Accept either a YAML list or a comma-separated string.
+            if isinstance(deps_raw, str):
+                deps = [s.strip() for s in deps_raw.split(",") if s.strip()]
+            elif isinstance(deps_raw, list):
+                deps = [str(s).strip() for s in deps_raw if str(s).strip()]
+            else:
+                return []
+            if not deps:
+                return []
+            # Read current statuses from the state cache. Build a quick
+            # task_id → status map; default to "unknown" (treated as
+            # not-done, conservative).
+            state = self.state_manager.state()
+            status_by_id: Dict[str, str] = {}
+            for t in (state.get("roadmap") or {}).get("tasks") or []:
+                tid = t.get("id")
+                if tid:
+                    status_by_id[str(tid)] = str(t.get("status") or "unknown")
+            missing: List[str] = []
+            for dep in deps:
+                if status_by_id.get(dep, "unknown") != "done":
+                    missing.append(dep)
+            return missing
+        except Exception as e:
+            _log(f"_unfinished_dependencies({task_id}) raised: {e}")
+            return []
 
     def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         text = str(body.get("text") or "").strip()
@@ -5865,6 +6647,7 @@ class Daemon:
             agent_type=agent_type,
             parent_conv=parent_conv,
             task_id=task_id,
+            initiative_id=initiative_id,
         )
         if mutex_err is not None:
             code_err, body_err = mutex_err
@@ -5962,18 +6745,88 @@ class Daemon:
         re.compile(r"\bcommit[:\s]+([0-9a-f]{6,40})\b", re.IGNORECASE),
         re.compile(r"^\s*✓\s+task\s+\S+\s+done\b", re.IGNORECASE | re.MULTILINE),
     )
+    # py-1.10.26 — Rate-limit signatures emitted by the upstream CLIs
+    # (Claude Code most commonly; Codex / DeepSeek would have their own
+    # phrasing once integrated). The patterns are intentionally broad
+    # so a phrasing change in a future CLI build still triggers — we'd
+    # rather over-pause than spin on a quota-exhausted subagent forever.
+    _RATE_LIMIT_PATTERNS = (
+        re.compile(r"Claude AI usage limit reached", re.IGNORECASE),
+        re.compile(r"\busage limit (reached|exceeded)\b", re.IGNORECASE),
+        re.compile(r"\brate[- ]?limit(ed|ing)?\b", re.IGNORECASE),
+        re.compile(r"\bquota (exceeded|reached|exhausted)\b", re.IGNORECASE),
+        re.compile(r"\b5[- ]hour (limit|window)\b", re.IGNORECASE),
+        re.compile(r"\bHTTP[\s/]+429\b"),
+        re.compile(r"\btoo many requests\b", re.IGNORECASE),
+        re.compile(r"Anthropic API .*\b(limit|quota)\b", re.IGNORECASE | re.DOTALL),
+    )
 
     def _classify_subagent_final(self, preview: str, exit_code: Optional[int]) -> str:
-        """Return one of: 'success' | 'no-commit' | 'error'. The
-        architect prompt's DECISION MATRIX treats anything other than
-        'success' as a failure; this method just makes the call
-        deterministic so the wake message can name it."""
+        """Return one of:
+            'success'     — committed work landed AND `git cat-file -e` confirms the sha
+            'no-commit'   — turn ended with no commit hash in preview, OR the
+                             claimed hash doesn't exist in the repo (py-1.12.0
+                             Invariant 7 — ghost commit detection)
+            'error'       — non-zero exit (CLI crashed or was killed)
+            'rate-limited' — upstream CLI told us the quota is out
+        Rate-limit detection runs first because some CLIs report the
+        condition with exit=0 + a polite "try again later" message,
+        which would otherwise look like a normal `no-commit`."""
+        text = preview or ""
+        if any(p.search(text) for p in self._RATE_LIMIT_PATTERNS):
+            return "rate-limited"
         if exit_code not in (None, 0):
             return "error"
-        text = preview or ""
-        if any(p.search(text) for p in self._COMMIT_PATTERNS):
-            return "success"
-        return "no-commit"
+        commit_match = False
+        for pat in self._COMMIT_PATTERNS:
+            m = pat.search(text)
+            if not m:
+                continue
+            # py-1.12.0 Invariant 7 — verify the claimed sha exists in
+            # the repo. Subagents occasionally hallucinate commit
+            # hashes; without this check the architect would mark the
+            # task `done` and move on, leaving the work undone forever.
+            # If the pattern doesn't capture a sha (e.g. the ✓-line
+            # pattern) we still trust it — the prompt mandates the
+            # commit line too, and we don't want false negatives from
+            # a pattern that's intentionally permissive.
+            sha = m.group(1) if m.lastindex and m.lastindex >= 1 else None
+            if sha and not self._git_commit_exists(sha):
+                _log(
+                    f"classify: subagent claimed commit {sha} but it doesn't exist in repo — demoting to no-commit"
+                )
+                _debug_emit(
+                    "subagent-final.ghost-commit",
+                    msg=f"claimed commit {sha} does not exist",
+                    lvl="warn",
+                    data={"claimed_sha": sha, "preview_head": text[:200]},
+                )
+                continue
+            commit_match = True
+            break
+        return "success" if commit_match else "no-commit"
+
+    def _git_commit_exists(self, sha: str) -> bool:
+        """Run `git cat-file -e <sha>` from the project root. Returns
+        True iff the sha is a valid object in the repo. Silently False
+        on any error (no git binary, not a repo, etc.) — the architect
+        will get the 'no-commit' verdict and the task fail-counter will
+        bump, which is the correct safe default."""
+        if not re.match(r"^[0-9a-f]{6,40}$", sha):
+            return False
+        try:
+            import subprocess
+
+            r = subprocess.run(
+                ["git", "cat-file", "-e", sha],
+                cwd=str(self.paths.root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _roadmap_pass_complete(self) -> bool:
         """py-1.10.25 — True iff no active/next initiative has any
@@ -6008,6 +6861,94 @@ class Daemon:
             return True
         except Exception:
             return False
+
+    # ── Agent-type pause state (py-1.10.27 — backed by QuotaState) ─────
+    # The per-agent_type API is preserved as a thin wrapper over
+    # QuotaState so existing callers (HTTP endpoints, wake hook) keep
+    # working without contortion. Under the hood every lookup goes
+    # through the (platform, model) quota_key derived from the
+    # agent manifest.
+
+    def _pause_agent_type(
+        self,
+        agent_type: str,
+        *,
+        reason: str,
+        duration_secs: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Pause the quota pool that `agent_type` belongs to. Multiple
+        types sharing a platform+model pause together (that's the
+        point — they share the same upstream account)."""
+        if not agent_type:
+            return {}
+        m = _agent_manifest(agent_type)
+        entry = self.quota.pause(
+            m["quota_key"],
+            reason=reason,
+            duration_secs=duration_secs,
+            platform=m["platform"],
+            model=m["model"],
+        )
+        # Back-compat shape for existing cockpit reader (until V108 lands).
+        return {
+            "since": entry.get("paused_at"),
+            "epoch": entry.get("paused_until_epoch", 0)
+            - (entry.get("paused_until_epoch", 0) - int(time.time())),
+            "expires_at": entry.get("paused_until"),
+            "expires_epoch": entry.get("paused_until_epoch"),
+            "reason": entry.get("reason"),
+            "duration_secs": duration_secs,
+            "quota_key": m["quota_key"],
+            "platform": m["platform"],
+            "model": m["model"],
+        }
+
+    def _unpause_agent_type(self, agent_type: str) -> bool:
+        if not agent_type:
+            return False
+        m = _agent_manifest(agent_type)
+        return self.quota.unpause(m["quota_key"])
+
+    def _agent_type_is_paused(
+        self, agent_type: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not agent_type:
+            return None
+        m = _agent_manifest(agent_type)
+        if not self.quota.is_paused(m["quota_key"]):
+            return None
+        entry = self.quota.get(m["quota_key"]) or {}
+        return {
+            "expires_at": entry.get("paused_until"),
+            "expires_epoch": entry.get("paused_until_epoch"),
+            "reason": entry.get("reason"),
+            "quota_key": m["quota_key"],
+            "platform": m["platform"],
+            "model": m["model"],
+        }
+
+    def _paused_agent_types_view(self) -> Dict[str, Dict[str, Any]]:
+        """Back-compat projection: map every agent_type whose
+        quota_key is paused onto the legacy /health field shape.
+        Built by walking AGENT_PROMPTS so multiple types sharing a
+        pool all appear paused together (correct — they actually are)."""
+        paused = self.quota.paused_view()
+        out: Dict[str, Dict[str, Any]] = {}
+        for t in AGENT_PROMPTS.keys():
+            m = _agent_manifest(t)
+            entry = paused.get(m["quota_key"])
+            if entry:
+                out[t] = {
+                    "since": entry.get("paused_at"),
+                    "expires_at": entry.get("paused_until"),
+                    "expires_epoch": entry.get("paused_until_epoch"),
+                    "reason": entry.get("reason"),
+                    "quota_key": m["quota_key"],
+                    "platform": entry.get("platform"),
+                    "model": entry.get("model"),
+                    "consecutive_rate_limits": entry.get("consecutive_rate_limits", 0),
+                }
+        return out
 
     def _bump_task_failure(self, task_id: Optional[str]) -> int:
         """Increment + return the cumulative unproductive-final count
@@ -6086,10 +7027,32 @@ class Daemon:
         child_meta = self._conv_meta_load().get(child_conv) or {}
         task_id = child_meta.get("task_id") or None
         initiative_id = child_meta.get("initiative_id") or None
+        child_agent_type = _agent_type_normalised(child_meta.get("agent_type"))
         fail_count = 0
         verdict_line = ""
         if outcome == "success":
             verdict_line = "VERDICT: ✓ success (commit detected in preview)"
+        elif outcome == "rate-limited":
+            # py-1.10.26 — Quota exhausted on the upstream CLI. Pause
+            # the whole agent_type so the architect doesn't keep
+            # throwing dispatches at a wall. Verdict tells it WHY
+            # AND how long the cooldown lasts; matrix rule forces
+            # mark-blocked-and-move-on (different from a normal fail
+            # because no retry helps here).
+            pause = self._pause_agent_type(
+                child_agent_type,
+                reason=f"rate-limited final from {child_conv}",
+            )
+            verdict_line = (
+                f"VERDICT: ⏸ rate-limited — task `{task_id or '?'}` hit the "
+                f"`{child_agent_type}` CLI quota. Agent type **paused until "
+                f"{pause.get('expires_at')}**; further dispatches of this "
+                f"type will return 503. **MATRIX RULE: mark this task "
+                f"`blocked: rate-limited` and DO NOT retry — retrying does "
+                f"not help until the quota window resets. You CAN dispatch "
+                f"a DIFFERENT agent_type (deploy / db / testing / docs / "
+                f"review) on other tasks while we wait.**"
+            )
         else:
             fail_count = self._bump_task_failure(task_id)
             kind = (
@@ -6185,6 +7148,12 @@ class Daemon:
                 lvl="error",
                 conv=parent_conv,
             )
+        # py-1.11.0 — Re-broadcast the PARENT's activity. The wake just
+        # re-dispatched the architect (live=true again) or queued it
+        # (still live with pending merged). Child broadcast + child
+        # auto-archive happen directly from the runner's emit-final
+        # path so they fire even when there's no parent to wake.
+        self._broadcast_conv_activity(parent_conv)
 
     def chat_cancel(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         conv = str(body.get("conv") or "").strip()
@@ -6213,6 +7182,13 @@ class Daemon:
                 "dropped_pending": dropped,
             }
         )
+        # py-1.11.0 — conv.activity flip. The conv is no longer live;
+        # if a parent was coordinating it, the parent's waiting_on
+        # shrinks (and may go empty → coordinating=false).
+        parent = self._conv_meta_parent(conv)
+        self._broadcast_conv_activity(conv)
+        if parent:
+            self._broadcast_conv_activity(parent)
         return 200, {
             "ok": True,
             "cancelled": True,
@@ -6331,14 +7307,15 @@ class Daemon:
             return 400, {"error": "conv required"}
         by = str(body.get("author") or "").strip()
         entry = self.chat_archive.archive(conv, by=by)
-        # Broadcast so other cockpit instances see the change in real
-        # time (multi-tab / multi-window scenarios).
+        # py-1.11.1 — Single broadcast on the snapshot.v1 contract. The
+        # legacy `chat.archived` alias was retired in Phase 2.
         self.hub.broadcast(
             {
-                "type": "chat.archived",
+                "type": "conv.archived",
                 "conv": conv,
-                "ts": entry.get("archived_at"),
+                "archived_at": entry.get("archived_at"),
                 "by": entry.get("by"),
+                "ts": entry.get("archived_at"),
             }
         )
         return 200, {"ok": True, "archived": entry}
@@ -6351,7 +7328,7 @@ class Daemon:
         if was_archived:
             self.hub.broadcast(
                 {
-                    "type": "chat.unarchived",
+                    "type": "conv.unarchived",
                     "conv": conv,
                     "ts": _iso_now(),
                 }
@@ -6722,20 +7699,6 @@ class Daemon:
             "features": self._features(),
             # py-1.2.0 — Standard v7 §10.4 (daemon self-update).
             "daemon": daemon_cfg,
-            # py-1.10.2 — Convs with a live ChatRunner right now.
-            # Cockpit uses this at boot/reconnect to mark agents as
-            # working + show their preparing bubble IMMEDIATELY instead
-            # of waiting for the next WS delta (which can take ~20s if
-            # the runner is mid-tool-call). Empty list when the daemon
-            # has no in-flight turns.
-            "chat_active_convs": self.chat_sessions.list_active(),
-            # py-1.10.19 — Full activity join. Each entry covers either
-            # a LIVE conv (its own ChatRunner is running) or a parent
-            # COORDINATING conv (own runner idle, but at least one
-            # child whose `parent_conv` points here is live). Cockpit
-            # consumes this for the per-initiative working spinner +
-            # 'Waiting on A101' pill + ChatRail coordinating chip.
-            "chat_activity": self.chat_activity(),
             # py-1.10.21 — Debug stream advertisement. `enabled` is the
             # operator-controlled flag (`cluster.yaml.debug.enabled`,
             # default true). Cockpit's debug-transport gates its POST
@@ -6749,69 +7712,309 @@ class Daemon:
                     else None
                 ),
             },
+            # py-1.10.26 — Agent-type pause state. Back-compat projection
+            # from QuotaState (py-1.10.27+). Empty dict when no type is
+            # paused. Cockpit's older banner reads from here.
+            "paused_agent_types": self._paused_agent_types_view(),
+            # py-1.10.27 — Full quota state keyed by `<platform>/<model>`
+            # with probe history, last-success, consecutive-rate-limits.
+            # New cockpit banner reads from here. Initiative
+            # `quota-aware-dispatch`.
+            "quota": self.quota.view(),
             "ts": _iso_now(),
         }
 
-    def chat_activity(self) -> List[Dict[str, Any]]:
-        """Join `chat_sessions.list_active()` with `conv_meta` so the
-        cockpit (and any future external observer) can see, in one
-        request: which convs are streaming, which initiative + task
-        they target, and which parent convs are coordinating live
-        children but not running themselves. Initiative
-        `agent-activity-surface`, feature flag `chat.activity.v1`."""
-        live = set(self.chat_sessions.list_active())
-        all_meta = self._conv_meta_load()
+    # ── py-1.11.0: chat-state-rearchitecture. Canonical conv list +
+    # paginated message reads + consolidated boot snapshot. The
+    # daemon-authoritative chat surface — replaces the deleted
+    # /state.timeline.recent_events + /health.chat_active_convs +
+    # /health.chat_activity legacy channels.
+    # ────────────────────────────────────────────────────────────────
 
-        def _meta(c: str) -> Dict[str, Any]:
-            return all_meta.get(c) or {}
+    def chat_convs(self) -> List[Dict[str, Any]]:
+        """Canonical list of every conv known to the daemon — union of
+        conv_meta.json sidecar entries, live ChatRunner convs, and the
+        ChatArchive registry. One source of truth so the cockpit no
+        longer has to reconstruct the rail by walking the last 500
+        timeline events.
+
+        Per entry:
+            conv               — conv id
+            agent_type         — normalised role (slug-implied wins)
+            agent_id           — A### if assigned
+            parent_conv        — for subagents
+            initiative_id      — work-* convs and the architect when known
+            task_id            — work-* convs
+            archived           — bool; archived_at + by when true
+            live               — own ChatRunner is streaming RIGHT NOW
+            coordinating       — has >=1 live child via parent_conv
+            waiting_on         — list of child convs currently live
+            created_at         — first-seen ts (from timeline; falls back to
+                                  archive entry or "" if neither exists)
+            last_activity_at   — most recent timeline event ts for this conv
+            msg_count          — count of user/assistant events in timeline
+
+        Note on cost: `_chat_msg_index()` walks all timeline files once
+        per call to compute counts + ts boundaries. On small clusters
+        (<10k events total) this is sub-millisecond; on big clusters we
+        can later memoise on file mtimes, but YAGNI for the cavioca
+        scale we're at today.
+        """
+        all_meta = self._conv_meta_load()
+        live = set(self.chat_sessions.list_active())
+        archived_list = self.chat_archive.list()  # [{conv, archived_at, by}, …]
+        archived_by_conv: Dict[str, Dict[str, Any]] = {
+            a["conv"]: a for a in archived_list
+        }
+        msg_index = self._chat_msg_index()
+
+        # Build the union of all conv ids we know about.
+        all_convs: set = set()
+        all_convs.update(all_meta.keys())
+        all_convs.update(live)
+        all_convs.update(archived_by_conv.keys())
+        all_convs.update(msg_index.keys())
+
+        # Build parent → children map across the conv_meta entries that
+        # name a parent, restricted to live children (the cockpit only
+        # cares about "currently waiting on X").
+        children_by_parent: Dict[str, List[str]] = {}
+        for c in live:
+            p = (all_meta.get(c) or {}).get("parent_conv")
+            if p:
+                children_by_parent.setdefault(str(p), []).append(c)
 
         entries: List[Dict[str, Any]] = []
-        for conv in sorted(live):
-            m = _meta(conv)
+        for conv in all_convs:
+            meta = all_meta.get(conv) or {}
+            arch = archived_by_conv.get(conv)
+            idx = msg_index.get(conv) or {}
+            is_live = conv in live
+            kids = children_by_parent.get(conv) or []
             entries.append(
                 {
                     "conv": conv,
+                    "agent_type": _agent_type_normalised(
+                        _agent_type_from_conv_slug(conv) or meta.get("agent_type")
+                    ),
+                    "agent_id": meta.get("agent_id"),
+                    "parent_conv": meta.get("parent_conv"),
+                    "initiative_id": meta.get("initiative_id"),
+                    "task_id": meta.get("task_id"),
+                    "archived": arch is not None,
+                    "archived_at": arch.get("archived_at") if arch else None,
+                    "archived_by": arch.get("by") if arch else None,
+                    "live": is_live,
+                    "coordinating": (not is_live) and bool(kids),
+                    "waiting_on": sorted(kids),
+                    "created_at": idx.get("first_ts")
+                    or (arch.get("archived_at") if arch else ""),
+                    "last_activity_at": idx.get("last_ts") or "",
+                    "msg_count": int(idx.get("count") or 0),
+                }
+            )
+
+        # Order: live first, then idle, then archived. Inside each
+        # bucket: newest activity first. Single sort with a composite
+        # key — bucket ascending + activity-string-inverted so newest
+        # ISO ts (which sort lexicographically) ends up on top.
+        def _sort_key(e: Dict[str, Any]) -> Tuple[int, str]:
+            bucket = 0 if e["live"] else (2 if e["archived"] else 1)
+            # Invert the ISO ts per-char so lexicographic ASC == ts DESC.
+            ts = e.get("last_activity_at") or ""
+            inverted = "".join(chr(255 - ord(c)) for c in ts) if ts else "\xff"
+            return (bucket, inverted)
+
+        entries.sort(key=_sort_key)
+        return entries
+
+    def _chat_msg_index(self) -> Dict[str, Dict[str, Any]]:
+        """Walk every timeline file once, return per-conv counts +
+        first/last ts of chat.user / chat.assistant.final events.
+
+        Cheap for cluster sizes we ship today (≤ a few hundred K events
+        across all jsonl + gz files combined → low-ms reads). If this
+        becomes a hot spot we'd memoise on file mtimes or maintain an
+        incremental `.runtime/conv-index/` cache; not needed yet."""
+        out: Dict[str, Dict[str, Any]] = {}
+        if not self.paths.timeline_dir.exists():
+            return out
+        chat_types = ("chat.user", "chat.assistant", "chat.assistant.final")
+        for f in _iter_timeline_files(self.paths):
+            for ev in _read_timeline_file(f):
+                if ev.get("type") not in chat_types:
+                    continue
+                conv = ev.get("conv")
+                if not conv:
+                    continue
+                ts = str(ev.get("ts") or "")
+                slot = out.setdefault(conv, {"count": 0, "first_ts": "", "last_ts": ""})
+                slot["count"] += 1
+                if ts:
+                    if not slot["first_ts"] or ts < slot["first_ts"]:
+                        slot["first_ts"] = ts
+                    if ts > slot["last_ts"]:
+                        slot["last_ts"] = ts
+        return out
+
+    def chat_conv_meta(self, conv: str) -> Dict[str, Any]:
+        """One conv's metadata sidecar, normalised. Used by the cockpit
+        for deep-links and resync of individual entries without a full
+        /chat/convs refetch."""
+        all_meta = self._conv_meta_load()
+        m = all_meta.get(conv) or {}
+        idx = self._chat_msg_index().get(conv) or {}
+        arch = self.chat_archive.is_archived(conv)
+        return {
+            "conv": conv,
+            "agent_type": _agent_type_normalised(
+                _agent_type_from_conv_slug(conv) or m.get("agent_type")
+            ),
+            "agent_id": m.get("agent_id"),
+            "parent_conv": m.get("parent_conv"),
+            "initiative_id": m.get("initiative_id"),
+            "task_id": m.get("task_id"),
+            "archived": arch,
+            "live": self.chat_sessions.has(conv),
+            "created_at": idx.get("first_ts") or "",
+            "last_activity_at": idx.get("last_ts") or "",
+            "msg_count": int(idx.get("count") or 0),
+        }
+
+    def chat_conv_messages(
+        self,
+        conv: str,
+        *,
+        before_ts: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """Paginated message read for one conv. Returns events of types
+        chat.user / chat.assistant / chat.assistant.final / chat.cancelled
+        whose ts < `before_ts` (when provided), newest-first, capped to
+        `limit`. The cockpit reverses for display order.
+
+        Pagination contract:
+            • First page  → call with before_ts unset → newest `limit`.
+            • Older page  → call with before_ts = oldest_ts of prior page.
+            • has_more    → true iff a full `limit` came back, OR there
+                              is at least one further event in the index.
+            • oldest_ts   → the ts of the oldest event in the page
+                              (cockpit feeds this back as `before_ts`).
+
+        Cost is the same `_iter_timeline_files` walk as `_chat_msg_index`.
+        For now we re-walk per request; the optimisation TODO (per-conv
+        index files) is documented but unshipped — small clusters don't
+        need it."""
+        limit = max(1, min(2000, int(limit or 200)))
+        wanted_types = (
+            "chat.user",
+            "chat.assistant",
+            "chat.assistant.final",
+            "chat.cancelled",
+        )
+        # Gather candidates across files in arbitrary order, then sort.
+        all_events: List[Dict[str, Any]] = []
+        if self.paths.timeline_dir.exists():
+            for f in _iter_timeline_files(self.paths):
+                for ev in _read_timeline_file(f):
+                    if ev.get("conv") != conv:
+                        continue
+                    if ev.get("type") not in wanted_types:
+                        continue
+                    all_events.append(ev)
+        all_events.sort(key=lambda e: str(e.get("ts") or ""))
+        if before_ts:
+            all_events = [e for e in all_events if str(e.get("ts") or "") < before_ts]
+        # Newest-first cap, then re-reverse so the returned list is in
+        # chronological order (the cockpit's reducer expects oldest→newest).
+        page = all_events[-limit:]
+        oldest_in_page = str(page[0].get("ts") or "") if page else ""
+        # `has_more` = there exists at least one event older than the
+        # oldest_in_page (we cut some off the front).
+        has_more = len(all_events) > len(page)
+        return {
+            "conv": conv,
+            "messages": page,
+            "count": len(page),
+            "has_more": has_more,
+            "oldest_ts": oldest_in_page,
+        }
+
+    def chat_snapshot(self) -> Dict[str, Any]:
+        """Boot consolidated payload. One round-trip on cockpit start
+        instead of the old 3-call chain (/state for timeline replay,
+        /chat/archives for archived set, /health for active convs).
+
+        Shape kept narrow on purpose — cockpit consumes specific
+        sub-keys; if we need more later, add a key. Never expose
+        secrets here."""
+        return {
+            "convs": self.chat_convs(),
+            "paused_agent_types": self._paused_agent_types_view(),
+            "quota": self.quota.view(),
+            "debug": {
+                "enabled": _DEBUG_LOG is not None,
+            },
+            "version": DAEMON_VERSION,
+            "generated_at": _iso_now(),
+        }
+
+    def _broadcast_conv_activity(
+        self,
+        conv: str,
+        *,
+        live_override: Optional[bool] = None,
+    ) -> None:
+        """Emit a `conv.activity` WS event for one conv so cockpits
+        update their live/coordinating/waiting_on flags without a
+        snapshot refetch. Cheap: computes the single entry inline.
+
+        `live_override` lets the caller force the `live` flag when
+        ChatSessions hasn't yet popped the conv from `_s` (the runner's
+        emit-final path races with ChatSessions._wait's pop). Pass
+        `False` from the wake hook when we know the child has just
+        finalised; pass `None` (default) elsewhere to read the truth
+        from `chat_sessions.list_active()`.
+
+        Called from the points that change a conv's runtime state:
+            • ChatRunner spawn (live=true)
+            • Wake hook on child final (live=false override)
+            • chat_cancel (live=false)
+        Idempotent — duplicate fires are safe; the cockpit reducer
+        dedupes on conv+live+coordinating identity."""
+        try:
+            all_meta = self._conv_meta_load()
+            live = set(self.chat_sessions.list_active())
+            if live_override is False:
+                live.discard(conv)
+            elif live_override is True:
+                live.add(conv)
+            kids = []
+            for c in live:
+                p = (all_meta.get(c) or {}).get("parent_conv")
+                if p == conv:
+                    kids.append(c)
+            is_live = conv in live
+            m = all_meta.get(conv) or {}
+            self.hub.broadcast(
+                {
+                    "type": "conv.activity",
+                    "conv": conv,
+                    "agent_type": _agent_type_normalised(
+                        _agent_type_from_conv_slug(conv) or m.get("agent_type")
+                    ),
                     "agent_id": m.get("agent_id"),
-                    "agent_type": _agent_type_normalised(m.get("agent_type")),
                     "parent_conv": m.get("parent_conv"),
                     "initiative_id": m.get("initiative_id"),
                     "task_id": m.get("task_id"),
-                    "live": True,
-                    "waiting_on": [],
+                    "live": is_live,
+                    "coordinating": (not is_live) and bool(kids),
+                    "waiting_on": sorted(kids),
+                    "ts": _iso_now(),
                 }
             )
-
-        # Coordinating parents: convs that are NOT live themselves but
-        # appear as `parent_conv` of one or more live convs.
-        children_by_parent: Dict[str, List[str]] = {}
-        for conv in live:
-            p = _meta(conv).get("parent_conv")
-            if p:
-                children_by_parent.setdefault(p, []).append(conv)
-
-        for parent, children in children_by_parent.items():
-            if parent in live:
-                # Already on the list — promote its `waiting_on`.
-                for e in entries:
-                    if e["conv"] == parent:
-                        e["waiting_on"] = sorted(children)
-                        break
-                continue
-            pm = _meta(parent)
-            entries.append(
-                {
-                    "conv": parent,
-                    "agent_id": pm.get("agent_id"),
-                    "agent_type": _agent_type_normalised(pm.get("agent_type")),
-                    "parent_conv": pm.get("parent_conv"),
-                    "initiative_id": pm.get("initiative_id"),
-                    "task_id": pm.get("task_id"),
-                    "live": False,
-                    "waiting_on": sorted(children),
-                }
-            )
-
-        return entries
+        except Exception as e:
+            _log(f"conv.activity broadcast failed for {conv}: {e}")
 
     def _features(self) -> List[str]:
         feats = [
@@ -6835,7 +8038,6 @@ class Daemon:
             "runs.cancel",  # POST /runs/<id>/cancel
             "runs.advance",  # POST /runs/<id>/advance
             "runs.finish",  # POST /runs/<id>/finish
-            "chat.active_convs",  # py-1.10.2 — /health.chat_active_convs
             "agents.roadmap-architect",  # py-1.10.3 — coordinator agent type
             "agents.architect-consult.v1",  # py-1.10.8 — [architect-consult] addendum forces A001 to decide
             "agents.validation-gate.v1",  # py-1.10.9 — VALIDATION GREEN/RED first turn + batched questions
@@ -6843,12 +8045,15 @@ class Daemon:
             "agents.validation-shortcuts.v1",  # py-1.10.11 — proceed/rework operator shortcuts + ROADMAP-REWORK trigger + chat-input UX
             "agents.slug-implied-type.v1",  # py-1.10.12 — slug-implied agent_type force heals stale conv_meta + drops the SOP-in-prompt lead-in
             "agents.roadmap-author.v1",  # py-1.10.13 — custom agent auto-triggers roadmap-author playbook (meshkore.com/reference/prompts/roadmap-author/v1/) on empty clusters
+            "cluster.credentials.crud.v1",  # py-1.11.3 — GET/PUT/POST/DELETE /credentials/<name>; cockpit Config block reads/writes single-file secrets at .meshkore/credentials/ (chmod 600, protected names: portal-token)
             "agents.briefing-https.v1",  # py-1.10.14 — agent briefings emit https://daemon.meshkore.com:<port> URLs when TLS bundle present (architect no longer aborts on TLS RST against plain http://localhost)
             "roadmap.linked-list.v1",  # py-1.10.15 — state.initiatives[] ordered by linked-list walk + bucket sort (empty-at-bottom, done at end)
             "roadmap.auto-archive.v1",  # py-1.10.15 — initiatives with all-done child tasks get status/completed_at/commit_sha written by the daemon on every /state build
             "agents.architect-wake.v1",  # py-1.10.16 — subagent's chat.assistant.final triggers an automatic [architect-wake] dispatch to the parent_conv recorded in conv_meta; replaces architect-side polling
             "debug.stream.v1",  # py-1.10.17 — structured JSONL at .meshkore/.runtime/debug.jsonl, GET /debug/tail + POST /debug/log, 30-min rolling retention. Replaces ad-hoc screenshots as the cross-component observability channel.
-            "chat.activity.v1",  # py-1.10.20 — /state.chat_activity + /health.chat_activity expose live convs + coordinating parents with waiting_on[]. Drives the cockpit's per-initiative spinner, per-task blink, ChatRail 'coordinating' chip, and 'Waiting on A###' chat pill.
+            "rate-limit.auto-pause.v1",  # py-1.10.26 — subagent finals classified as rate-limited auto-pause their agent_type for 30 min; chat_dispatch returns 503 during cooldown; manual POST /agent-types/<t>/{pause,unpause} for operator override; /health.paused_agent_types advertises state.
+            "quota.aware-dispatch.v1",  # py-1.10.27 — per-(platform,model) persistent QuotaState at .runtime/quota-state.json + QuotaProber thread that auto-clears expired pauses; /quota GET + /quota/<key>/{pause,unpause} endpoints.
+            "chat.snapshot.v1",  # py-1.11.0+ — daemon-authoritative conv list. GET /chat/snapshot (boot), GET /chat/convs, GET /chat/conv/<id>/meta, GET /chat/conv/<id>/messages?before=&limit= (paginated history). WS events: conv.created, conv.meta_updated, conv.archived, conv.unarchived, conv.activity. py-1.11.1 Phase 2 deleted the legacy back-compat surfaces (/health.chat_active_convs, /health.chat_activity, /state.timeline.recent_events, chat.archived/chat.unarchived WS aliases). Initiative `chat-state-rearchitecture`.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -7148,9 +8353,81 @@ class Daemon:
                     "name": f.name,
                     "size": size,
                     "is_symlink": f.is_symlink(),
+                    # py-1.11.3 — protected names are listable but the
+                    # cockpit's CRUD blocks edit/delete on them. portal-token
+                    # is the canonical example: rewriting it from the cockpit
+                    # would lock the cockpit out of its own daemon.
+                    "protected": f.name in CREDENTIAL_PROTECTED_NAMES,
                 }
             )
         return out
+
+    # py-1.11.3 — Single-credential CRUD helpers. All return (code, body)
+    # tuples consumed by do_GET/do_PUT/do_DELETE. Auth handled by the
+    # routing layer before these run.
+    def credential_read(self, name: str) -> Tuple[int, Dict[str, Any]]:
+        """Return the credential value for the operator-facing reveal
+        action. The cockpit's CredentialsBlock keeps values masked by
+        default and only fetches the raw via this endpoint when the
+        operator clicks 'reveal'. Auth-required (handled upstream)."""
+        valid = _validate_credential_name(name)
+        if valid is not None:
+            return valid
+        path = self.paths.credentials / name
+        if not path.exists() or not path.is_file():
+            return 404, {"error": "credential not found", "name": name}
+        try:
+            value = path.read_text(encoding="utf-8")
+        except OSError as e:
+            return 500, {"error": f"read failed: {e}"}
+        return 200, {
+            "name": name,
+            "value": value,
+            "protected": name in CREDENTIAL_PROTECTED_NAMES,
+        }
+
+    def credential_write(self, name: str, value: str) -> Tuple[int, Dict[str, Any]]:
+        """Create or overwrite a credential file under .meshkore/credentials/.
+        Always chmod 600. Refuses protected names (portal-token) so the
+        cockpit can't accidentally lock itself out of the daemon."""
+        valid = _validate_credential_name(name)
+        if valid is not None:
+            return valid
+        if name in CREDENTIAL_PROTECTED_NAMES:
+            return 403, {
+                "error": "protected credential — managed by daemon",
+                "name": name,
+            }
+        if not isinstance(value, str):
+            return 400, {"error": "value must be a string"}
+        self.paths.credentials.mkdir(parents=True, exist_ok=True)
+        path = self.paths.credentials / name
+        try:
+            path.write_text(value, encoding="utf-8")
+            os.chmod(path, 0o600)
+        except OSError as e:
+            return 500, {"error": f"write failed: {e}"}
+        _log(f"credential written: {name} ({len(value)} bytes)")
+        return 200, {"name": name, "size": len(value.encode("utf-8"))}
+
+    def credential_delete(self, name: str) -> Tuple[int, Dict[str, Any]]:
+        valid = _validate_credential_name(name)
+        if valid is not None:
+            return valid
+        if name in CREDENTIAL_PROTECTED_NAMES:
+            return 403, {
+                "error": "protected credential — managed by daemon",
+                "name": name,
+            }
+        path = self.paths.credentials / name
+        if not path.exists():
+            return 404, {"error": "credential not found", "name": name}
+        try:
+            path.unlink()
+        except OSError as e:
+            return 500, {"error": f"delete failed: {e}"}
+        _log(f"credential deleted: {name}")
+        return 200, {"deleted": True, "name": name}
 
     # ── lifecycle ──────────────────────────────────────────────────────
     def serve_forever(self) -> None:
@@ -7191,11 +8468,21 @@ class Daemon:
         # D-CRON-02: start the scheduler. Ticks every 10s in a background
         # thread; cluster.yaml.crons jobs fire from here, no LaunchAgent.
         self.cron_scheduler.start()
+        # py-1.10.27 — Quota prober. Wakes every 60s, probes paused
+        # quota keys, unpauses (or extends pause) based on outcome.
+        # Initiative `quota-aware-dispatch`.
+        self.quota_prober = QuotaProber(self)
+        self.quota_prober.start()
         try:
             self.server.serve_forever(poll_interval=0.5)
         finally:
             try:
                 self.cron_scheduler.stop()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "quota_prober", None) is not None:
+                    self.quota_prober.stop()
             except Exception:
                 pass
             self.cleanup()
@@ -7249,6 +8536,15 @@ def _iso_now() -> str:
     return (
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
         + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    )
+
+
+def _iso_at(epoch_secs: int) -> str:
+    """ISO-8601 UTC for a given epoch — used for pause expiry stamps
+    (py-1.10.26). Cheap; no ms component (we only care about the
+    minute granularity for rate-limit cooldowns)."""
+    return datetime.fromtimestamp(epoch_secs, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
     )
 
 
