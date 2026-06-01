@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.0"  # 1.12.0 — roadmap safety net. 4 NEW invariants on top of the 1.10.25/.28 set, all enforced server-side at chat_dispatch time:
+DAEMON_VERSION = "py-1.12.5"  # 1.12.5 — pluggable LLM runners. cluster.yaml `runners.default` + `runners.fallback` select the headless client (cursor, claude-code). ChatRunner tries each in order until a binary is found; Cursor reads CURSOR_API_KEY from env or `.meshkore/credentials/cursor-api-key`.
 #   Invariant 4 — Wave cap. At most WAVE_CAP (default 3, cluster.yaml.architect.wave_cap) work-* subagents alive at once per parent_conv. Bounds quota burn during a wave + prevents architect prompt bugs from spawning 7 parallel.
 #   Invariant 5 — Required join keys. work-* conv dispatch MUST carry both initiative_id AND task_id. Closes the bypass where dispatch without these fields skipped Invariants 2+3.
 #   Invariant 6 — Depends-on gate. Task being dispatched must have its `depends_on:` frontmatter satisfied (every referenced task is `done`). Refuses 409 with the missing list. Prevents the architect from racing a downstream task before its upstream finishes.
@@ -536,6 +536,25 @@ class Cluster:
     def modules(self) -> List[Dict[str, Any]]:
         m = self.data.get("modules") or []
         return m if isinstance(m, list) else []
+
+    @property
+    def runners_config(self) -> Dict[str, Any]:
+        """Headless LLM runner selection from cluster.yaml."""
+        runners = self.data.get("runners")
+        if not isinstance(runners, dict):
+            daemon = self.data.get("daemon")
+            if isinstance(daemon, dict):
+                runners = daemon.get("runners")
+        if not isinstance(runners, dict):
+            runners = {}
+        default = str(runners.get("default") or "claude-code").strip()
+        fallback = runners.get("fallback") or []
+        if not isinstance(fallback, list):
+            fallback = []
+        return {
+            "default": default or "claude-code",
+            "fallback": [str(x).strip() for x in fallback if str(x).strip()],
+        }
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1472,6 +1491,101 @@ def _find_claude() -> Optional[str]:
         if hits and os.access(hits[0], os.X_OK):
             return hits[0]
     return None
+
+
+_RUNNER_PLATFORMS = frozenset({"claude-code", "cursor"})
+
+
+def _find_cursor_agent() -> Optional[str]:
+    """Locate the Cursor headless CLI (`cursor-agent` or `cursor agent`)."""
+    import shutil
+
+    for name in ("cursor-agent", "agent"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = [
+        os.path.expanduser("~/.local/bin/cursor-agent"),
+        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor-agent",
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _find_runner_binary(platform: str) -> Optional[str]:
+    if platform == "cursor":
+        return _find_cursor_agent()
+    if platform == "claude-code":
+        return _find_claude()
+    return None
+
+
+def _load_cursor_api_key(paths: "Paths") -> Optional[str]:
+    key = os.environ.get("CURSOR_API_KEY", "").strip()
+    if key:
+        return key
+    key_file = paths.credentials / "cursor-api-key"
+    if key_file.is_file():
+        return key_file.read_text(errors="replace").strip() or None
+    return None
+
+
+def _runner_path_env() -> str:
+    extra = [
+        os.path.expanduser("~/.local/bin"),
+        "/Applications/Cursor.app/Contents/Resources/app/bin",
+    ]
+    current = os.environ.get("PATH", "")
+    return ":".join(extra + ([current] if current else []))
+
+
+def _resolve_runner_platforms(cluster: "Cluster", agent_type: str) -> List[str]:
+    """Ordered runner platforms to try for one chat turn."""
+    cfg = cluster.runners_config
+    prompt_entry = AGENT_PROMPTS.get(agent_type) or {}
+    primary = (
+        str(prompt_entry["platform"]).strip()
+        if prompt_entry.get("platform")
+        else cfg["default"]
+    )
+    order: List[str] = []
+    for plat in [primary, *cfg["fallback"], "claude-code", "cursor"]:
+        if plat in _RUNNER_PLATFORMS and plat not in order:
+            order.append(plat)
+    return order or ["claude-code"]
+
+
+def _cursor_spawn_argv(
+    bin_path: str, *, workspace: Path, model: Optional[str] = None
+) -> List[str]:
+    flags = [
+        "-p",
+        "--trust",
+        "--force",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--workspace",
+        str(workspace),
+    ]
+    if model and model != "auto":
+        flags.extend(["--model", model])
+    if os.path.basename(bin_path) == "cursor":
+        return [bin_path, "agent", *flags]
+    return [bin_path, *flags]
+
+
+def _runner_error_message(platforms: List[str]) -> str:
+    tried = ", ".join(platforms)
+    return (
+        f"No LLM runner found (tried: {tried}). "
+        "Cursor: ensure `cursor-agent` is on PATH, run `cursor-agent login`, "
+        "or place your API key in `.meshkore/credentials/cursor-api-key`. "
+        "Claude Code: `npm i -g @anthropic-ai/claude-code`."
+    )
 
 
 def _conversation_history(
@@ -3409,10 +3523,10 @@ class BriefingPipeline:
 
 
 class ChatRunner:
-    """One coordinator turn = one ChatRunner. Spawns `claude -p` with
-    stream-json output, parses each line into chat.assistant.delta /
-    tool.use / tool.result events on the WS, and emits a final
-    `chat.assistant.final` when the child exits.
+    """One coordinator turn = one ChatRunner. Spawns a headless LLM CLI
+    (Cursor agent or Claude Code) with stream-json output, parses each
+    line into chat.assistant.delta / tool.use / tool.result events on the
+    WS, and emits a final `chat.assistant.final` when the child exits.
 
     Cancel-safe: cancel() sends SIGTERM to the process group; if still
     alive after 30 s, SIGKILL."""
@@ -3448,6 +3562,7 @@ class ChatRunner:
         self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
         self.pid: Optional[int] = None
         self.proc: Any = None  # subprocess.Popen
+        self.runner_platform: str = "claude-code"
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
@@ -3479,9 +3594,15 @@ class ChatRunner:
     def spawn(self) -> None:
         import subprocess
 
-        claude_bin = _find_claude()
-        if not claude_bin:
-            err = "claude CLI not found — install via `npm i -g @anthropic-ai/claude-code`"
+        platforms = _resolve_runner_platforms(self.cluster, self.agent_type)
+        runner_bin: Optional[str] = None
+        for plat in platforms:
+            runner_bin = _find_runner_binary(plat)
+            if runner_bin:
+                self.runner_platform = plat
+                break
+        if not runner_bin:
+            err = _runner_error_message(platforms)
             _log(err)
             self.hub.broadcast(
                 _append_timeline(
@@ -3497,13 +3618,7 @@ class ChatRunner:
             )
             self.done.set()
             return
-        # py-1.6.1 HOTFIX — --session-id from py-1.6.0 caused empty
-        # assistant responses in production (claude-code exited
-        # silently on subsequent turns of the same conv). Reverted to
-        # opt-in via env var MESHKORE_CLAUDE_SESSION_ID=1. Default off
-        # until the failure mode is understood and re-tested.
-        # The uuid5 helper is preserved so reintroduction is a one-line
-        # flip once safe.
+
         session_id = _session_id_for_conv(self.conv)
         use_session = os.environ.get("MESHKORE_CLAUDE_SESSION_ID", "").strip() in (
             "1",
@@ -3511,44 +3626,42 @@ class ChatRunner:
             "yes",
             "on",
         )
-        args = [
-            claude_bin,
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            "bypassPermissions",
-            # Headless: cockpit has no UI to surface interactive question
-            # tools. Disallow them so the model defaults to plain-text
-            # asks in the chat bubble instead of stalling on a hanging
-            # AskUserQuestion / ExitPlanMode call.
-            "--disallowed-tools",
-            "AskUserQuestion,ExitPlanMode",
-        ]
-        if use_session:
-            args[2:2] = ["--session-id", session_id]
-        # py-1.10.5 — Pipe the briefing through stdin instead of
-        # appending it as a positional argument. claude 2.1.145
-        # rejects a trailing positional that arrives AFTER a
-        # multi-value flag (`--disallowed-tools <comma,list>`) — the
-        # parser consumes our prompt as another disallowed-tool name
-        # or just drops it, and claude exits 1 with stderr:
-        #   "Error: Input must be provided either through stdin or
-        #    as a prompt argument when using --print"
-        # Captured 2026-05-29 by py-1.10.4's stderr drainer (which
-        # had been silently dropping this error for every spawn
-        # since the cockpit's roadmap-architect feature shipped).
-        # Stdin works regardless of argv order, so it's the
-        # forward-compatible answer.
+        manifest = _agent_manifest(self.agent_type)
+        if self.runner_platform == "cursor":
+            args = _cursor_spawn_argv(
+                runner_bin,
+                workspace=self.paths.root,
+                model=manifest.get("model"),
+            )
+        else:
+            args = [
+                runner_bin,
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "bypassPermissions",
+                "--disallowed-tools",
+                "AskUserQuestion,ExitPlanMode",
+            ]
+            if use_session:
+                args[2:2] = ["--session-id", session_id]
+
         briefing = self._briefing()
         env = {
             **os.environ,
+            "PATH": _runner_path_env(),
             "MESHKORE_IDENTITY": self.identity,
             "MESHKORE_CONV": self.conv,
             "MESHKORE_SESSION_ID": session_id,
         }
+        if self.runner_platform == "cursor":
+            cursor_key = _load_cursor_api_key(self.paths)
+            if cursor_key:
+                env["CURSOR_API_KEY"] = cursor_key
+
         self.proc = subprocess.Popen(
             args,
             cwd=str(self.paths.root),
@@ -3559,17 +3672,16 @@ class ChatRunner:
             start_new_session=True,
         )
         self.pid = self.proc.pid
-        # Write the briefing to stdin and close. claude reads it
-        # all (EOF on close) then begins streaming results to stdout.
         try:
             if self.proc.stdin is not None:
                 self.proc.stdin.write(briefing.encode("utf-8"))
                 self.proc.stdin.close()
         except (BrokenPipeError, OSError) as e:
-            _log(f"claude({self.conv}) stdin write failed: {e}")
+            _log(f"runner({self.conv}) stdin write failed: {e}")
         _log(
-            f"claude({self.conv}) spawned pid={self.pid} agent_type={self.agent_type} "
-            f"stream={self.stream_id} briefing_len={len(briefing)}"
+            f"runner({self.conv}) platform={self.runner_platform} pid={self.pid} "
+            f"agent_type={self.agent_type} stream={self.stream_id} "
+            f"briefing_len={len(briefing)}"
         )
         self.hub.broadcast(
             {
@@ -3577,7 +3689,7 @@ class ChatRunner:
                 "id": f"chat:{self.conv}",
                 "agent": self.identity,
                 "ts": _iso_now(),
-                "runner": "claude-code",
+                "runner": self.runner_platform,
                 "conv": self.conv,
                 "stream_id": self.stream_id,
             }
@@ -3618,7 +3730,7 @@ class ChatRunner:
             except Exception:
                 continue
             if line:
-                _log(f"claude({self.conv}) stderr: {line}")
+                _log(f"runner({self.conv}) stderr: {line}")
 
     def cancel(self) -> None:
         if self.cancelled:
@@ -3724,6 +3836,46 @@ class ChatRunner:
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
+                continue
+            if ev_type in ("text", "text_delta", "assistant_text_delta"):
+                delta = str(ev.get("text") or ev.get("delta") or "")
+                if delta:
+                    self._cumulative_text += delta
+                    now = time.monotonic()
+                    if now - last_emit_at > 0.2:
+                        last_emit_at = now
+                        self.hub.broadcast(
+                            {
+                                "type": "chat.assistant.delta",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "text": self._cumulative_text[:16000],
+                                "ts": _iso_now(),
+                            }
+                        )
+                continue
+            if ev_type == "assistant":
+                msg = ev.get("message") or {}
+                for c in (msg.get("content") or [] if isinstance(msg, dict) else []):
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        delta = str(c.get("text") or "")
+                        if delta:
+                            self._cumulative_text += delta
+                            now = time.monotonic()
+                            if now - last_emit_at > 0.2:
+                                last_emit_at = now
+                                self.hub.broadcast(
+                                    {
+                                        "type": "chat.assistant.delta",
+                                        "author": self.identity,
+                                        "conv": self.conv,
+                                        "stream_id": self.stream_id,
+                                        "text": self._cumulative_text[:16000],
+                                        "ts": _iso_now(),
+                                    }
+                                )
+                continue
         # Finalize
         final_text = result_text or self._cumulative_text
         # py-1.7.0 — Harvest REMEMBER: lines into the role's shared
@@ -3758,8 +3910,8 @@ class ChatRunner:
         exit_code = self.proc.wait() if self.proc else None
         text_len = len(cleaned_text or "")
         _log(
-            f"claude({self.conv}) exit={exit_code} stream={self.stream_id} "
-            f"text_len={text_len} agent_type={self.agent_type}"
+            f"runner({self.conv}) platform={self.runner_platform} exit={exit_code} "
+            f"stream={self.stream_id} text_len={text_len} agent_type={self.agent_type}"
         )
         _debug_emit(
             "subagent-final",
