@@ -66,7 +66,14 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.5"  # 1.12.5 — pluggable LLM runners. cluster.yaml `runners.default` + `runners.fallback` select the headless client (cursor, claude-code). ChatRunner tries each in order until a binary is found; Cursor reads CURSOR_API_KEY from env or `.meshkore/credentials/cursor-api-key`.
+DAEMON_VERSION = "py-1.12.6"  # 1.12.6 — universal auth flow. Extends the runner auth system (py-1.12.5) to cover deploy tools: wrangler, gh, fly, vercel. `POST /auth/<platform>/start` + WS runner.auth.* events now work for all 6 platforms (cursor, claude-code, wrangler, gh, fly, vercel). Daemon also scans the final assistant text for known auth-failure keywords from deploy tools and auto-emits runner.auth.required so the cockpit shows the auth card without requiring the agent to signal it explicitly. py-1.12.5 stderr-surface + polling preserved. cluster.yaml `runners.default` + `runners.fallback` select the headless client (cursor, claude-code). ChatRunner tries each in order until a binary is found; Cursor reads CURSOR_API_KEY from env or `.meshkore/credentials/cursor-api-key`. py-1.12.4 initiative status consistency guard preserved. Operator field report 2026-05-31: "Visual identity v2" appeared in the archived view as DONE with 5/7 tasks done (2 still pending). The auto-archive reconcile was unidirectional (active→done only); the architect could write `status: done` on a partial initiative and nothing reverted it. `_reconcile_initiative_archive` is now BIDIRECTIONAL: forward as before, plus reverse — if frontmatter says `done` but ANY task is not `done`, revert to `active` + wipe `completed_at` + `commit_sha`. `_patch_frontmatter` extended to support `None` value = remove key. Architect prompt rewritten: the "Set initiative status: done" authority line now explicitly forbids the partial-done write + warns about the daemon's re-check.
+# 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
+# 1.12.2 — agent honesty pass. Two prompt fixes from operator field report 2026-05-31:
+#   (a) `deploy` agent prompt completely rewritten — mandatory read of `.meshkore/links.yaml` + `.meshkore/modules/<id>/README.md` + `.meshkore/credentials/` BEFORE acting; mandatory post-deploy verification via provider CLI OR curl-against-prod.url with version match; explicit "deploy isn't done until verified" rule. Closes the bug where the agent shipped a `partial-pass` smoke + a `web-build-failed` component and still reported `✓ deploy done` on the top line.
+#   (b) Commit cadence in the architect prompt now mandates VERIFY-BEFORE-CLAIMING-DONE for ALL agent types (code → build exit 0, deploy → curl/CLI version match, db → SELECT read-back, testing → actual test run) + HONEST REPORTING with `✓` vs `✗` as the first character. Stops the false-positive success pattern across the whole fleet.
+# Periodic VersionWatcher (py-1.12.1) + 4 dispatch invariants (py-1.12.0) preserved.
+# 1.12.1 — periodic VersionWatcher thread polls the CDN for upgrades every cluster.yaml.daemon.auto_update_check_interval_sec (default 1800s / 30min). When a newer DAEMON_VERSION is published AND no chat session is in flight AND cluster.yaml.daemon.auto_update is true, the watcher self-invokes /self-update so the cluster stays current without operator action. Designed for fleet-scale operation: 100 daemons keep themselves fresh on the same cadence the CDN ships. The 4 safety nets from 1.12.0 still apply. Architect prompt strengthened with explicit phase-order (foundation→build→test→ship) + depends_on reading instruction (operator field report 2026-05-31: architect picked tasks in apparent random order).
+# 1.12.0 — roadmap safety net. 4 NEW invariants on top of the 1.10.25/.28 set, all enforced server-side at chat_dispatch time:
 #   Invariant 4 — Wave cap. At most WAVE_CAP (default 3, cluster.yaml.architect.wave_cap) work-* subagents alive at once per parent_conv. Bounds quota burn during a wave + prevents architect prompt bugs from spawning 7 parallel.
 #   Invariant 5 — Required join keys. work-* conv dispatch MUST carry both initiative_id AND task_id. Closes the bypass where dispatch without these fields skipped Invariants 2+3.
 #   Invariant 6 — Depends-on gate. Task being dispatched must have its `depends_on:` frontmatter satisfied (every referenced task is `done`). Refuses 409 with the missing list. Prevents the architect from racing a downstream task before its upstream finishes.
@@ -539,7 +546,13 @@ class Cluster:
 
     @property
     def runners_config(self) -> Dict[str, Any]:
-        """Headless LLM runner selection from cluster.yaml."""
+        """Headless LLM runner selection from cluster.yaml.
+
+        Supports top-level `runners:` or nested `daemon.runners:`:
+          runners:
+            default: cursor
+            fallback: [claude-code]
+        """
         runners = self.data.get("runners")
         if not isinstance(runners, dict):
             daemon = self.data.get("daemon")
@@ -1215,12 +1228,21 @@ def _reconcile_initiative_archive(
     tasks: List[Dict[str, Any]],
     paths: "Paths",
 ) -> None:
-    """Auto-archive (D-RM-ARCHIVE-02). For every initiative with
-    status ∈ {active, next, in_progress} and task_total > 0 whose
-    child tasks are ALL `status: done`, flip its frontmatter to
-    `status: done`, populate `completed_at` (ISO UTC), and stamp the
-    cluster's git HEAD into `commit_sha`. Idempotent — second pass
-    sees `status: done` already and skips."""
+    """Bidirectional reconcile between initiative status + child tasks.
+
+    py-1.10.15 (forward): active → done when ALL tasks done.
+    py-1.12.4 (BACKWARD): done → active when ANY task is not done.
+      Closes the bug where the architect prematurely set
+      `status: done` on a partial initiative (operator field report
+      2026-05-31: Visual identity v2 archived with 5/7 done). The
+      cockpit was showing the initiative as DONE in the archived
+      view despite 2 tasks still pending. The architect's prompt
+      already forbids this, but a server-side guard is the only
+      reliable defense.
+
+    For both directions: idempotent — the second pass sees the
+    consistent state and skips.
+    """
     # tasks_by_initiative reused so we don't iterate N×M times.
     children: Dict[str, List[Dict[str, Any]]] = {}
     for t in tasks:
@@ -1234,49 +1256,84 @@ def _reconcile_initiative_archive(
 
     for it in initiatives:
         status = normalize_status(it.get("status"))
-        if status in ("done", "backlog"):
+        if status == "backlog":
             continue
         kids = children.get(it["id"], [])
         if not kids:
             continue
-        if not all(normalize_status(k.get("status")) == "done" for k in kids):
+
+        all_done = all(normalize_status(k.get("status")) == "done" for k in kids)
+
+        # ── Forward path: active/next/in_progress → done ────────────
+        if status != "done" and all_done:
+            if not head_sha_attempted:
+                head_sha_attempted = True
+                head_sha = _git_head_sha(paths.root)
+            new_fields = {
+                "status": "done",
+                "completed_at": iso_now,
+            }
+            if head_sha:
+                new_fields["commit_sha"] = head_sha
+            try:
+                fp = paths.root / it["path"]
+                if _patch_frontmatter(fp, new_fields):
+                    it["status"] = "done"
+                    it["completed_at"] = iso_now
+                    if head_sha:
+                        it["commit_sha"] = head_sha
+                    _log(
+                        f"roadmap: auto-archived initiative {it['id']} "
+                        f"({len(kids)} tasks done, commit={head_sha or 'none'})"
+                    )
+                    _debug_emit(
+                        "init-archive",
+                        msg=f"initiative {it['id']} auto-archived",
+                        data={
+                            "initiative_id": it["id"],
+                            "tasks_done": len(kids),
+                            "commit_sha": head_sha,
+                            "completed_at": iso_now,
+                        },
+                    )
+            except OSError as e:
+                _log(f"roadmap: archive write failed for {it['id']}: {e}")
             continue
-        # Triggered. Compute the git SHA once per state build.
-        if not head_sha_attempted:
-            head_sha_attempted = True
-            head_sha = _git_head_sha(paths.root)
-        new_fields = {
-            "status": "done",
-            "completed_at": iso_now,
-        }
-        if head_sha:
-            new_fields["commit_sha"] = head_sha
-        try:
-            fp = paths.root / it["path"]
-            if _patch_frontmatter(fp, new_fields):
-                # Reflect into the in-memory dict so this /state response
-                # already shows the archive — the cockpit doesn't have to
-                # poll again to see the transition.
-                it["status"] = "done"
-                it["completed_at"] = iso_now
-                if head_sha:
-                    it["commit_sha"] = head_sha
-                _log(
-                    f"roadmap: auto-archived initiative {it['id']} "
-                    f"({len(kids)} tasks done, commit={head_sha or 'none'})"
-                )
-                _debug_emit(
-                    "init-archive",
-                    msg=f"initiative {it['id']} auto-archived",
-                    data={
-                        "initiative_id": it["id"],
-                        "tasks_done": len(kids),
-                        "commit_sha": head_sha,
-                        "completed_at": iso_now,
-                    },
-                )
-        except OSError as e:
-            _log(f"roadmap: archive write failed for {it['id']}: {e}")
+
+        # ── Backward path (py-1.12.4): done → active when partial ───
+        if status == "done" and not all_done:
+            pending = [
+                k.get("id") for k in kids
+                if normalize_status(k.get("status")) != "done"
+            ]
+            new_fields = {"status": "active"}
+            # Wipe the completion markers — they're lying.
+            for stale in ("completed_at", "commit_sha"):
+                if it.get(stale):
+                    new_fields[stale] = None  # _patch_frontmatter removes nulls
+            try:
+                fp = paths.root / it["path"]
+                if _patch_frontmatter(fp, new_fields):
+                    it["status"] = "active"
+                    it.pop("completed_at", None)
+                    it.pop("commit_sha", None)
+                    _log(
+                        f"roadmap: REVERTED initiative {it['id']} from done → active "
+                        f"({len(pending)} task(s) still pending: {pending[:5]}"
+                        f"{', …' if len(pending) > 5 else ''})"
+                    )
+                    _debug_emit(
+                        "init-archive.reverted",
+                        msg=f"initiative {it['id']} reverted: pending tasks remain",
+                        lvl="warn",
+                        data={
+                            "initiative_id": it["id"],
+                            "pending_task_ids": pending,
+                            "total_tasks": len(kids),
+                        },
+                    )
+            except OSError as e:
+                _log(f"roadmap: revert write failed for {it['id']}: {e}")
 
 
 def _git_head_sha(root: "Path") -> Optional[str]:
@@ -1298,11 +1355,17 @@ def _git_head_sha(root: "Path") -> Optional[str]:
     return None
 
 
-def _patch_frontmatter(fp: "Path", patch: Dict[str, str]) -> bool:
+def _patch_frontmatter(fp: "Path", patch: Dict[str, Any]) -> bool:
     """Idempotent frontmatter merge. Writes only the fields in `patch`
     that differ from current. Preserves field order: known fields keep
-    their position, new fields append in `patch` order. Returns True
-    iff the file was actually rewritten."""
+    their position, new fields append in `patch` order.
+
+    py-1.12.4 — a `None` value in the patch REMOVES that key from the
+    frontmatter (used by the bidirectional reconcile to wipe stale
+    `completed_at` / `commit_sha` when a partially-done initiative is
+    reverted from done → active).
+
+    Returns True iff the file was actually rewritten."""
     text = fp.read_text(errors="replace")
     m = _FM_RE.match(text)
     if not m:
@@ -1310,34 +1373,39 @@ def _patch_frontmatter(fp: "Path", patch: Dict[str, str]) -> bool:
         return False
     fm_block = m.group(1)
     rest = text[m.end() :]
-    # Parse current to compare values; we keep the original lines to
-    # preserve formatting (quotes, lists) on untouched fields.
     current = parse_simple_yaml(fm_block)
+    # Detect any actual change. A None patch entry counts as a change
+    # iff the key currently exists.
     changed = False
     for k, v in patch.items():
-        if str(current.get(k) or "") != str(v):
-            changed = True
-            break
+        if v is None:
+            if k in current and current.get(k) not in (None, ""):
+                changed = True
+                break
+        else:
+            if str(current.get(k) or "") != str(v):
+                changed = True
+                break
     if not changed:
         return False
-    # Rewrite: keep existing lines for unchanged keys, replace the
-    # `key: ...` line in-place for changed keys, append new keys at
-    # the end of the FM block.
     lines = fm_block.splitlines()
     handled: set[str] = set()
     new_lines: List[str] = []
     for line in lines:
-        # Match `key: value` (top-level, no leading whitespace).
         if ":" in line and not line.startswith((" ", "\t", "-", "#")):
             key = line.split(":", 1)[0].strip()
             if key in patch:
-                new_lines.append(f"{key}: {patch[key]}")
                 handled.add(key)
+                if patch[key] is None:
+                    # Skip the line — that's the removal.
+                    continue
+                new_lines.append(f"{key}: {patch[key]}")
                 continue
         new_lines.append(line)
     for k, v in patch.items():
-        if k not in handled:
-            new_lines.append(f"{k}: {v}")
+        if k in handled or v is None:
+            continue
+        new_lines.append(f"{k}: {v}")
     new_fm = "\n".join(new_lines)
     if not new_fm.endswith("\n"):
         new_fm += "\n"
@@ -1494,6 +1562,84 @@ def _find_claude() -> Optional[str]:
 
 
 _RUNNER_PLATFORMS = frozenset({"claude-code", "cursor"})
+
+# py-1.12.6 — All platforms that support /auth/<platform>/start.
+# Includes LLM runners AND deploy tools (wrangler, gh, fly, vercel).
+_AUTH_PLATFORMS: Dict[str, Dict[str, Any]] = {
+    # LLM runners
+    "cursor": {
+        "login_cmd": None,     # built dynamically in runner_auth_start
+        "check_cmd": None,     # built dynamically in _runner_auth_check
+        "auth_keywords": ["authentication required", "auth required", "not logged in"],
+    },
+    "claude-code": {
+        "login_cmd": None,
+        "check_cmd": None,
+        "auth_keywords": ["authentication required", "please run claude login", "not logged in"],
+    },
+    # Deploy tools
+    "wrangler": {
+        "login_cmd": ["npx", "--yes", "wrangler", "login"],
+        "check_cmd": ["npx", "wrangler", "whoami"],
+        "auth_keywords": [
+            "not authenticated",
+            "please run `wrangler login`",
+            "run wrangler login",
+            "wrangler login",
+            "cloudflare_api_token",
+        ],
+    },
+    "gh": {
+        "login_cmd": ["gh", "auth", "login"],
+        "check_cmd": ["gh", "auth", "status"],
+        "auth_keywords": [
+            "not logged in",
+            "run gh auth login",
+            "gh auth login",
+            "authentication required",
+            "you are not logged into",
+        ],
+    },
+    "fly": {
+        "login_cmd": ["fly", "auth", "login"],
+        "check_cmd": ["fly", "auth", "whoami"],
+        "auth_keywords": [
+            "error: not logged in",
+            "fly auth login",
+            "you need to sign in",
+            "authentication token",
+        ],
+    },
+    "vercel": {
+        "login_cmd": ["vercel", "login"],
+        "check_cmd": ["vercel", "whoami"],
+        "auth_keywords": [
+            "not authenticated",
+            "vercel login",
+            "run vercel login",
+            "you need to log in",
+        ],
+    },
+}
+
+# Keyword → platform mapping for auto-detection in agent output
+_AUTH_KEYWORD_TO_PLATFORM: List[tuple] = [
+    (kw, plat)
+    for plat, cfg in _AUTH_PLATFORMS.items()
+    for kw in cfg["auth_keywords"]
+]
+
+
+def _detect_auth_needed_in_text(text: str) -> Optional[str]:
+    """Scan agent final text for auth-failure signals. Returns the platform
+    name if a match is found, else None. Case-insensitive."""
+    if not text:
+        return None
+    lower = text.lower()
+    for kw, platform in _AUTH_KEYWORD_TO_PLATFORM:
+        if kw in lower:
+            return platform
+    return None
 
 
 def _find_cursor_agent() -> Optional[str]:
@@ -2265,26 +2411,133 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
         "role": (
             "You are the **deploy** agent. Your job is shipping this "
             "cluster's code to its runtime targets (Cloudflare Pages, "
-            "Workers, R2, custom hosts) and keeping the build / CI / "
-            "credentials story healthy."
+            "Workers, R2, Fly.io, Vercel, custom hosts) and keeping the "
+            "build / CI / credentials story healthy."
         ),
         "focus": (
-            "## Your focus\n\n"
-            "- Build & deploy commands (wrangler, npm, custom scripts).\n"
-            "- Git hygiene before deploy: refuse to deploy uncommitted "
-            "changes silently — surface them and ask what to do.\n"
-            "- Credentials & auth: know **where** they live "
-            "(`.meshkore/credentials/`), never read/print/leak them, "
-            "never commit them. If a deploy fails on auth, surface the "
-            "missing token name and ask the operator to provide it.\n"
-            "- Version bumps: use `POST /version/next` to pick the next "
-            "version; never invent a number.\n"
+            "## Step 0 — Read the project playbook BEFORE touching anything\n\n"
+            "Every cluster carries its own deploy contract. Read in this "
+            "order:\n"
+            "1. `.meshkore/links.yaml` — canonical mapping of module → "
+            "`local`/`prod`/`repo`. The `prod.url`, `prod.provider`, "
+            "`prod.project`, `prod.region`, `prod.deploy_command`, "
+            "`prod.deployed_version`, `prod.deployed_sha` fields are how "
+            "the cluster talks to YOU. The `deploy_command` is the exact "
+            "shell line to run; do NOT improvise.\n"
+            "2. `.meshkore/modules/<module>/README.md` — module-specific "
+            "deploy notes, smoke procedure, gotchas.\n"
+            "3. `.meshkore/credentials/` — list filenames only, never read "
+            "values. The name tells you which token to expect (e.g. "
+            "`cloudflare-token`, `fly-token`, `vercel-token`). Wrangler "
+            "and similar CLIs read these directly when symlinked from the "
+            "right location — don't `cat` them into env vars by hand.\n"
+            "4. `.meshkore/docs/conventions/` for cross-project standards.\n\n"
+            "If links.yaml has no entry for the module you're deploying, "
+            "STOP and ask the operator to populate it. Don't guess targets.\n\n"
+            "## Step 1 — Pre-flight\n\n"
+            "- Git hygiene: refuse to deploy with uncommitted changes. "
+            "Surface them, ask what to do.\n"
+            "- Build first, deploy second. If the build emits ANY error "
+            "(non-zero exit, webpack UnhandledScheme, type error, missing "
+            "module) STOP. Do NOT proceed to deploy. Report the build "
+            "error verbatim and end the turn.\n"
+            "- Version bumps via `POST /version/next` (never invent).\n\n"
+            "## Step 2 — Deploy\n\n"
+            "Run the EXACT `prod.deploy_command` from links.yaml. Capture "
+            "stdout + stderr + exit code. If exit ≠ 0: STOP, report failure.\n\n"
+            "## Step 3 — Post-deploy verification (MANDATORY)\n\n"
+            "A deploy isn't done until you've **confirmed the new version "
+            "is live**. Saying \"✓ deploy done\" without verification is "
+            "a bug. Verify by AT LEAST ONE of:\n"
+            "- **Provider CLI**: e.g. `wrangler deployments list` "
+            "(Cloudflare Workers), `wrangler pages deployment list "
+            "<project>` (Pages), `flyctl releases` (Fly), `vercel ls` "
+            "(Vercel). Confirm the newest deployment timestamp is within "
+            "the last ~2 min AND its commit/sha matches what you just "
+            "shipped.\n"
+            "- **HTTP curl** against `prod.url`: hit it, verify response "
+            "200 + verify the served version (look for a version "
+            "header, a build-id meta tag, a `/healthz` JSON, a "
+            "`/version` endpoint — whatever the module exposes per its "
+            "README). If the served version still matches the OLD "
+            "`prod.deployed_version` recorded in links.yaml, the deploy "
+            "did NOT propagate — report it.\n"
+            "- **Smoke endpoints**: if the module has a `prod.health` "
+            "URL or a smoke script (`scripts/smoke.sh`), run it and "
+            "include its output in your reply.\n\n"
+            "Record what you verified, what you found, and the new "
+            "`prod.deployed_sha` + `prod.deployed_at` in links.yaml via "
+            "`PATCH /links/<module>`.\n\n"
+            "## Step 4 — Honest reporting\n\n"
+            "Your final reply MUST follow one of these shapes — never mix "
+            "a green checkmark with a partial result:\n\n"
+            "**Full success** (every step including verification green):\n"
+            "```\n"
+            "✓ task <id> done. files: <N>. commit: <sha>.\n"
+            "deploy: <module> → <provider>. verified: <method + evidence>.\n"
+            "```\n\n"
+            "**Partial / failed** (ANY component below 100% green):\n"
+            "```\n"
+            "✗ task <id> deploy-incomplete. files: <N>. commit: <sha>.\n"
+            "components:\n"
+            "  <module-a>: deployed + verified (sha <X>)\n"
+            "  <module-b>: build-failed (error: <verbatim>)\n"
+            "  <module-c>: deployed but verification mismatch (served <Y> "
+            "vs expected <X>)\n"
+            "smoke: <endpoint> → <code>\n"
+            "blockers: <what the operator needs to fix>\n"
+            "```\n\n"
+            "Mixing a top-line \"✓ deploy done\" with a `partial-pass` "
+            "smoke or a `web-build-failed` component is the operator's "
+            "single biggest pain point — they trust the checkmark, the "
+            "site doesn't update, and the bug stays open. NEVER do this. "
+            "If any component failed, the first character of your reply "
+            "is `✗`, not `✓`.\n\n"
+            "## Other rules\n\n"
             "- After every successful deploy, append a 1-line entry to "
-            "`.meshkore/log/<UTC-date>.md` recording target + version + "
-            "commit SHA + URL.\n"
-            "- Coordinate with the general coder when the deploy uncovers "
-            "code changes needed (e.g. broken build) — flag it, don't fix "
-            "it yourself unless the operator OKs."
+            "`.meshkore/log/<UTC-date>.md`: target + new version + "
+            "commit SHA + URL + verification method.\n"
+            "## Boundary — what you fix vs what you escalate\n\n"
+            "**You ARE authorised to edit (and commit):**\n"
+            "  • `wrangler.toml`, `fly.toml`, `vercel.json`, `netlify.toml`, "
+            "Dockerfile, infra-only YAMLs\n"
+            "  • `.meshkore/links.yaml` (record deployed_sha, deployed_at)\n"
+            "  • `.github/workflows/*.yml` deploy steps\n"
+            "  • `scripts/deploy.sh`, `scripts/smoke.sh`, `scripts/dns-*.sh`\n"
+            "  • module READMEs to document deploy quirks you discovered\n"
+            "  • Environment variable wiring in the deploy config (NOT the app)\n\n"
+            "**You are NOT authorised to edit (escalate to the architect):**\n"
+            "  • Anything under `apps/*/src/`, `packages/*/src/`, `src/`, "
+            "`app/`, business-logic dirs\n"
+            "  • Import statements in app code (even when they're the "
+            "actual cause of the build failure)\n"
+            "  • Type definitions, schemas, routes, components, business "
+            "rules\n"
+            "  • Any `*.test.*` / `*.spec.*` files (testing agent's "
+            "territory)\n"
+            "  • Database migrations (db agent's territory)\n\n"
+            "**Escalation format** — when your deploy fails due to app "
+            "source you can't touch, end your turn with:\n"
+            "```\n"
+            "✗ task <id> deploy-blocked-on-code-fix. commit: none.\n"
+            "components:\n"
+            "  <module>: build-failed\n"
+            "blockers:\n"
+            "  apps/web/app/about/roadmap/page.tsx imports `node:fs` at "
+            "module scope but declares `runtime = \"edge\"` — webpack "
+            "UnhandledSchemeError. Needs refactor to a build-time data "
+            "module OR drop the edge runtime export. File is in app "
+            "source, out of my boundary. Architect: please dispatch a "
+            "custom coder.\n"
+            "```\n"
+            "The architect's DECISION MATRIX has a dedicated row for "
+            "this; it will dispatch a custom coder + re-dispatch you "
+            "once the fix lands. Don't try to fix it yourself — you'll "
+            "break the boundary and confuse the testing agent later.\n\n"
+            "- Stub-gating is allowed (deploy ships in `console`/`dry-run` "
+            "mode when a credential is absent). When a deploy intentionally "
+            "stubs, report it as `stub-shipped` (not `deployed`) so the "
+            "operator knows real production isn't live yet."
         ),
         "redirect": (
             "If the operator asks you to edit the roadmap, change task "
@@ -2585,6 +2838,9 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "| Tool not installed on host | Write the script anyway. Add to deferred-ops with `install <tool>`. |\n"
             "| Task body references a deleted file | Edit body to point at the current equivalent, OR mark `blocked: stale-spec`. |\n"
             "| Daemon HTTP 5xx on dispatch | Wait 5s, retry once. Still 5xx → `blocked: daemon-dispatch`. |\n"
+            "| **`deploy` agent returned ✗ with build/code error in app source** (broken import, type error, edge-incompat module like `node:fs` at module scope) | Read the agent's `blockers:` list. Dispatch a focused `custom` agent: `task: fix <verbatim error> so deploy can pass. files: <path>. expected outcome: <next build> exits 0.` Wait for its wake. THEN re-dispatch the original deploy task. The deploy agent should NEVER touch app source. |\n"
+            "| **`deploy` agent returned ✗ with infra/config issue it could fix itself** (wrangler.toml typo, missing route, smoke script bug) | The deploy agent should have already fixed in-place per its own prompt. If it didn't, re-dispatch the deploy task with: `task: fix <issue> in deploy config + re-deploy. authorised to edit wrangler.toml / scripts / links.yaml. do NOT edit app source.` |\n"
+            "| **`deploy` agent returned ✓ but post-deploy verification mismatch** (served version ≠ shipped sha) | Re-dispatch the deploy task once with: `task: previous deploy claimed ✓ but curl <prod.url> still serves old sha <X>. Diagnose propagation (CF Pages preview vs main? wrangler cache? wrong project?). Fix or escalate.` If second attempt also fails verification, `blocked: deploy-unverified`. |\n"
             "| Daemon connection reset / `Recv failure` / `Connection refused` | You're hitting the TLS-wrapped loopback over plain HTTP. Re-issue against the `https://daemon.meshkore.com:<port>` Base URL from `## Daemon endpoints` (NOT halt). Only after BOTH schemes fail twice → emit `═══ VALIDATION RED ═══` with the question, never an abort. |\n"
             "| Genuine manual artifact required (faucet, domain registration) | Add to deferred-ops with the exact 1-line action. Move on. |\n\n"
             "## HALT RULE — restated\n\n"
@@ -2749,9 +3005,32 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "on speculative parallel work that may need to be discarded "
             "if an upstream task fails.\n\n"
             "For each active+next initiative, lower-id first:\n\n"
-            "1. Read `.meshkore/roadmap/initiatives/<id>.md` and its tasks.\n"
-            "2. Plan in ONE line: `Plan I12: DEMO1+DEMO3 parallel, DEMO2 sequential after.`\n"
-            "3. Dispatch the first wave (max 3 parallel) via `POST /chat/dispatch`:\n"
+            "1. Read `.meshkore/roadmap/initiatives/<id>.md` and EVERY "
+            "task .md under that initiative. The full frontmatter "
+            "matters — not just the title. Pay attention to:\n"
+            "   • `phase:` — operator's stage marker. The standard "
+            "order is **foundation → build → test → ship**. NEVER "
+            "dispatch a build task before its foundation deps are "
+            "done; NEVER dispatch ship before test passes. Tasks "
+            "without a `phase:` field default to `build`.\n"
+            "   • `depends_on:` — explicit upstream task ids. The "
+            "daemon's Invariant 6 will refuse 409 if you dispatch a "
+            "task whose `depends_on:` upstreams aren't `done` yet; "
+            "save the round-trip, check it yourself first.\n"
+            "   • `modules:` — for tasks SHARING the same module "
+            "you should prefer sequential dispatch to avoid git "
+            "races on shared files. Different modules → safe in "
+            "parallel.\n"
+            "2. Plan in ONE line with reasoning. Examples:\n"
+            "   • `Plan I7: FOUNDATION(DEP4 alone — D1 schema blocks BUILD); then BUILD wave (DEP1+DEP2+DEP3 parallel, different modules); DEP5 after DEP1; DEP6 last; TEST(DEP8); SHIP(DEP7).`\n"
+            "   • `Plan I12: DEMO1+DEMO3 parallel (independent), DEMO2 sequential after DEMO1.`\n"
+            "   The plan must NAME the phase order, NAME the parallel "
+            "groups, and NAME the sequential constraints. If a task "
+            "has `depends_on:` referencing an undone task, that's a "
+            "sequential constraint — surface it in the plan.\n"
+            "3. Dispatch the first wave (max 3 parallel) via `POST /chat/dispatch`. "
+            "First wave = the EARLIEST tasks in the phase order whose "
+            "`depends_on:` is already satisfied, capped at 3:\n"
             "```json\n"
             "{\n"
             '  "conv": "work-<initiative-id>-<task-id>-<stamp>",\n'
@@ -2805,10 +3084,35 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "\n"
             "     Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n"
             "4. DO NOT push. Local commit only.\n"
-            "5. Reply: `✓ task <id> done. files: <N>. commit: <short-sha>. <1-line summary>.`\n"
+            "5. **VERIFY** before claiming done:\n"
+            "     • code task → confirm `npm run build` / `tsc --noEmit` / "
+            "       equivalent exits 0. Don't assume.\n"
+            "     • deploy task → run the post-deploy verification "
+            "       described in your role prompt (provider CLI or curl "
+            "       against `prod.url` from `.meshkore/links.yaml`). "
+            "       Confirm the served version matches what you shipped.\n"
+            "     • db task → run a read-back query (`SELECT … FROM "
+            "       _migrations` etc.) to confirm the migration landed.\n"
+            "     • testing task → actually execute the tests and "
+            "       report the pass/fail count.\n"
+            "6. **HONEST REPORTING.** First character of your final reply:\n"
+            "     • `✓` ONLY if EVERY step above passed cleanly. Format:\n"
+            "         `✓ task <id> done. files: <N>. commit: <sha>. <verification result>.`\n"
+            "     • `✗` if ANY step (build, deploy, verify) failed or "
+            "       partially failed. Format:\n"
+            "         `✗ task <id> <kind>. files: <N>. commit: <sha or none>.`\n"
+            "         `  <one component per line: name → status + verbatim error>`\n"
+            "         `  blockers: <what the operator must fix>`\n"
+            "       NEVER mix `✓` with a `partial-pass` / `stub-skipped` / "
+            "       `build-failed` component buried in the body. The "
+            "       architect (and the operator) parse the FIRST CHAR. "
+            "       Lying with a `✓` while smoke is failing leaves bugs "
+            "       hidden for hours.\n"
             "```\n\n"
             "Sub-agent finishes without committing → dispatch a `chore` "
-            "follow-up. Uncommitted work is unfinished work.\n\n"
+            "follow-up. Uncommitted work is unfinished work. Sub-agent "
+            "ships `✗` → bump the task fail counter, run the matrix "
+            "rule, never re-dispatch the same retry blindly.\n\n"
             "## DOC CADENCE — after every initiative transition\n\n"
             "YOU (the architect) append to `.meshkore/log/<UTC-date>.md`:\n\n"
             "```\n"
@@ -2882,7 +3186,16 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "- Dispatch + cancel sub-agents.\n"
             "- Dispatch to `_onboarding_v1` with `[architect-consult]` prefix → A001 decides.\n"
             "- Mark a task `status: done`, `status: blocked`, `status: pending-operator` in frontmatter.\n"
-            "- Set initiative `status: done` when 100% shipped (stubs count as shipped).\n"
+            "- Set initiative `status: done` ONLY when **every** child "
+            "task's frontmatter is `status: done`. Stubs count as shipped, "
+            "but the stub task itself MUST be `status: done` first — a "
+            "stub that hasn't even been written + committed is still "
+            "`active`. If ANY task is `active|next|blocked|in_progress|"
+            "backlog`, the initiative is NOT done; leave it `active`. "
+            "py-1.12.4 — the daemon now re-checks on every `/state` build "
+            "and REVERTS `status: done → active` (wiping `completed_at` "
+            "+ `commit_sha`) if any task is still pending. Save us both "
+            "the round-trip: don't write the lie.\n"
             "- Apply DECISION CATALOG defaults silently.\n"
             "- Apply STUB-AND-FEATURE-FLAG to any external dependency.\n"
             "- Lightly edit a task body to add an `# architect: assumption` note or salvage a broken spec.\n"
@@ -3566,6 +3879,7 @@ class ChatRunner:
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
+        self._stderr_lines: List[str] = []
         # py-1.10.16 — Back-reference for the architect-wake hook
         # (initiative `architect-wake-on-subagent`). When the
         # subprocess emits `chat.assistant.final`, the runner calls
@@ -3634,6 +3948,7 @@ class ChatRunner:
                 model=manifest.get("model"),
             )
         else:
+            # py-1.6.1 HOTFIX — --session-id opt-in via MESHKORE_CLAUDE_SESSION_ID.
             args = [
                 runner_bin,
                 "-p",
@@ -3718,10 +4033,10 @@ class ChatRunner:
         threading.Thread(target=self._stderr_drain, daemon=True).start()
 
     def _stderr_drain(self) -> None:
-        """Read self.proc.stderr line-by-line and forward to the
-        daemon log. Tagged with conv so multiple in-flight runners
-        don't blur together. Cheap — claude rarely emits much on
-        stderr unless it's failing."""
+        """Read self.proc.stderr line-by-line, forward to daemon log,
+        and accumulate into self._stderr_lines so _reader_loop can
+        surface it as a chat error when the runner exits non-zero with
+        no stdout (e.g. cursor-agent auth failure)."""
         if not self.proc or not self.proc.stderr:
             return
         for raw in self.proc.stderr:
@@ -3731,6 +4046,7 @@ class ChatRunner:
                 continue
             if line:
                 _log(f"runner({self.conv}) stderr: {line}")
+                self._stderr_lines.append(line)
 
     def cancel(self) -> None:
         if self.cancelled:
@@ -3837,6 +4153,7 @@ class ChatRunner:
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
                 continue
+            # Cursor agent stream-json — direct text deltas
             if ev_type in ("text", "text_delta", "assistant_text_delta"):
                 delta = str(ev.get("text") or ev.get("delta") or "")
                 if delta:
@@ -3901,6 +4218,20 @@ class ChatRunner:
                 },
             )
         )
+        # py-1.12.6 — scan the agent's final text for deploy-tool auth
+        # failures (wrangler, gh, fly, vercel). When found, emit
+        # runner.auth.required so the cockpit shows the auth card even
+        # though we don't own the tool's process (the LLM ran it).
+        if cleaned_text:
+            detected_platform = _detect_auth_needed_in_text(cleaned_text)
+            if detected_platform and detected_platform not in (self.runner_platform,):
+                _log(f"runner-auth: auto-detected auth needed for {detected_platform} from agent output")
+                self.hub.broadcast({
+                    "type": "runner.auth.required",
+                    "platform": detected_platform,
+                    "conv": self.conv,
+                    "ts": _iso_now(),
+                })
         # py-1.10.4 — surface the exit code in the daemon log so a
         # silent claude failure (empty stdout, no final, etc.) can
         # be traced back to e.g. "exited 1 with stderr 'context
@@ -3908,6 +4239,41 @@ class ChatRunner:
         # looked identical regardless of whether claude crashed,
         # blocked on a tool, or genuinely had nothing to say.
         exit_code = self.proc.wait() if self.proc else None
+        # py-1.12.5 — If the runner exited non-zero with no output at all
+        # (e.g. cursor-agent "Authentication required", or binary crash),
+        # surface the captured stderr as the chat final so the operator
+        # can see what went wrong directly in the cockpit instead of
+        # hunting the daemon log.
+        if not cleaned_text and exit_code not in (None, 0) and self._stderr_lines:
+            stderr_snippet = "\n".join(self._stderr_lines[:20])
+            needs_auth = "authentication" in stderr_snippet.lower() or "auth" in stderr_snippet.lower()
+            cleaned_text = (
+                f"[runner error — {self.runner_platform} exited {exit_code}]\n\n"
+                f"```\n{stderr_snippet}\n```"
+            )
+            if needs_auth:
+                cleaned_text += (
+                    f"\n\n**{self.runner_platform} necesita autenticación.** "
+                    "Usa el botón de autenticación que aparece abajo."
+                )
+                self.hub.broadcast({
+                    "type": "runner.auth.required",
+                    "platform": self.runner_platform,
+                    "conv": self.conv,
+                    "ts": _iso_now(),
+                })
+            self.hub.broadcast(
+                _append_timeline(
+                    self.paths,
+                    {
+                        "type": "chat.assistant.final",
+                        "author": self.identity,
+                        "conv": self.conv,
+                        "stream_id": self.stream_id,
+                        "text": cleaned_text,
+                    },
+                )
+            )
         text_len = len(cleaned_text or "")
         _log(
             f"runner({self.conv}) platform={self.runner_platform} exit={exit_code} "
@@ -5693,6 +6059,20 @@ def make_handler(daemon: "Daemon"):
                 )
                 return self._json(code, resp)
 
+            # py-1.12.5 — Runner auth: POST /auth/<platform>/start
+            # Spawns `cursor-agent login` (or `claude login`) on the local
+            # machine so the OS opens the browser for OAuth. The daemon
+            # then polls every 3 s to detect when auth succeeds and
+            # broadcasts `runner.auth.completed` on the WS.
+            if p.startswith("/auth/") and p.endswith("/start"):
+                platform = p[len("/auth/") : -len("/start")].strip("/")
+                if platform not in _AUTH_PLATFORMS:
+                    return self._json(
+                        400, {"error": f"unknown platform '{platform}'", "known": list(_AUTH_PLATFORMS)}
+                    )
+                ok, msg = daemon.runner_auth_start(platform)
+                return self._json(200 if ok else 500, {"ok": ok, "platform": platform, "msg": msg})
+
             return self._json(404, {"error": "not found", "path": p})
 
         def do_PUT(self):  # noqa: N802
@@ -6169,6 +6549,217 @@ class QuotaProber:
             if _agent_manifest(t)["quota_key"] == quota_key:
                 return t
         return "custom"
+
+
+# ───────────────────────────────────────────────────────────────────────
+# VersionWatcher (py-1.12.1)
+#
+# Background thread that periodically polls the CDN for newer
+# daemon.py versions and self-invokes /self-update when the cluster
+# is idle. Designed for fleet operation: an operator with 100 clients
+# shouldn't need to log into each one to push an upgrade — the
+# daemon sees the new version on CDN and rolls itself forward.
+#
+# Coexists with the BOOT self-update (`_boot_self_update_if_needed`)
+# which only fires when the daemon starts. Long-running daemons (days
+# of uptime, no restart) would never upgrade without this thread.
+#
+# Behavior
+# ────────
+#   • Tick interval: `cluster.yaml.daemon.auto_update_check_interval_sec`
+#     (default 1800 = 30 min). Clamped 60-86400.
+#   • Skips entirely when `cluster.yaml.daemon.auto_update: false`.
+#   • Each tick:
+#       1. Fetch the first ~1 KB of `auto_update_source` to read its
+#          DAEMON_VERSION line. Cheap — single Range request.
+#       2. Parse local + remote versions. If remote ≤ local, sleep.
+#       3. If `chat_sessions.list_active()` non-empty → defer (log
+#          "deferred until idle", emit `daemon.upgrade.deferred` WS).
+#       4. Otherwise call `self.daemon.self_update({})` directly. The
+#          method spawns the new daemon on a fresh port and schedules
+#          this process's shutdown. Cockpits reconnect via the daemon
+#          dedup-by-cluster_id path.
+#   • Cooldown: 5 min after any attempt (successful or not) to avoid
+#     hammering a misconfigured CDN or looping if the upgrade fails.
+
+
+class VersionWatcher:
+    """py-1.12.1 — Periodic CDN poll + idle-aware self-update for the
+    long-uptime case. See module-level docstring above."""
+
+    DEFAULT_TICK_SECS = 1800  # 30 min
+    MIN_TICK_SECS = 60
+    MAX_TICK_SECS = 86400
+    COOLDOWN_AFTER_ATTEMPT_SECS = 300  # 5 min between attempts
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self.daemon = daemon
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._last_attempt_ts: float = 0.0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        _log(f"version-watcher: started (tick={self._tick_secs()}s)")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _tick_secs(self) -> int:
+        try:
+            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            raw = (d or {}).get("auto_update_check_interval_sec")
+            if raw is None:
+                return self.DEFAULT_TICK_SECS
+            n = int(raw)
+            return max(self.MIN_TICK_SECS, min(self.MAX_TICK_SECS, n))
+        except Exception:
+            return self.DEFAULT_TICK_SECS
+
+    def _enabled(self) -> bool:
+        try:
+            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            return bool((d or {}).get("auto_update", True))
+        except Exception:
+            return True
+
+    def _source_url(self) -> str:
+        try:
+            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            u = (d or {}).get("auto_update_source")
+            if isinstance(u, str) and u.strip():
+                return u.strip()
+        except Exception:
+            pass
+        return "https://meshkore.com/reference/cluster/scripts/daemon.py"
+
+    def _loop(self) -> None:
+        # Initial small grace so we don't fight the boot self-update if
+        # both happen to fire on the same first second.
+        if self._stop.wait(60):
+            return
+        while True:
+            try:
+                if self._enabled():
+                    self._check_once()
+            except Exception as e:
+                _log(f"version-watcher: tick raised: {e}")
+            if self._stop.wait(self._tick_secs()):
+                return
+
+    def _check_once(self) -> None:
+        # Cooldown gate.
+        now = time.time()
+        if now - self._last_attempt_ts < self.COOLDOWN_AFTER_ATTEMPT_SECS:
+            return
+        remote = self._fetch_remote_version()
+        if not remote:
+            return
+        if not _is_remote_newer(local=DAEMON_VERSION, remote=remote):
+            return
+        # An upgrade is available. Are we idle?
+        active = self.daemon.chat_sessions.list_active()
+        if active:
+            _log(
+                f"version-watcher: upgrade {DAEMON_VERSION} → {remote} available "
+                f"but {len(active)} chat session(s) live — deferring"
+            )
+            _debug_emit(
+                "version-watcher.deferred",
+                msg=f"upgrade {DAEMON_VERSION} → {remote} deferred ({len(active)} live)",
+                lvl="info",
+                data={"local": DAEMON_VERSION, "remote": remote, "live_convs": active},
+            )
+            try:
+                self.daemon.hub.broadcast({
+                    "type": "daemon.upgrade.deferred",
+                    "local": DAEMON_VERSION,
+                    "remote": remote,
+                    "live_convs": active,
+                    "ts": _iso_now(),
+                })
+            except Exception:
+                pass
+            return
+        # Idle — call self_update directly. It re-checks the active set
+        # so even if something raced into flight between the check above
+        # and the swap, we get a clean 409 (no kill).
+        self._last_attempt_ts = now
+        _log(f"version-watcher: triggering self_update ({DAEMON_VERSION} → {remote})")
+        _debug_emit(
+            "version-watcher.upgrade.start",
+            msg=f"auto self-update {DAEMON_VERSION} → {remote}",
+            lvl="info",
+            data={"local": DAEMON_VERSION, "remote": remote},
+        )
+        try:
+            self.daemon.hub.broadcast({
+                "type": "daemon.upgrade.starting",
+                "local": DAEMON_VERSION,
+                "remote": remote,
+                "ts": _iso_now(),
+            })
+        except Exception:
+            pass
+        try:
+            code, resp = self.daemon.self_update({})
+            if code >= 400:
+                _log(f"version-watcher: self_update returned {code}: {resp}")
+                _debug_emit(
+                    "version-watcher.upgrade.failed",
+                    msg=f"self_update returned {code}",
+                    lvl="warn",
+                    data={"code": code, "resp": resp},
+                )
+        except Exception as e:
+            _log(f"version-watcher: self_update raised: {e}")
+
+    # The DAEMON_VERSION line lives ~line 69 of the canonical file —
+    # past the module docstring + imports. 8 KB is enough to catch it
+    # with room to spare; still <0.1% of the full ~400 KB daemon.py.
+    _FETCH_BYTES = 8192
+
+    def _fetch_remote_version(self) -> Optional[str]:
+        """HTTP Range-request the head of the source URL and parse the
+        DAEMON_VERSION line. Returns None on any failure (network,
+        non-200, missing version marker)."""
+        url = self._source_url()
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": f"meshcore-py/{DAEMON_VERSION} version-watcher",
+                    "Range": f"bytes=0-{self._FETCH_BYTES - 1}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                head = r.read(self._FETCH_BYTES).decode("utf-8", errors="replace")
+        except Exception as e:
+            _log(f"version-watcher: fetch failed {url}: {e}")
+            return None
+        m = re.search(r'^DAEMON_VERSION\s*=\s*"([^"]+)"', head, re.MULTILINE)
+        if not m:
+            return None
+        return m.group(1).strip()
+
+
+def _is_remote_newer(local: str, remote: str) -> bool:
+    """Compare two `py-X.Y.Z` strings. Tolerates suffixes like
+    `py-1.12.1-hotfix` — strips after the first non-numeric/dot char
+    in the version body for comparison purposes."""
+    def _tuple(v: str) -> Tuple[int, ...]:
+        body = v[len("py-"):] if v.startswith("py-") else v
+        # Stop at the first char that isn't digit or dot.
+        clean = re.split(r"[^0-9.]", body, 1)[0]
+        return tuple(int(p) for p in clean.split(".") if p.isdigit())
+    try:
+        return _tuple(remote) > _tuple(local)
+    except Exception:
+        return False
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -8625,6 +9216,12 @@ class Daemon:
         # Initiative `quota-aware-dispatch`.
         self.quota_prober = QuotaProber(self)
         self.quota_prober.start()
+        # py-1.12.1 — Periodic CDN poll + idle-aware self-update. Honors
+        # cluster.yaml.daemon.auto_update (opt-out) and
+        # auto_update_check_interval_sec (default 30 min). Keeps fleets
+        # of long-running daemons current without operator action.
+        self.version_watcher = VersionWatcher(self)
+        self.version_watcher.start()
         try:
             self.server.serve_forever(poll_interval=0.5)
         finally:
@@ -8638,6 +9235,140 @@ class Daemon:
             except Exception:
                 pass
             self.cleanup()
+
+    # py-1.12.5 — Runner auth flow ──────────────────────────────────────
+    # POST /auth/<platform>/start → spawns the CLI login command so the OS
+    # opens the browser. We then poll every 3 s; on success we broadcast
+    # `runner.auth.completed` and stop polling.
+
+    _auth_poller_running: Dict[str, bool] = {}
+    _login_procs: Dict[str, Any] = {}   # platform → Popen (for process-exit check)
+
+    def runner_auth_start(self, platform: str) -> Tuple[bool, str]:
+        import subprocess as _sp
+
+        if platform not in _AUTH_PLATFORMS:
+            return False, f"unknown platform '{platform}'"
+
+        env = {**os.environ, "PATH": _runner_path_env()}
+
+        # Build login command
+        cfg = _AUTH_PLATFORMS[platform]
+        if cfg["login_cmd"] is not None:
+            cmd = list(cfg["login_cmd"])
+        elif platform == "cursor":
+            bin_path = _find_cursor_agent()
+            if not bin_path:
+                return False, "cursor-agent not found — install Cursor"
+            cmd = [bin_path, "agent", "login"] if os.path.basename(bin_path) == "cursor" else [bin_path, "login"]
+        elif platform == "claude-code":
+            bin_path = _find_claude()
+            if not bin_path:
+                return False, "claude CLI not found — run: npm i -g @anthropic-ai/claude-code"
+            cmd = [bin_path, "login"]
+        else:
+            return False, f"no login command for {platform}"
+
+        try:
+            proc = _sp.Popen(
+                cmd,
+                env=env,
+                stdin=_sp.DEVNULL,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                start_new_session=True,
+            )
+            # Keep process reference so _runner_auth_check can poll exit code
+            self._login_procs[platform] = proc
+        except Exception as e:
+            return False, f"failed to spawn {platform} login: {e}"
+
+        _log(f"runner-auth: spawned {platform} login ({' '.join(cmd)})")
+        self.hub.broadcast({
+            "type": "runner.auth.started",
+            "platform": platform,
+            "ts": _iso_now(),
+        })
+
+        if not self._auth_poller_running.get(platform):
+            self._auth_poller_running[platform] = True
+            threading.Thread(
+                target=self._runner_auth_poll,
+                args=(platform,),
+                daemon=True,
+            ).start()
+
+        return True, f"{platform} login launched — browser should open"
+
+    def _runner_auth_check(self, platform: str) -> bool:
+        """Return True if the tool/runner is authenticated.
+
+        For cursor / claude-code we rely on the exit code of the login
+        process (started by runner_auth_start) — when the user approves the
+        OAuth flow the CLI exits 0.  We do NOT launch a full inference job
+        to verify because that is slow, unreliable under timeout, and
+        triggers quota.
+
+        For deploy tools (wrangler, gh, fly, vercel) we run the dedicated
+        `check_cmd` which is fast and purpose-built for auth status.
+        """
+        import subprocess as _sp
+
+        cfg = _AUTH_PLATFORMS.get(platform)
+        if cfg is None:
+            return False
+
+        # ── LLM runners: check whether the login process has exited 0 ──
+        if platform in ("cursor", "claude-code"):
+            proc = self._login_procs.get(platform)
+            if proc is None:
+                return False
+            rc = proc.poll()
+            if rc is None:
+                return False  # login still waiting for browser
+            return rc == 0
+
+        # ── Deploy tools: run the check command ──
+        if cfg.get("check_cmd") is None:
+            return False
+
+        env = {**os.environ, "PATH": _runner_path_env()}
+        try:
+            result = _sp.run(
+                list(cfg["check_cmd"]),
+                env=env,
+                stdin=_sp.DEVNULL,
+                capture_output=True,
+                timeout=15,
+            )
+            combined = (result.stdout + result.stderr).decode("utf-8", "replace").lower()
+            auth_kws = cfg.get("auth_keywords") or ["not authenticated", "not logged in"]
+            return result.returncode == 0 and not any(kw in combined for kw in auth_kws)
+        except Exception:
+            return False
+
+    def _runner_auth_poll(self, platform: str) -> None:
+        """Poll every 3 s until auth succeeds, then broadcast completed."""
+        _log(f"runner-auth: polling {platform} every 3s")
+        for _ in range(60):  # max 3 min
+            if self.stopping.is_set():
+                break
+            time.sleep(3)
+            if self._runner_auth_check(platform):
+                _log(f"runner-auth: {platform} auth confirmed")
+                self.hub.broadcast({
+                    "type": "runner.auth.completed",
+                    "platform": platform,
+                    "ts": _iso_now(),
+                })
+                break
+            else:
+                self.hub.broadcast({
+                    "type": "runner.auth.polling",
+                    "platform": platform,
+                    "ts": _iso_now(),
+                })
+        self._auth_poller_running[platform] = False
 
     def request_shutdown(self) -> None:
         if self.stopping.is_set():
