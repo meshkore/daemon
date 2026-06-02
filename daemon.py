@@ -66,7 +66,8 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.6"  # 1.12.6 — universal auth flow. Extends the runner auth system (py-1.12.5) to cover deploy tools: wrangler, gh, fly, vercel. `POST /auth/<platform>/start` + WS runner.auth.* events now work for all 6 platforms (cursor, claude-code, wrangler, gh, fly, vercel). Daemon also scans the final assistant text for known auth-failure keywords from deploy tools and auto-emits runner.auth.required so the cockpit shows the auth card without requiring the agent to signal it explicitly. py-1.12.5 stderr-surface + polling preserved. cluster.yaml `runners.default` + `runners.fallback` select the headless client (cursor, claude-code). ChatRunner tries each in order until a binary is found; Cursor reads CURSOR_API_KEY from env or `.meshkore/credentials/cursor-api-key`. py-1.12.4 initiative status consistency guard preserved. Operator field report 2026-05-31: "Visual identity v2" appeared in the archived view as DONE with 5/7 tasks done (2 still pending). The auto-archive reconcile was unidirectional (active→done only); the architect could write `status: done` on a partial initiative and nothing reverted it. `_reconcile_initiative_archive` is now BIDIRECTIONAL: forward as before, plus reverse — if frontmatter says `done` but ANY task is not `done`, revert to `active` + wipe `completed_at` + `commit_sha`. `_patch_frontmatter` extended to support `None` value = remove key. Architect prompt rewritten: the "Set initiative status: done" authority line now explicitly forbids the partial-done write + warns about the daemon's re-check.
+DAEMON_VERSION = "py-1.12.8"  # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
+# 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
 # 1.12.2 — agent honesty pass. Two prompt fixes from operator field report 2026-05-31:
 #   (a) `deploy` agent prompt completely rewritten — mandatory read of `.meshkore/links.yaml` + `.meshkore/modules/<id>/README.md` + `.meshkore/credentials/` BEFORE acting; mandatory post-deploy verification via provider CLI OR curl-against-prod.url with version match; explicit "deploy isn't done until verified" rule. Closes the bug where the agent shipped a `partial-pass` smoke + a `web-build-failed` component and still reported `✓ deploy done` on the top line.
@@ -543,31 +544,6 @@ class Cluster:
     def modules(self) -> List[Dict[str, Any]]:
         m = self.data.get("modules") or []
         return m if isinstance(m, list) else []
-
-    @property
-    def runners_config(self) -> Dict[str, Any]:
-        """Headless LLM runner selection from cluster.yaml.
-
-        Supports top-level `runners:` or nested `daemon.runners:`:
-          runners:
-            default: cursor
-            fallback: [claude-code]
-        """
-        runners = self.data.get("runners")
-        if not isinstance(runners, dict):
-            daemon = self.data.get("daemon")
-            if isinstance(daemon, dict):
-                runners = daemon.get("runners")
-        if not isinstance(runners, dict):
-            runners = {}
-        default = str(runners.get("default") or "claude-code").strip()
-        fallback = runners.get("fallback") or []
-        if not isinstance(fallback, list):
-            fallback = []
-        return {
-            "default": default or "claude-code",
-            "fallback": [str(x).strip() for x in fallback if str(x).strip()],
-        }
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1303,8 +1279,7 @@ def _reconcile_initiative_archive(
         # ── Backward path (py-1.12.4): done → active when partial ───
         if status == "done" and not all_done:
             pending = [
-                k.get("id") for k in kids
-                if normalize_status(k.get("status")) != "done"
+                k.get("id") for k in kids if normalize_status(k.get("status")) != "done"
             ]
             new_fields = {"status": "active"}
             # Wipe the completion markers — they're lying.
@@ -1559,179 +1534,6 @@ def _find_claude() -> Optional[str]:
         if hits and os.access(hits[0], os.X_OK):
             return hits[0]
     return None
-
-
-_RUNNER_PLATFORMS = frozenset({"claude-code", "cursor"})
-
-# py-1.12.6 — All platforms that support /auth/<platform>/start.
-# Includes LLM runners AND deploy tools (wrangler, gh, fly, vercel).
-_AUTH_PLATFORMS: Dict[str, Dict[str, Any]] = {
-    # LLM runners
-    "cursor": {
-        "login_cmd": None,     # built dynamically in runner_auth_start
-        "check_cmd": None,     # built dynamically in _runner_auth_check
-        "auth_keywords": ["authentication required", "auth required", "not logged in"],
-    },
-    "claude-code": {
-        "login_cmd": None,
-        "check_cmd": None,
-        "auth_keywords": ["authentication required", "please run claude login", "not logged in"],
-    },
-    # Deploy tools
-    "wrangler": {
-        "login_cmd": ["npx", "--yes", "wrangler", "login"],
-        "check_cmd": ["npx", "wrangler", "whoami"],
-        "auth_keywords": [
-            "not authenticated",
-            "please run `wrangler login`",
-            "run wrangler login",
-            "wrangler login",
-            "cloudflare_api_token",
-        ],
-    },
-    "gh": {
-        "login_cmd": ["gh", "auth", "login"],
-        "check_cmd": ["gh", "auth", "status"],
-        "auth_keywords": [
-            "not logged in",
-            "run gh auth login",
-            "gh auth login",
-            "authentication required",
-            "you are not logged into",
-        ],
-    },
-    "fly": {
-        "login_cmd": ["fly", "auth", "login"],
-        "check_cmd": ["fly", "auth", "whoami"],
-        "auth_keywords": [
-            "error: not logged in",
-            "fly auth login",
-            "you need to sign in",
-            "authentication token",
-        ],
-    },
-    "vercel": {
-        "login_cmd": ["vercel", "login"],
-        "check_cmd": ["vercel", "whoami"],
-        "auth_keywords": [
-            "not authenticated",
-            "vercel login",
-            "run vercel login",
-            "you need to log in",
-        ],
-    },
-}
-
-# Keyword → platform mapping for auto-detection in agent output
-_AUTH_KEYWORD_TO_PLATFORM: List[tuple] = [
-    (kw, plat)
-    for plat, cfg in _AUTH_PLATFORMS.items()
-    for kw in cfg["auth_keywords"]
-]
-
-
-def _detect_auth_needed_in_text(text: str) -> Optional[str]:
-    """Scan agent final text for auth-failure signals. Returns the platform
-    name if a match is found, else None. Case-insensitive."""
-    if not text:
-        return None
-    lower = text.lower()
-    for kw, platform in _AUTH_KEYWORD_TO_PLATFORM:
-        if kw in lower:
-            return platform
-    return None
-
-
-def _find_cursor_agent() -> Optional[str]:
-    """Locate the Cursor headless CLI (`cursor-agent` or `cursor agent`)."""
-    import shutil
-
-    for name in ("cursor-agent", "agent"):
-        found = shutil.which(name)
-        if found:
-            return found
-    candidates = [
-        os.path.expanduser("~/.local/bin/cursor-agent"),
-        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor-agent",
-    ]
-    for path in candidates:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
-
-
-def _find_runner_binary(platform: str) -> Optional[str]:
-    if platform == "cursor":
-        return _find_cursor_agent()
-    if platform == "claude-code":
-        return _find_claude()
-    return None
-
-
-def _load_cursor_api_key(paths: "Paths") -> Optional[str]:
-    key = os.environ.get("CURSOR_API_KEY", "").strip()
-    if key:
-        return key
-    key_file = paths.credentials / "cursor-api-key"
-    if key_file.is_file():
-        return key_file.read_text(errors="replace").strip() or None
-    return None
-
-
-def _runner_path_env() -> str:
-    extra = [
-        os.path.expanduser("~/.local/bin"),
-        "/Applications/Cursor.app/Contents/Resources/app/bin",
-    ]
-    current = os.environ.get("PATH", "")
-    return ":".join(extra + ([current] if current else []))
-
-
-def _resolve_runner_platforms(cluster: "Cluster", agent_type: str) -> List[str]:
-    """Ordered runner platforms to try for one chat turn."""
-    cfg = cluster.runners_config
-    prompt_entry = AGENT_PROMPTS.get(agent_type) or {}
-    primary = (
-        str(prompt_entry["platform"]).strip()
-        if prompt_entry.get("platform")
-        else cfg["default"]
-    )
-    order: List[str] = []
-    for plat in [primary, *cfg["fallback"], "claude-code", "cursor"]:
-        if plat in _RUNNER_PLATFORMS and plat not in order:
-            order.append(plat)
-    return order or ["claude-code"]
-
-
-def _cursor_spawn_argv(
-    bin_path: str, *, workspace: Path, model: Optional[str] = None
-) -> List[str]:
-    flags = [
-        "-p",
-        "--trust",
-        "--force",
-        "--output-format",
-        "stream-json",
-        "--stream-partial-output",
-        "--workspace",
-        str(workspace),
-    ]
-    if model and model != "auto":
-        flags.extend(["--model", model])
-    if os.path.basename(bin_path) == "cursor":
-        return [bin_path, "agent", *flags]
-    return [bin_path, *flags]
-
-
-def _runner_error_message(platforms: List[str]) -> str:
-    tried = ", ".join(platforms)
-    return (
-        f"No LLM runner found (tried: {tried}). "
-        "Cursor: ensure `cursor-agent` is on PATH, run `cursor-agent login`, "
-        "or place your API key in `.meshkore/credentials/cursor-api-key`. "
-        "Claude Code: `npm i -g @anthropic-ai/claude-code`."
-    )
 
 
 def _conversation_history(
@@ -2447,7 +2249,7 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "stdout + stderr + exit code. If exit ≠ 0: STOP, report failure.\n\n"
             "## Step 3 — Post-deploy verification (MANDATORY)\n\n"
             "A deploy isn't done until you've **confirmed the new version "
-            "is live**. Saying \"✓ deploy done\" without verification is "
+            'is live**. Saying "✓ deploy done" without verification is '
             "a bug. Verify by AT LEAST ONE of:\n"
             "- **Provider CLI**: e.g. `wrangler deployments list` "
             "(Cloudflare Workers), `wrangler pages deployment list "
@@ -2487,7 +2289,7 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "smoke: <endpoint> → <code>\n"
             "blockers: <what the operator needs to fix>\n"
             "```\n\n"
-            "Mixing a top-line \"✓ deploy done\" with a `partial-pass` "
+            'Mixing a top-line "✓ deploy done" with a `partial-pass` '
             "smoke or a `web-build-failed` component is the operator's "
             "single biggest pain point — they trust the checkmark, the "
             "site doesn't update, and the bug stays open. NEVER do this. "
@@ -2524,7 +2326,7 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "  <module>: build-failed\n"
             "blockers:\n"
             "  apps/web/app/about/roadmap/page.tsx imports `node:fs` at "
-            "module scope but declares `runtime = \"edge\"` — webpack "
+            'module scope but declares `runtime = "edge"` — webpack '
             "UnhandledSchemeError. Needs refactor to a build-time data "
             "module OR drop the edge runtime export. File is in app "
             "source, out of my boundary. Architect: please dispatch a "
@@ -3077,12 +2879,22 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "When you're done with the task body:\n"
             "1. Run the project's lint/format (npm run lint, ruff check, etc — read package.json / pyproject.toml).\n"
             "2. Stage ONLY the files you touched. Never `git add -A`.\n"
-            "3. Commit with a conventional message:\n"
+            "3. Commit with a conventional message (standard v12):\n"
             "     <type>(<scope>): <imperative title>\n"
             "\n"
             "     <one-line why>\n"
             "\n"
+            "     Agent: <your-agent-type>      # custom, deploy, db, testing, docs, review — your role\n"
+            "     Model: claude-opus-4-7\n"
             "     Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n"
+            "   The `Agent:` + `Model:` trailers are required per the\n"
+            "   MeshKore standard v12 — they let git log / blame /\n"
+            "   analytics tell apart fast probes from heavyweight work\n"
+            "   and survive merges + cherry-picks. Replace the model id\n"
+            "   if you know you're running under a different one; use\n"
+            "   `Model: unknown` rather than omitting if genuinely\n"
+            "   unsure. Full spec at\n"
+            "   https://meshkore.com/standard#91-commit-attribution--agent--model-trailers-v12\n"
             "4. DO NOT push. Local commit only.\n"
             "5. **VERIFY** before claiming done:\n"
             "     • code task → confirm `npm run build` / `tsc --noEmit` / "
@@ -3208,7 +3020,53 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "- `git push`. Local commits only.\n"
             "- Touching `.meshkore/credentials/`, `.meshkore/.runtime/`, `state.json`.\n"
             "- Stubbing CORE business logic. Stubs are for external integrations only.\n"
-            "- Stopping anywhere except the end-of-pass summary."
+            "- Stopping anywhere except the end-of-pass summary.\n"
+            "- **Disguised no-ops (py-1.12.7).** If on entry every task and "
+            "every initiative in scope is already `status: done` on disk "
+            "AND in HEAD (so `git diff HEAD -- <file>` would print "
+            "nothing for any rewrite you'd do), DO NOT rewrite the files "
+            "with identical content to 'force a state refresh' / 'resync "
+            "frontmatter'. Operator field-reported 2026-06-02: a 2-min "
+            "pass closed three initiatives looking like real work — you "
+            "had only touched mtimes to kick the daemon's stale "
+            "in-memory state. Correct behaviour:\n"
+            "  1. End-of-pass summary line — `daemon-state-stale: "
+            "detected — N initiatives + M tasks already at status:done "
+            "in HEAD; no rewrite performed`.\n"
+            "  2. Recommend: `operator: hit /reload (or restart the "
+            "daemon) to refresh in-memory state from disk`.\n"
+            "  3. Do NOT claim 'flipped N statuses' — you flipped zero.\n"
+            "  4. Do NOT write a diary entry titled '<I> resync' — there "
+            "is nothing to log beyond the stale-state observation.\n"
+            "Pre-check before any frontmatter write: would "
+            "`git diff HEAD -- <file>` be empty after this write? If "
+            "yes, the write is cosmetic, drop it. Only flip a status "
+            "when reality differs from HEAD (commits landed but "
+            "frontmatter says `active`) — and then cite the SHA(s) "
+            "you observed.\n"
+            "- **Setting `status: active` for curation (py-1.12.8).** "
+            "`status: active` means a coder subagent is dispatched "
+            "against this task RIGHT NOW (the cockpit reads this as "
+            "live execution — blinking amber + the task appears in "
+            "`activeTaskIds`). Curating a task — trimming verbose "
+            "intros, fixing tags, removing dead meta sections, "
+            "rewriting the description for clarity, restructuring "
+            "Done-when bullets — is NOT execution. Leave `status` "
+            "exactly as you found it (`next`, `backlog`, `blocked`, "
+            "etc.). The only legitimate writes to `status:` from "
+            "the architect are: `done` (a coder reported `✓` and you "
+            "verified), `blocked` (a dependency or operator answer "
+            "is needed), `pending-operator` (you need a decision the "
+            "DECISION CATALOG doesn't cover). Operator field report "
+            "2026-06-02: after a 'review the roadmap' pass, 4-6 "
+            "tasks were left with stale `status: active` because the "
+            "architect set it to mark 'I'm editing this' — the "
+            "cockpit pulsed them as live work for hours. Don't do "
+            "this. The cockpit's live signal is now decoupled from "
+            "the file's status field (TaskCard pulses only on "
+            "`activeTaskIds().has(id)`), so a stale `status: active` "
+            "no longer parpadea — but it's still visually wrong and "
+            "lies about your work. Stop writing it."
         ),
         "redirect": (
             "If the operator asks you to write code, edit a task body, "
@@ -3836,10 +3694,10 @@ class BriefingPipeline:
 
 
 class ChatRunner:
-    """One coordinator turn = one ChatRunner. Spawns a headless LLM CLI
-    (Cursor agent or Claude Code) with stream-json output, parses each
-    line into chat.assistant.delta / tool.use / tool.result events on the
-    WS, and emits a final `chat.assistant.final` when the child exits.
+    """One coordinator turn = one ChatRunner. Spawns `claude -p` with
+    stream-json output, parses each line into chat.assistant.delta /
+    tool.use / tool.result events on the WS, and emits a final
+    `chat.assistant.final` when the child exits.
 
     Cancel-safe: cancel() sends SIGTERM to the process group; if still
     alive after 30 s, SIGKILL."""
@@ -3875,11 +3733,9 @@ class ChatRunner:
         self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
         self.pid: Optional[int] = None
         self.proc: Any = None  # subprocess.Popen
-        self.runner_platform: str = "claude-code"
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
-        self._stderr_lines: List[str] = []
         # py-1.10.16 — Back-reference for the architect-wake hook
         # (initiative `architect-wake-on-subagent`). When the
         # subprocess emits `chat.assistant.final`, the runner calls
@@ -3908,15 +3764,9 @@ class ChatRunner:
     def spawn(self) -> None:
         import subprocess
 
-        platforms = _resolve_runner_platforms(self.cluster, self.agent_type)
-        runner_bin: Optional[str] = None
-        for plat in platforms:
-            runner_bin = _find_runner_binary(plat)
-            if runner_bin:
-                self.runner_platform = plat
-                break
-        if not runner_bin:
-            err = _runner_error_message(platforms)
+        claude_bin = _find_claude()
+        if not claude_bin:
+            err = "claude CLI not found — install via `npm i -g @anthropic-ai/claude-code`"
             _log(err)
             self.hub.broadcast(
                 _append_timeline(
@@ -3932,7 +3782,13 @@ class ChatRunner:
             )
             self.done.set()
             return
-
+        # py-1.6.1 HOTFIX — --session-id from py-1.6.0 caused empty
+        # assistant responses in production (claude-code exited
+        # silently on subsequent turns of the same conv). Reverted to
+        # opt-in via env var MESHKORE_CLAUDE_SESSION_ID=1. Default off
+        # until the failure mode is understood and re-tested.
+        # The uuid5 helper is preserved so reintroduction is a one-line
+        # flip once safe.
         session_id = _session_id_for_conv(self.conv)
         use_session = os.environ.get("MESHKORE_CLAUDE_SESSION_ID", "").strip() in (
             "1",
@@ -3940,43 +3796,44 @@ class ChatRunner:
             "yes",
             "on",
         )
-        manifest = _agent_manifest(self.agent_type)
-        if self.runner_platform == "cursor":
-            args = _cursor_spawn_argv(
-                runner_bin,
-                workspace=self.paths.root,
-                model=manifest.get("model"),
-            )
-        else:
-            # py-1.6.1 HOTFIX — --session-id opt-in via MESHKORE_CLAUDE_SESSION_ID.
-            args = [
-                runner_bin,
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--permission-mode",
-                "bypassPermissions",
-                "--disallowed-tools",
-                "AskUserQuestion,ExitPlanMode",
-            ]
-            if use_session:
-                args[2:2] = ["--session-id", session_id]
-
+        args = [
+            claude_bin,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--permission-mode",
+            "bypassPermissions",
+            # Headless: cockpit has no UI to surface interactive question
+            # tools. Disallow them so the model defaults to plain-text
+            # asks in the chat bubble instead of stalling on a hanging
+            # AskUserQuestion / ExitPlanMode call.
+            "--disallowed-tools",
+            "AskUserQuestion,ExitPlanMode",
+        ]
+        if use_session:
+            args[2:2] = ["--session-id", session_id]
+        # py-1.10.5 — Pipe the briefing through stdin instead of
+        # appending it as a positional argument. claude 2.1.145
+        # rejects a trailing positional that arrives AFTER a
+        # multi-value flag (`--disallowed-tools <comma,list>`) — the
+        # parser consumes our prompt as another disallowed-tool name
+        # or just drops it, and claude exits 1 with stderr:
+        #   "Error: Input must be provided either through stdin or
+        #    as a prompt argument when using --print"
+        # Captured 2026-05-29 by py-1.10.4's stderr drainer (which
+        # had been silently dropping this error for every spawn
+        # since the cockpit's roadmap-architect feature shipped).
+        # Stdin works regardless of argv order, so it's the
+        # forward-compatible answer.
         briefing = self._briefing()
         env = {
             **os.environ,
-            "PATH": _runner_path_env(),
             "MESHKORE_IDENTITY": self.identity,
             "MESHKORE_CONV": self.conv,
             "MESHKORE_SESSION_ID": session_id,
         }
-        if self.runner_platform == "cursor":
-            cursor_key = _load_cursor_api_key(self.paths)
-            if cursor_key:
-                env["CURSOR_API_KEY"] = cursor_key
-
         self.proc = subprocess.Popen(
             args,
             cwd=str(self.paths.root),
@@ -3987,16 +3844,17 @@ class ChatRunner:
             start_new_session=True,
         )
         self.pid = self.proc.pid
+        # Write the briefing to stdin and close. claude reads it
+        # all (EOF on close) then begins streaming results to stdout.
         try:
             if self.proc.stdin is not None:
                 self.proc.stdin.write(briefing.encode("utf-8"))
                 self.proc.stdin.close()
         except (BrokenPipeError, OSError) as e:
-            _log(f"runner({self.conv}) stdin write failed: {e}")
+            _log(f"claude({self.conv}) stdin write failed: {e}")
         _log(
-            f"runner({self.conv}) platform={self.runner_platform} pid={self.pid} "
-            f"agent_type={self.agent_type} stream={self.stream_id} "
-            f"briefing_len={len(briefing)}"
+            f"claude({self.conv}) spawned pid={self.pid} agent_type={self.agent_type} "
+            f"stream={self.stream_id} briefing_len={len(briefing)}"
         )
         self.hub.broadcast(
             {
@@ -4004,7 +3862,7 @@ class ChatRunner:
                 "id": f"chat:{self.conv}",
                 "agent": self.identity,
                 "ts": _iso_now(),
-                "runner": self.runner_platform,
+                "runner": "claude-code",
                 "conv": self.conv,
                 "stream_id": self.stream_id,
             }
@@ -4033,10 +3891,10 @@ class ChatRunner:
         threading.Thread(target=self._stderr_drain, daemon=True).start()
 
     def _stderr_drain(self) -> None:
-        """Read self.proc.stderr line-by-line, forward to daemon log,
-        and accumulate into self._stderr_lines so _reader_loop can
-        surface it as a chat error when the runner exits non-zero with
-        no stdout (e.g. cursor-agent auth failure)."""
+        """Read self.proc.stderr line-by-line and forward to the
+        daemon log. Tagged with conv so multiple in-flight runners
+        don't blur together. Cheap — claude rarely emits much on
+        stderr unless it's failing."""
         if not self.proc or not self.proc.stderr:
             return
         for raw in self.proc.stderr:
@@ -4045,8 +3903,7 @@ class ChatRunner:
             except Exception:
                 continue
             if line:
-                _log(f"runner({self.conv}) stderr: {line}")
-                self._stderr_lines.append(line)
+                _log(f"claude({self.conv}) stderr: {line}")
 
     def cancel(self) -> None:
         if self.cancelled:
@@ -4152,47 +4009,6 @@ class ChatRunner:
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
-                continue
-            # Cursor agent stream-json — direct text deltas
-            if ev_type in ("text", "text_delta", "assistant_text_delta"):
-                delta = str(ev.get("text") or ev.get("delta") or "")
-                if delta:
-                    self._cumulative_text += delta
-                    now = time.monotonic()
-                    if now - last_emit_at > 0.2:
-                        last_emit_at = now
-                        self.hub.broadcast(
-                            {
-                                "type": "chat.assistant.delta",
-                                "author": self.identity,
-                                "conv": self.conv,
-                                "stream_id": self.stream_id,
-                                "text": self._cumulative_text[:16000],
-                                "ts": _iso_now(),
-                            }
-                        )
-                continue
-            if ev_type == "assistant":
-                msg = ev.get("message") or {}
-                for c in (msg.get("content") or [] if isinstance(msg, dict) else []):
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        delta = str(c.get("text") or "")
-                        if delta:
-                            self._cumulative_text += delta
-                            now = time.monotonic()
-                            if now - last_emit_at > 0.2:
-                                last_emit_at = now
-                                self.hub.broadcast(
-                                    {
-                                        "type": "chat.assistant.delta",
-                                        "author": self.identity,
-                                        "conv": self.conv,
-                                        "stream_id": self.stream_id,
-                                        "text": self._cumulative_text[:16000],
-                                        "ts": _iso_now(),
-                                    }
-                                )
-                continue
         # Finalize
         final_text = result_text or self._cumulative_text
         # py-1.7.0 — Harvest REMEMBER: lines into the role's shared
@@ -4218,20 +4034,6 @@ class ChatRunner:
                 },
             )
         )
-        # py-1.12.6 — scan the agent's final text for deploy-tool auth
-        # failures (wrangler, gh, fly, vercel). When found, emit
-        # runner.auth.required so the cockpit shows the auth card even
-        # though we don't own the tool's process (the LLM ran it).
-        if cleaned_text:
-            detected_platform = _detect_auth_needed_in_text(cleaned_text)
-            if detected_platform and detected_platform not in (self.runner_platform,):
-                _log(f"runner-auth: auto-detected auth needed for {detected_platform} from agent output")
-                self.hub.broadcast({
-                    "type": "runner.auth.required",
-                    "platform": detected_platform,
-                    "conv": self.conv,
-                    "ts": _iso_now(),
-                })
         # py-1.10.4 — surface the exit code in the daemon log so a
         # silent claude failure (empty stdout, no final, etc.) can
         # be traced back to e.g. "exited 1 with stderr 'context
@@ -4239,45 +4041,10 @@ class ChatRunner:
         # looked identical regardless of whether claude crashed,
         # blocked on a tool, or genuinely had nothing to say.
         exit_code = self.proc.wait() if self.proc else None
-        # py-1.12.5 — If the runner exited non-zero with no output at all
-        # (e.g. cursor-agent "Authentication required", or binary crash),
-        # surface the captured stderr as the chat final so the operator
-        # can see what went wrong directly in the cockpit instead of
-        # hunting the daemon log.
-        if not cleaned_text and exit_code not in (None, 0) and self._stderr_lines:
-            stderr_snippet = "\n".join(self._stderr_lines[:20])
-            needs_auth = "authentication" in stderr_snippet.lower() or "auth" in stderr_snippet.lower()
-            cleaned_text = (
-                f"[runner error — {self.runner_platform} exited {exit_code}]\n\n"
-                f"```\n{stderr_snippet}\n```"
-            )
-            if needs_auth:
-                cleaned_text += (
-                    f"\n\n**{self.runner_platform} necesita autenticación.** "
-                    "Usa el botón de autenticación que aparece abajo."
-                )
-                self.hub.broadcast({
-                    "type": "runner.auth.required",
-                    "platform": self.runner_platform,
-                    "conv": self.conv,
-                    "ts": _iso_now(),
-                })
-            self.hub.broadcast(
-                _append_timeline(
-                    self.paths,
-                    {
-                        "type": "chat.assistant.final",
-                        "author": self.identity,
-                        "conv": self.conv,
-                        "stream_id": self.stream_id,
-                        "text": cleaned_text,
-                    },
-                )
-            )
         text_len = len(cleaned_text or "")
         _log(
-            f"runner({self.conv}) platform={self.runner_platform} exit={exit_code} "
-            f"stream={self.stream_id} text_len={text_len} agent_type={self.agent_type}"
+            f"claude({self.conv}) exit={exit_code} stream={self.stream_id} "
+            f"text_len={text_len} agent_type={self.agent_type}"
         )
         _debug_emit(
             "subagent-final",
@@ -6059,20 +5826,6 @@ def make_handler(daemon: "Daemon"):
                 )
                 return self._json(code, resp)
 
-            # py-1.12.5 — Runner auth: POST /auth/<platform>/start
-            # Spawns `cursor-agent login` (or `claude login`) on the local
-            # machine so the OS opens the browser for OAuth. The daemon
-            # then polls every 3 s to detect when auth succeeds and
-            # broadcasts `runner.auth.completed` on the WS.
-            if p.startswith("/auth/") and p.endswith("/start"):
-                platform = p[len("/auth/") : -len("/start")].strip("/")
-                if platform not in _AUTH_PLATFORMS:
-                    return self._json(
-                        400, {"error": f"unknown platform '{platform}'", "known": list(_AUTH_PLATFORMS)}
-                    )
-                ok, msg = daemon.runner_auth_start(platform)
-                return self._json(200 if ok else 500, {"ok": ok, "platform": platform, "msg": msg})
-
             return self._json(404, {"error": "not found", "path": p})
 
         def do_PUT(self):  # noqa: N802
@@ -6610,7 +6363,11 @@ class VersionWatcher:
 
     def _tick_secs(self) -> int:
         try:
-            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            d = (
+                self.daemon.cluster.data.get("daemon")
+                if isinstance(self.daemon.cluster.data, dict)
+                else None
+            )
             raw = (d or {}).get("auto_update_check_interval_sec")
             if raw is None:
                 return self.DEFAULT_TICK_SECS
@@ -6621,14 +6378,22 @@ class VersionWatcher:
 
     def _enabled(self) -> bool:
         try:
-            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            d = (
+                self.daemon.cluster.data.get("daemon")
+                if isinstance(self.daemon.cluster.data, dict)
+                else None
+            )
             return bool((d or {}).get("auto_update", True))
         except Exception:
             return True
 
     def _source_url(self) -> str:
         try:
-            d = self.daemon.cluster.data.get("daemon") if isinstance(self.daemon.cluster.data, dict) else None
+            d = (
+                self.daemon.cluster.data.get("daemon")
+                if isinstance(self.daemon.cluster.data, dict)
+                else None
+            )
             u = (d or {}).get("auto_update_source")
             if isinstance(u, str) and u.strip():
                 return u.strip()
@@ -6674,13 +6439,15 @@ class VersionWatcher:
                 data={"local": DAEMON_VERSION, "remote": remote, "live_convs": active},
             )
             try:
-                self.daemon.hub.broadcast({
-                    "type": "daemon.upgrade.deferred",
-                    "local": DAEMON_VERSION,
-                    "remote": remote,
-                    "live_convs": active,
-                    "ts": _iso_now(),
-                })
+                self.daemon.hub.broadcast(
+                    {
+                        "type": "daemon.upgrade.deferred",
+                        "local": DAEMON_VERSION,
+                        "remote": remote,
+                        "live_convs": active,
+                        "ts": _iso_now(),
+                    }
+                )
             except Exception:
                 pass
             return
@@ -6696,12 +6463,14 @@ class VersionWatcher:
             data={"local": DAEMON_VERSION, "remote": remote},
         )
         try:
-            self.daemon.hub.broadcast({
-                "type": "daemon.upgrade.starting",
-                "local": DAEMON_VERSION,
-                "remote": remote,
-                "ts": _iso_now(),
-            })
+            self.daemon.hub.broadcast(
+                {
+                    "type": "daemon.upgrade.starting",
+                    "local": DAEMON_VERSION,
+                    "remote": remote,
+                    "ts": _iso_now(),
+                }
+            )
         except Exception:
             pass
         try:
@@ -6729,6 +6498,7 @@ class VersionWatcher:
         url = self._source_url()
         try:
             import urllib.request
+
             req = urllib.request.Request(
                 url,
                 headers={
@@ -6751,11 +6521,13 @@ def _is_remote_newer(local: str, remote: str) -> bool:
     """Compare two `py-X.Y.Z` strings. Tolerates suffixes like
     `py-1.12.1-hotfix` — strips after the first non-numeric/dot char
     in the version body for comparison purposes."""
+
     def _tuple(v: str) -> Tuple[int, ...]:
-        body = v[len("py-"):] if v.startswith("py-") else v
+        body = v[len("py-") :] if v.startswith("py-") else v
         # Stop at the first char that isn't digit or dot.
         clean = re.split(r"[^0-9.]", body, 1)[0]
         return tuple(int(p) for p in clean.split(".") if p.isdigit())
+
     try:
         return _tuple(remote) > _tuple(local)
     except Exception:
@@ -9235,140 +9007,6 @@ class Daemon:
             except Exception:
                 pass
             self.cleanup()
-
-    # py-1.12.5 — Runner auth flow ──────────────────────────────────────
-    # POST /auth/<platform>/start → spawns the CLI login command so the OS
-    # opens the browser. We then poll every 3 s; on success we broadcast
-    # `runner.auth.completed` and stop polling.
-
-    _auth_poller_running: Dict[str, bool] = {}
-    _login_procs: Dict[str, Any] = {}   # platform → Popen (for process-exit check)
-
-    def runner_auth_start(self, platform: str) -> Tuple[bool, str]:
-        import subprocess as _sp
-
-        if platform not in _AUTH_PLATFORMS:
-            return False, f"unknown platform '{platform}'"
-
-        env = {**os.environ, "PATH": _runner_path_env()}
-
-        # Build login command
-        cfg = _AUTH_PLATFORMS[platform]
-        if cfg["login_cmd"] is not None:
-            cmd = list(cfg["login_cmd"])
-        elif platform == "cursor":
-            bin_path = _find_cursor_agent()
-            if not bin_path:
-                return False, "cursor-agent not found — install Cursor"
-            cmd = [bin_path, "agent", "login"] if os.path.basename(bin_path) == "cursor" else [bin_path, "login"]
-        elif platform == "claude-code":
-            bin_path = _find_claude()
-            if not bin_path:
-                return False, "claude CLI not found — run: npm i -g @anthropic-ai/claude-code"
-            cmd = [bin_path, "login"]
-        else:
-            return False, f"no login command for {platform}"
-
-        try:
-            proc = _sp.Popen(
-                cmd,
-                env=env,
-                stdin=_sp.DEVNULL,
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-                start_new_session=True,
-            )
-            # Keep process reference so _runner_auth_check can poll exit code
-            self._login_procs[platform] = proc
-        except Exception as e:
-            return False, f"failed to spawn {platform} login: {e}"
-
-        _log(f"runner-auth: spawned {platform} login ({' '.join(cmd)})")
-        self.hub.broadcast({
-            "type": "runner.auth.started",
-            "platform": platform,
-            "ts": _iso_now(),
-        })
-
-        if not self._auth_poller_running.get(platform):
-            self._auth_poller_running[platform] = True
-            threading.Thread(
-                target=self._runner_auth_poll,
-                args=(platform,),
-                daemon=True,
-            ).start()
-
-        return True, f"{platform} login launched — browser should open"
-
-    def _runner_auth_check(self, platform: str) -> bool:
-        """Return True if the tool/runner is authenticated.
-
-        For cursor / claude-code we rely on the exit code of the login
-        process (started by runner_auth_start) — when the user approves the
-        OAuth flow the CLI exits 0.  We do NOT launch a full inference job
-        to verify because that is slow, unreliable under timeout, and
-        triggers quota.
-
-        For deploy tools (wrangler, gh, fly, vercel) we run the dedicated
-        `check_cmd` which is fast and purpose-built for auth status.
-        """
-        import subprocess as _sp
-
-        cfg = _AUTH_PLATFORMS.get(platform)
-        if cfg is None:
-            return False
-
-        # ── LLM runners: check whether the login process has exited 0 ──
-        if platform in ("cursor", "claude-code"):
-            proc = self._login_procs.get(platform)
-            if proc is None:
-                return False
-            rc = proc.poll()
-            if rc is None:
-                return False  # login still waiting for browser
-            return rc == 0
-
-        # ── Deploy tools: run the check command ──
-        if cfg.get("check_cmd") is None:
-            return False
-
-        env = {**os.environ, "PATH": _runner_path_env()}
-        try:
-            result = _sp.run(
-                list(cfg["check_cmd"]),
-                env=env,
-                stdin=_sp.DEVNULL,
-                capture_output=True,
-                timeout=15,
-            )
-            combined = (result.stdout + result.stderr).decode("utf-8", "replace").lower()
-            auth_kws = cfg.get("auth_keywords") or ["not authenticated", "not logged in"]
-            return result.returncode == 0 and not any(kw in combined for kw in auth_kws)
-        except Exception:
-            return False
-
-    def _runner_auth_poll(self, platform: str) -> None:
-        """Poll every 3 s until auth succeeds, then broadcast completed."""
-        _log(f"runner-auth: polling {platform} every 3s")
-        for _ in range(60):  # max 3 min
-            if self.stopping.is_set():
-                break
-            time.sleep(3)
-            if self._runner_auth_check(platform):
-                _log(f"runner-auth: {platform} auth confirmed")
-                self.hub.broadcast({
-                    "type": "runner.auth.completed",
-                    "platform": platform,
-                    "ts": _iso_now(),
-                })
-                break
-            else:
-                self.hub.broadcast({
-                    "type": "runner.auth.polling",
-                    "platform": platform,
-                    "ts": _iso_now(),
-                })
-        self._auth_poller_running[platform] = False
 
     def request_shutdown(self) -> None:
         if self.stopping.is_set():
