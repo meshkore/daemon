@@ -66,7 +66,8 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.8"  # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
+DAEMON_VERSION = "py-1.12.9"  # 1.12.9 — auto-archive broadened from work-* prefix to ANY dispatched subagent (parent_conv set in meta). Catches deploy/db/testing/custom-coder convs that were leaking into the rail after task completion. Master `_onboarding_v1` and `roadmap-architect-*` and any operator-opened conv without parent_conv are exempt — the operator can keep manual agents open as long as they want. Operator field report 2026-06-06: cavioca had hundreds of subagent convs piling up because only work-* was being swept. Singleton invariants (1 master + 1 roadmap-architect) were already enforced via py-1.10.25 invariant 1.
+# 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
 # 1.12.2 — agent honesty pass. Two prompt fixes from operator field report 2026-05-31:
@@ -4093,17 +4094,42 @@ class ChatRunner:
                 self.daemon._broadcast_conv_activity(self.conv, live_override=False)
             except Exception as e:
                 _log(f"conv.activity broadcast on final failed for {self.conv}: {e}")
-            # py-1.11.2 — Auto-archive finished `work-*` subagent convs.
-            # They're single-purpose one-task workers; nothing else lands
-            # on them after the final. Keeps the rail clean without the
-            # cockpit needing a `scheduleSubagentAutoArchive` timer of
-            # its own. Master `_onboarding_v1` and roadmap-architect-*
-            # convs are explicitly NOT auto-archived (they carry the
-            # pass summary + project narrative). Operators can unarchive
-            # from the History panel to inspect a failed worker.
-            if self.conv.startswith(
-                "work-"
-            ) and not self.daemon.chat_archive.is_archived(self.conv):
+            # py-1.12.9 — Auto-archive any finished SUBAGENT conv.
+            # Criterion broadened from "work-* prefix" (py-1.11.2) to
+            # "has parent_conv in meta OR matches `work-*` slug". A
+            # subagent is anything the architect dispatched — workers
+            # (work-*), deploy, db, testing, and ad-hoc customs all
+            # carry `parent_conv` in conv_meta. The new rule catches
+            # them uniformly.
+            #
+            # NOT auto-archived (operator-owned, multi-turn):
+            #   - Master `_onboarding_v1` (the Coordinator)
+            #   - `roadmap-architect-*` (carries the pass summary)
+            #   - Any conv WITHOUT parent_conv and not prefixed work-
+            #     (= the operator opened it manually, keep it open)
+            #
+            # Operator field report 2026-06-06: "garantizar que cuando
+            # se lanzan agentes que hacen tareas se cierran. Si el
+            # usuario quiere abrir tres a mano y dejarlos ahí no hay
+            # problema." This matches the rule exactly: dispatched →
+            # auto-archive; operator-opened → leave alone.
+            should_auto_archive = False
+            if not self.daemon.chat_archive.is_archived(self.conv):
+                if self.conv.startswith("work-"):
+                    should_auto_archive = True
+                elif self.conv == "_onboarding_v1":
+                    should_auto_archive = False
+                elif self.conv.startswith("roadmap-architect-"):
+                    should_auto_archive = False
+                else:
+                    # Look up parent_conv from meta sidecar.
+                    try:
+                        meta = self.daemon._conv_meta_load().get(self.conv) or {}
+                        if meta.get("parent_conv"):
+                            should_auto_archive = True
+                    except Exception as e:
+                        _log(f"auto-archive meta check failed for {self.conv}: {e}")
+            if should_auto_archive:
                 try:
                     entry = self.daemon.chat_archive.archive(
                         self.conv,
