@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.14"  # 1.12.14 — Standard v20: universal-rules block instructs every agent to mention initiatives and tasks by their `#<id>` in chat output (`#I18`, `#T-foo`). The cockpit's V108 timeline ships the matching `#<id>` chip next to each initiative title so operators can pattern-match between chat and roadmap UI. New convention doc `.meshkore/docs/conventions/chat-id-references.md`. Closes operator request 2026-06-09 ("ids para localizarlas en el roadmap luego").
+DAEMON_VERSION = "py-1.12.15"  # 1.12.15 — Standard v21: commit-trailer revision. Mandatory three are now `Agent:` + `Model:` + `MeshKore:` (daemon version); `Co-Authored-By:` is REMOVED (operator's cross-repo convention is no-co-authoring; the existing three trailers fully attribute the AI). The daemon now embeds its own `DAEMON_VERSION` into every subagent's commit-cadence prompt so the `MeshKore:` trailer is always quotable. Closes operator request 2026-06-09 ("nosotros tenemos una regla general que en ningún repo ponemos co-authoring, pero en este de meshkore sí … podrías complementar con la versión de MeshKore que estamos usando en ese momento").
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -2886,16 +2886,17 @@ AGENT_PROMPTS: Dict[str, Dict[str, str]] = {
             "     <one-line why>\n"
             "\n"
             "     Agent: <your-agent-type>      # custom, deploy, db, testing, docs, review — your role\n"
-            "     Model: claude-opus-4-7\n"
-            "     Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n"
-            "   The `Agent:` + `Model:` trailers are required per the\n"
-            "   MeshKore standard v12 — they let git log / blame /\n"
-            "   analytics tell apart fast probes from heavyweight work\n"
-            "   and survive merges + cherry-picks. Replace the model id\n"
-            "   if you know you're running under a different one; use\n"
-            "   `Model: unknown` rather than omitting if genuinely\n"
-            "   unsure. Full spec at\n"
-            "   https://meshkore.com/standard#91-commit-attribution--agent--model-trailers-v12\n"
+            "     Model: claude-opus-4-7         # or your actual model id; `Model: unknown` if genuinely unsure — never omit\n"
+            f"     MeshKore: {DAEMON_VERSION}\n"
+            "   These THREE trailers are MANDATORY (MeshKore standard v21).\n"
+            "   The cross-repo convention is no-co-authoring — do NOT add\n"
+            "   `Co-Authored-By:` here. Git's own author/committer field\n"
+            "   already records who ran the commit; Agent + Model + MeshKore\n"
+            "   add the semantic attribution (role, model, daemon runtime).\n"
+            "   The `MeshKore:` value is the literal daemon version above —\n"
+            "   quote it verbatim; this lets `git log` filter cohorts\n"
+            "   by daemon release. Full spec:\n"
+            "   https://meshkore.com/standard#91-commit-attribution--agent--model--meshkore-trailers-v12-revised-v21\n"
             "4. DO NOT push. Local commit only.\n"
             "5. **VERIFY** before claiming done:\n"
             "     • code task → confirm `npm run build` / `tsc --noEmit` / "
