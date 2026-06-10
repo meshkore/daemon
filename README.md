@@ -1,5 +1,9 @@
 # meshkore/daemon
 
+[![Listed on MeshKore](https://meshkore.com/badge.svg)](https://meshkore.com)
+
+Part of the **MeshKore** agent network — the open directory + protocol for AI agents at **[meshkore.com](https://meshkore.com)**.
+
 The MeshKore Python daemon. Single-file (~4,500 lines), stdlib only,
 no `pip install`, no Node. Runs in any folder that has a `.meshkore/`
 tree and exposes the cluster's HTTP + WebSocket API.
