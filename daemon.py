@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.17"  # 1.12.17 — Graceful shutdown drain. SIGTERM/SIGINT no longer immediately tears down the server — instead `request_shutdown` walks the in-flight `chat_sessions` list and waits up to `cluster.yaml.daemon.shutdown_grace_secs` (default 30s) for the subprocesses to finish on their own, broadcasting a `daemon.shutting_down` event to cockpits during the wait. Without this, killing the daemon (deploy, OS shutdown, accidental Ctrl+C) propagates SIGTERM down the process group and EVERY mid-flight claude-code subprocess dies — operator sees a chat with user messages and zero replies (field report 2026-06-10: PID 2020 died 4 min into a turn when I killed the daemon to deploy py-1.12.16). After the grace expires, leftover sessions are still allowed to die (we proceed with shutdown) — same behavior as today, just with an opportunity for short turns to land first. Pair with py-1.12.16 ChatSessionReaper for the case where the subprocess survives but the daemon still crashes.
+DAEMON_VERSION = "py-1.12.18"  # 1.12.18 — `/chat/dispatch` accepts attachments-only payloads. Previously, an empty `text` field (e.g. operator pasted only images / context_docs) returned `400 text required`; the cockpit silently restored the draft and the operator's message vanished without visible feedback (field report 2026-06-10). Now: text+images+docs all empty → still 400 (with clearer error); text empty + images/docs present → accept, synthesize a neutral placeholder ("(see attached image)" etc.) so the briefing pipeline has a user-turn body. Paired with cockpit-side handling (system bubble in chat for any non-2xx dispatch). py-1.12.17 — graceful shutdown drain (SIGTERM waits up to cluster.yaml.daemon.shutdown_grace_secs=30s for in-flight chat_sessions to finish before tearing down).
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -7330,8 +7330,39 @@ class Daemon:
 
     def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         text = str(body.get("text") or "").strip()
+        # py-1.12.18 — image-only / docs-only dispatch is valid. The
+        # operator field-reported 2026-06-10 that attaching images to
+        # the architect without typing a question produced
+        # `400 text required` — the message disappeared into thin air.
+        # Now we accept the dispatch and synthesize a minimal text so
+        # the model gets a coherent turn (claude-code expects a text
+        # part). Reject only when EVERYTHING is empty.
+        has_images = isinstance(body.get("images"), list) and len(body["images"]) > 0
+        has_docs = (
+            isinstance(body.get("context_docs"), list) and len(body["context_docs"]) > 0
+        )
+        if not text and not has_images and not has_docs:
+            return 400, {
+                "error": "empty dispatch — provide text, images, or context_docs",
+            }
         if not text:
-            return 400, {"error": "text required"}
+            # Synthesize a neutral placeholder so the briefing pipeline
+            # has something to render as the user's turn. The
+            # attachments themselves carry the operator's intent.
+            if has_images and has_docs:
+                text = "(see attached images and documents)"
+            elif has_images:
+                text = (
+                    "(see attached image)"
+                    if len(body["images"]) == 1
+                    else "(see attached images)"
+                )
+            else:
+                text = (
+                    "(see attached document)"
+                    if len(body["context_docs"]) == 1
+                    else "(see attached documents)"
+                )
         author = str(body.get("author") or self.identity)
         conv = str(
             body.get("conv")
