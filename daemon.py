@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.18"  # 1.12.18 — `/chat/dispatch` accepts attachments-only payloads. Previously, an empty `text` field (e.g. operator pasted only images / context_docs) returned `400 text required`; the cockpit silently restored the draft and the operator's message vanished without visible feedback (field report 2026-06-10). Now: text+images+docs all empty → still 400 (with clearer error); text empty + images/docs present → accept, synthesize a neutral placeholder ("(see attached image)" etc.) so the briefing pipeline has a user-turn body. Paired with cockpit-side handling (system bubble in chat for any non-2xx dispatch). py-1.12.17 — graceful shutdown drain (SIGTERM waits up to cluster.yaml.daemon.shutdown_grace_secs=30s for in-flight chat_sessions to finish before tearing down).
+DAEMON_VERSION = "py-1.12.19"  # 1.12.19 — Standard v16 chat-turn queue: actually shipped. The py-1.12.12 release note claimed the 5 routes existed but they were never implemented — the cockpit's clock-icon "enqueue" button hit `POST /chat/conv/<id>/queue` and got 404. This version ships ChatQueueManager (per-conv FIFO at `.meshkore/queues/<conv>.json`) + all 5 routes (GET list, POST enqueue, POST .../edit, POST .../move, POST .../promote, DELETE .../<id>) + WS events queue.item.added|updated|removed|sent + auto-flush hook (after each turn finishes with empty in-memory pending, pop the disk queue head and dispatch as the next turn — operator's accumulated instructions land seamlessly). ChatSessions.start now accepts an `on_idle` callback so the auto-flush runs AFTER the slot is popped, avoiding the chicken-and-egg with chat_dispatch's busy-branch. py-1.12.18 — /chat/dispatch accepts attachments-only payloads.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -142,6 +142,10 @@ class Paths:
         # under .meshkore/.runtime/; the logs dir holds per-run captures.
         self.crons_state_path = self.runtime / "crons.json"
         self.crons_logs_dir = self.runtime / "logs" / "cron"
+        # py-1.12.19 — chat-turn queue (Standard v16). Per-conv FIFO
+        # at `.meshkore/queues/<conv>.json`. Gitignored runtime artifact
+        # — operator's typed pending instructions don't belong in git.
+        self.queues_dir = self.meshkore / "queues"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -4617,6 +4621,161 @@ class RunStore:
         return out[:limit]
 
 
+class ChatQueueManager:
+    """Standard v16 chat-turn queue — per-conv FIFO at
+    `.meshkore/queues/<conv>.json`. Survives daemon restarts; auto-flushes
+    the head item after each chat turn finishes.
+
+    Five HTTP routes (GET / POST / edit / move-or-promote / DELETE), all
+    serialised through a single lock so the disk view stays consistent
+    with the in-memory view. Auto-flush is invoked by the daemon after
+    `ChatRunner._read_stream` finalises — pops head + spawns next turn.
+
+    Operator field report 2026-06-10: the cockpit was calling
+    `POST /chat/conv/<id>/queue` for explicit enqueue and getting 404s
+    because these endpoints were never actually shipped despite the
+    py-1.12.12 release note. This class + the routes close that gap."""
+
+    def __init__(self, paths: Paths, hub) -> None:
+        self.paths = paths
+        self.hub = hub
+        self._lock = threading.Lock()
+
+    def _path(self, conv: str) -> Path:
+        # The queue file name uses the conv id verbatim; conv slugs are
+        # ASCII-safe by convention. Sanitise just in case.
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in conv)
+        return self.paths.queues_dir / f"{safe}.json"
+
+    def _read(self, conv: str) -> List[Dict[str, Any]]:
+        p = self._path(conv)
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text())
+            items = data.get("items")
+            return list(items) if isinstance(items, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _write(self, conv: str, items: List[Dict[str, Any]]) -> None:
+        p = self._path(conv)
+        if items:
+            self.paths.queues_dir.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                json.dumps(
+                    {"conv": conv, "items": items, "updated_at": _iso_now()},
+                    indent=2,
+                ),
+            )
+        else:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _broadcast(
+        self, ev_type: str, conv: str, item: Optional[Dict[str, Any]]
+    ) -> None:
+        try:
+            self.hub.broadcast(
+                {
+                    "type": ev_type,
+                    "conv": conv,
+                    "item": item,
+                    "ts": _iso_now(),
+                },
+            )
+        except Exception as e:
+            _log(f"queue broadcast {ev_type} failed for {conv}: {e}")
+
+    def list(self, conv: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return self._read(conv)
+
+    def enqueue(self, conv: str, text: str) -> Dict[str, Any]:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("text required")
+        with self._lock:
+            items = self._read(conv)
+            item = {
+                "id": secrets.token_hex(6),
+                "text": text,
+                "position": len(items),
+                "created_at": _iso_now(),
+                "updated_at": _iso_now(),
+            }
+            items.append(item)
+            self._write(conv, items)
+        self._broadcast("queue.item.added", conv, item)
+        return item
+
+    def edit(self, conv: str, item_id: str, text: str) -> Optional[Dict[str, Any]]:
+        text = (text or "").strip()
+        if not text:
+            return None
+        with self._lock:
+            items = self._read(conv)
+            for it in items:
+                if it.get("id") == item_id:
+                    it["text"] = text
+                    it["updated_at"] = _iso_now()
+                    self._write(conv, items)
+                    self._broadcast("queue.item.updated", conv, it)
+                    return it
+        return None
+
+    def remove(self, conv: str, item_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            items = self._read(conv)
+            for i, it in enumerate(items):
+                if it.get("id") == item_id:
+                    removed = items.pop(i)
+                    for j, x in enumerate(items):
+                        x["position"] = j
+                    self._write(conv, items)
+                    self._broadcast("queue.item.removed", conv, removed)
+                    return removed
+        return None
+
+    def move(self, conv: str, item_id: str, position: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            items = self._read(conv)
+            idx = next(
+                (i for i, x in enumerate(items) if x.get("id") == item_id),
+                -1,
+            )
+            if idx < 0:
+                return None
+            it = items.pop(idx)
+            position = max(0, min(position, len(items)))
+            items.insert(position, it)
+            for j, x in enumerate(items):
+                x["position"] = j
+            self._write(conv, items)
+        self._broadcast("queue.item.updated", conv, it)
+        return it
+
+    def promote(self, conv: str, item_id: str) -> Optional[Dict[str, Any]]:
+        """Convenience — move the item to position 0 (head)."""
+        return self.move(conv, item_id, 0)
+
+    def pop_head(self, conv: str) -> Optional[Dict[str, Any]]:
+        """Pop the head item and broadcast `queue.item.sent`. Used by the
+        auto-flush hook after a turn finishes."""
+        with self._lock:
+            items = self._read(conv)
+            if not items:
+                return None
+            head = items.pop(0)
+            for j, x in enumerate(items):
+                x["position"] = j
+            self._write(conv, items)
+        self._broadcast("queue.item.sent", conv, head)
+        return head
+
+
 class ChatSessions:
     """conv → active runner + pending buffer. Same mid-turn-merge
     protocol as Node's chatSessions: a second prompt while running
@@ -4644,7 +4803,7 @@ class ChatSessions:
             sess["pending"].append(text)
             return len(sess["pending"])
 
-    def start(self, conv: str, runner: ChatRunner, on_chain) -> None:
+    def start(self, conv: str, runner: ChatRunner, on_chain, on_idle=None) -> None:
         with self._lock:
             self._s[conv] = {"runner": runner, "pending": [], "cancelled": False}
 
@@ -4654,10 +4813,21 @@ class ChatSessions:
                 sess = self._s.get(conv)
                 if not sess:
                     return
-                if sess["cancelled"] or not sess["pending"]:
-                    self._s.pop(conv, None)
-                    return
+                cancelled = sess["cancelled"]
                 pending = sess["pending"]
+                if cancelled or not pending:
+                    self._s.pop(conv, None)
+                    # py-1.12.19 — Notify the on_idle hook BEFORE returning,
+                    # AFTER the slot is popped. The Daemon wires this to
+                    # the disk-queue auto-flush: if a queued item exists
+                    # we'll spawn the next turn (and ChatSessions.start
+                    # will re-occupy the slot cleanly).
+                    if on_idle is not None:
+                        try:
+                            on_idle(conv)
+                        except Exception as e:
+                            _log(f"on_idle hook failed for {conv}: {e}")
+                    return
                 sess["pending"] = []
             merged = (
                 pending[0]
@@ -5586,6 +5756,19 @@ def make_handler(daemon: "Daemon"):
                             limit=limit,
                         ),
                     )
+                # py-1.12.19 — Standard v16 chat-turn queue. GET lists
+                # the items for one conv. If the conv has no queue file
+                # we return 200 with empty items (NOT 404) so the
+                # cockpit's hydrate path doesn't log false negatives.
+                if rest.endswith("/queue"):
+                    cid = urllib.parse.unquote(rest[: -len("/queue")])
+                    if not cid:
+                        return self._json(400, {"error": "conv id required"})
+                    items = daemon.chat_queue_manager.list(cid)
+                    return self._json(
+                        200,
+                        {"conv": cid, "items": items, "generated_at": _iso_now()},
+                    )
             # D-CRON-02..05: scheduler introspection.
             if p == "/cron/list":
                 if self._need_auth():
@@ -5805,6 +5988,60 @@ def make_handler(daemon: "Daemon"):
                 return self._json(*daemon.chat_dispatch(self._read_json_body()))
             if p == "/chat/cancel":
                 return self._json(*daemon.chat_cancel(self._read_json_body()))
+
+            # py-1.12.19 — Standard v16 chat-turn queue mutations.
+            #   POST /chat/conv/<id>/queue                  {text}      → add
+            #   POST /chat/conv/<id>/queue/<itemId>/edit    {text}      → edit
+            #   POST /chat/conv/<id>/queue/<itemId>/move    {position}  → reorder
+            #   POST /chat/conv/<id>/queue/<itemId>/promote             → head
+            # The matching DELETE (remove) is handled in do_DELETE below.
+            if p.startswith("/chat/conv/"):
+                rest = p[len("/chat/conv/") :]
+                if rest.endswith("/queue"):
+                    cid = urllib.parse.unquote(rest[: -len("/queue")])
+                    if not cid:
+                        return self._json(400, {"error": "conv id required"})
+                    body = self._read_json_body()
+                    text = str((body or {}).get("text") or "").strip()
+                    if not text:
+                        return self._json(400, {"error": "text required"})
+                    try:
+                        item = daemon.chat_queue_manager.enqueue(cid, text)
+                    except ValueError as e:
+                        return self._json(400, {"error": str(e)})
+                    return self._json(200, {"conv": cid, "item": item})
+                if "/queue/" in rest:
+                    cid_part, _, sub = rest.partition("/queue/")
+                    cid = urllib.parse.unquote(cid_part)
+                    if not cid:
+                        return self._json(400, {"error": "conv id required"})
+                    if sub.endswith("/edit"):
+                        item_id = urllib.parse.unquote(sub[: -len("/edit")])
+                        body = self._read_json_body()
+                        text = str((body or {}).get("text") or "").strip()
+                        if not text:
+                            return self._json(400, {"error": "text required"})
+                        it = daemon.chat_queue_manager.edit(cid, item_id, text)
+                        if it is None:
+                            return self._json(404, {"error": "item not found"})
+                        return self._json(200, {"conv": cid, "item": it})
+                    if sub.endswith("/move"):
+                        item_id = urllib.parse.unquote(sub[: -len("/move")])
+                        body = self._read_json_body()
+                        try:
+                            pos = int((body or {}).get("position"))
+                        except (TypeError, ValueError):
+                            return self._json(400, {"error": "position required (int)"})
+                        it = daemon.chat_queue_manager.move(cid, item_id, pos)
+                        if it is None:
+                            return self._json(404, {"error": "item not found"})
+                        return self._json(200, {"conv": cid, "item": it})
+                    if sub.endswith("/promote"):
+                        item_id = urllib.parse.unquote(sub[: -len("/promote")])
+                        it = daemon.chat_queue_manager.promote(cid, item_id)
+                        if it is None:
+                            return self._json(404, {"error": "item not found"})
+                        return self._json(200, {"conv": cid, "item": it})
             # py-1.5.0 — Daemon-side archive lifecycle.
             if p == "/chat/archive":
                 return self._json(*daemon.chat_archive_set(self._read_json_body()))
@@ -5943,6 +6180,20 @@ def make_handler(daemon: "Daemon"):
                 name = p[len("/credentials/") :]
                 code, resp = daemon.credential_delete(name)
                 return self._json(code, resp)
+            # py-1.12.19 — Standard v16 queue: remove one item.
+            #   DELETE /chat/conv/<id>/queue/<itemId>
+            if p.startswith("/chat/conv/"):
+                rest = p[len("/chat/conv/") :]
+                if "/queue/" in rest:
+                    cid_part, _, item_id_part = rest.partition("/queue/")
+                    cid = urllib.parse.unquote(cid_part)
+                    item_id = urllib.parse.unquote(item_id_part)
+                    if not cid or not item_id:
+                        return self._json(400, {"error": "conv + item id required"})
+                    removed = daemon.chat_queue_manager.remove(cid, item_id)
+                    if removed is None:
+                        return self._json(404, {"error": "item not found"})
+                    return self._json(200, {"conv": cid, "item": removed})
             return self._json(404, {"error": "not found", "path": p})
 
         # ── helpers used by do_POST handlers ───────────────────────────
@@ -6780,6 +7031,10 @@ class Daemon:
         # both objects exist.
         self.state_manager.bind_daemon(self)
         self.chat_sessions = ChatSessions()
+        # py-1.12.19 — Standard v16 chat-turn queue. Disk-backed FIFO
+        # per conv. Auto-flushed after each turn via
+        # `_maybe_flush_queue` invoked from ChatRunner's end-of-stream.
+        self.chat_queue_manager = ChatQueueManager(self.paths, self.hub)
         # py-1.10.27 — Persistent quota state. Replaces the in-memory
         # `_agent_type_pauses` dict from py-1.10.26. State is keyed by
         # `<platform>/<model>` (the "quota_key" from _agent_manifest)
@@ -6884,6 +7139,18 @@ class Daemon:
             on_chain=lambda c, p: self._spawn_chat_turn(
                 c,
                 p,
+                context_docs=chain_ctx,
+                agent_type=chain_type,
+                agent_id=chain_id,
+            ),
+            # py-1.12.19 — Standard v16 auto-flush. After a turn finishes
+            # with no in-memory pending, check the disk queue for the
+            # conv. If a queued item exists, pop the head and dispatch
+            # it as the next turn — operator's accumulated instructions
+            # land seamlessly. Carries the same context_docs / agent_type
+            # / agent_id as the just-finished turn (chain inheritance).
+            on_idle=lambda c: self._maybe_flush_chat_queue(
+                c,
                 context_docs=chain_ctx,
                 agent_type=chain_type,
                 agent_id=chain_id,
@@ -7327,6 +7594,46 @@ class Daemon:
         except Exception as e:
             _log(f"_unfinished_dependencies({task_id}) raised: {e}")
             return []
+
+    def _maybe_flush_chat_queue(
+        self,
+        conv: str,
+        *,
+        context_docs: Optional[List[Dict[str, Any]]] = None,
+        agent_type: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> None:
+        """Standard v16 auto-flush hook. Called by ChatSessions when a
+        conv has just gone idle (in-memory `pending` was empty / cancelled
+        + slot popped). If the disk queue has items, pop the head and
+        dispatch it as the next turn. The just-popped item gets
+        `queue.item.sent` broadcast by `ChatQueueManager.pop_head`."""
+        try:
+            head = self.chat_queue_manager.pop_head(conv)
+        except Exception as e:
+            _log(f"queue auto-flush pop_head failed for {conv}: {e}")
+            return
+        if head is None:
+            return
+        text = str(head.get("text") or "").strip()
+        if not text:
+            return
+        _debug_emit(
+            "queue.auto-flush",
+            msg=f"flushing queue head into conv={conv}",
+            conv=conv,
+            data={"item_id": head.get("id"), "text_preview": text[:200]},
+        )
+        try:
+            self._spawn_chat_turn(
+                conv,
+                text,
+                context_docs=context_docs,
+                agent_type=agent_type,
+                agent_id=agent_id,
+            )
+        except Exception as e:
+            _log(f"queue auto-flush spawn failed for {conv}: {e}")
 
     def chat_dispatch(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         text = str(body.get("text") or "").strip()
