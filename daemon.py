@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.21"  # 1.12.21 — chat attachment persistence + serving. Images sent with /chat/dispatch were previously fed only into the claude-code briefing as inline base64 — never persisted, never visible to the cockpit on hydrate. Now: UploadStore saves each image under `.meshkore/uploads/<YYYY-MM-DD>/<conv>-<ms>-<idx>-<rand4>.<ext>`; the chat.user timeline event carries an `attachments[{kind, media_type, url, size_bytes, filename}]` manifest; GET /chat/uploads/<bucket>/<filename> serves the file with the right content-type. Retention via `cluster.yaml.uploads.retention_days` (default 30, max 365), opportunistic GC on every save. Limits: 8 MB/file, 12 files/dispatch. Operator field report 2026-06-10: chat thumbnails were missing after sending an image-attached prompt. py-1.12.20 — ChatSessions.queue merges-on-arrival.
+DAEMON_VERSION = "py-1.12.22"  # 1.12.22 — Standard v22 storage reporting. New `GET /storage/usage` returns a per-bucket disk-usage breakdown of `.meshkore/` (log, snapshots, uploads, queues, timeline, agents, modules, docs, roadmap, .runtime, credentials) + total bytes/files + each bucket's retention days when applicable. Cached server-side (CACHE_TTL_SECS=5s) so cockpit polling is cheap. Lets the cockpit render a Storage panel and lays the groundwork for operator-driven retention tuning + purge ordering. Schema documented in Standard §23 (json.storage_reporting). py-1.12.21 — chat attachment persistence + serving.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -4627,6 +4627,136 @@ class RunStore:
         return out[:limit]
 
 
+class StorageReport:
+    """py-1.12.22 — Disk usage report for `.meshkore/`.
+
+    Walks the well-known top-level subtrees + sums their byte size and
+    file count so the cockpit can render a storage panel. Cached for
+    `CACHE_TTL_SECS` to avoid re-walking large trees on every poll.
+
+    Buckets reported:
+        log, snapshots, uploads, queues, timeline, agents, modules,
+        docs, roadmap, .runtime, credentials.
+
+    Each entry: `{path, bytes, files, exists, retention_days?}`.
+    Unknown / empty subtrees report `bytes:0, files:0, exists:false`
+    so the cockpit can render a stable row regardless of state.
+
+    Initiative tracked in `.meshkore/log/<today>.md`. Standard v22+
+    documents the endpoint as the canonical surface for operator-side
+    capacity reporting."""
+
+    CACHE_TTL_SECS = 5.0  # cheap-ish recompute; long enough that a
+    # rapid poll cluster doesn't burn IO.
+
+    # Each entry: (logical-name, attribute on Paths). The order is the
+    # order the cockpit will render them in.
+    _BUCKETS: List[Tuple[str, str]] = [
+        ("log", "log_dir"),
+        ("snapshots", "snapshots_dir"),
+        ("uploads", "uploads_dir"),
+        ("queues", "queues_dir"),
+        ("timeline", "timeline_dir"),
+        ("agents", "agents_dir"),
+        ("modules", "modules_dir"),
+        ("docs", "docs_dir"),
+        ("roadmap", "roadmap_dir"),
+        (".runtime", "runtime"),
+        ("credentials", "credentials"),
+    ]
+
+    def __init__(self, paths: Paths, cluster: "Cluster") -> None:
+        self.paths = paths
+        self.cluster = cluster
+        self._lock = threading.Lock()
+        self._cached_at: float = 0.0
+        self._cache: Dict[str, Any] = {}
+
+    def _retention_for(self, bucket: str) -> Optional[int]:
+        """Pull the retention policy (in days) for a bucket from
+        cluster.yaml, when one applies. Returns None when the bucket
+        has no retention semantics."""
+        try:
+            data = self.cluster.data if isinstance(self.cluster.data, dict) else {}
+        except Exception:
+            return None
+        cfg_key = {
+            "snapshots": "snapshots",
+            "uploads": "uploads",
+        }.get(bucket)
+        if cfg_key is None:
+            return None
+        try:
+            cfg = data.get(cfg_key) if isinstance(data.get(cfg_key), dict) else None
+            if cfg is None:
+                # Fall through to the per-feature default.
+                return 7 if bucket == "snapshots" else 30
+            return int(cfg.get("retention_days", 7 if bucket == "snapshots" else 30))
+        except Exception:
+            return 7 if bucket == "snapshots" else 30
+
+    def _walk_dir(self, root: Path) -> Tuple[int, int]:
+        """Return (total_bytes, file_count) for everything under `root`.
+        Missing directory returns (0, 0); permission errors are absorbed
+        so one unreadable subtree doesn't poison the whole report."""
+        if not root.exists() or not root.is_dir():
+            return 0, 0
+        total = 0
+        files = 0
+        try:
+            for entry in root.rglob("*"):
+                try:
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                        files += 1
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            pass
+        return total, files
+
+    def usage(self) -> Dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            if self._cache and now - self._cached_at < self.CACHE_TTL_SECS:
+                return self._cache
+        buckets: List[Dict[str, Any]] = []
+        total = 0
+        total_files = 0
+        for name, attr in self._BUCKETS:
+            root = getattr(self.paths, attr, None)
+            if not isinstance(root, Path):
+                buckets.append(
+                    {"name": name, "bytes": 0, "files": 0, "exists": False},
+                )
+                continue
+            b, f = self._walk_dir(root)
+            entry: Dict[str, Any] = {
+                "name": name,
+                "bytes": b,
+                "files": f,
+                "exists": root.exists(),
+            }
+            ret = self._retention_for(name)
+            if ret is not None:
+                entry["retention_days"] = ret
+            buckets.append(entry)
+            total += b
+            total_files += f
+        report: Dict[str, Any] = {
+            "root": ".meshkore/",
+            "total_bytes": total,
+            "total_files": total_files,
+            "buckets": buckets,
+            "generated_at": _iso_now(),
+            "cache_ttl_secs": self.CACHE_TTL_SECS,
+        }
+        with self._lock:
+            self._cache = report
+            self._cached_at = time.time()
+        return report
+
+
 class UploadStore:
     """py-1.12.21 — chat attachment persistence.
 
@@ -5821,6 +5951,12 @@ def make_handler(daemon: "Daemon"):
                 return self._json(200, daemon.agents_listing())
             if p == "/info":
                 return self._json(200, daemon.info())
+            # py-1.12.22 / Standard v22 — `.meshkore/` capacity report
+            # for the operator's storage panel. Cached server-side
+            # (CACHE_TTL_SECS) so polling is cheap. No auth required —
+            # bytes per bucket is metadata, not contents.
+            if p == "/storage/usage":
+                return self._json(200, daemon.storage_report.usage())
             # U-DAEMON-02: read-only file serve under .meshkore/ for
             # docs, modules, and roadmap (the URL says `/tasks/` to
             # match Node's contract — but it serves from
@@ -7280,6 +7416,10 @@ class Daemon:
         self.chat_queue_manager = ChatQueueManager(self.paths, self.hub)
         # py-1.12.21 — chat attachment persistence + retention GC.
         self.upload_store = UploadStore(self.paths, self.cluster)
+        # py-1.12.22 — Standard v22 storage reporting. Cached walk of
+        # the well-known .meshkore/ subtrees so the cockpit can render
+        # a capacity panel without re-`du`-ing on every poll.
+        self.storage_report = StorageReport(self.paths, self.cluster)
         # py-1.10.27 — Persistent quota state. Replaces the in-memory
         # `_agent_type_pauses` dict from py-1.10.26. State is keyed by
         # `<platform>/<model>` (the "quota_key" from _agent_manifest)
