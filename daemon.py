@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.20"  # 1.12.20 — ChatSessions.queue merges-on-arrival. When a /chat/dispatch arrives while the conv is busy, the new text is concatenated into the existing pending text with `\n\n` separators instead of appended as a separate item. Pending list is now at most ONE text that grows; `_wait`'s merge always takes the `pending[0]` branch — the agent sees a clean continuous message, no more "Several follow-up instructions while you were working: 1. … 2. …" prefix. Operator clarification 2026-06-10 case 1: messages typed while a turn is running get appended to the in-task pending bubble (one growing bubble), not added as separate disk-queue items. py-1.12.19 — Standard v16 chat-turn queue shipped (was vaporware from py-1.12.12).
+DAEMON_VERSION = "py-1.12.21"  # 1.12.21 — chat attachment persistence + serving. Images sent with /chat/dispatch were previously fed only into the claude-code briefing as inline base64 — never persisted, never visible to the cockpit on hydrate. Now: UploadStore saves each image under `.meshkore/uploads/<YYYY-MM-DD>/<conv>-<ms>-<idx>-<rand4>.<ext>`; the chat.user timeline event carries an `attachments[{kind, media_type, url, size_bytes, filename}]` manifest; GET /chat/uploads/<bucket>/<filename> serves the file with the right content-type. Retention via `cluster.yaml.uploads.retention_days` (default 30, max 365), opportunistic GC on every save. Limits: 8 MB/file, 12 files/dispatch. Operator field report 2026-06-10: chat thumbnails were missing after sending an image-attached prompt. py-1.12.20 — ChatSessions.queue merges-on-arrival.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -146,6 +146,12 @@ class Paths:
         # at `.meshkore/queues/<conv>.json`. Gitignored runtime artifact
         # — operator's typed pending instructions don't belong in git.
         self.queues_dir = self.meshkore / "queues"
+        # py-1.12.21 — chat uploads. Image / file attachments sent with
+        # /chat/dispatch land here under YYYY-MM-DD/ buckets so the
+        # cockpit can render thumbnails. Gitignored (operator inputs
+        # may contain anything); retention via cluster.yaml.uploads
+        # (default 30 days), opportunistic GC on every upload.
+        self.uploads_dir = self.meshkore / "uploads"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -4621,6 +4627,184 @@ class RunStore:
         return out[:limit]
 
 
+class UploadStore:
+    """py-1.12.21 — chat attachment persistence.
+
+    Stores image / binary attachments sent with /chat/dispatch under
+    `.meshkore/uploads/<YYYY-MM-DD>/<filename>`. Returns a small
+    manifest record that the daemon embeds in the matching chat.user
+    timeline event, so the cockpit can render thumbnails on next
+    hydrate. Retention is bounded by
+    `cluster.yaml.uploads.retention_days` (default 30); a sweep runs
+    opportunistically on every save.
+
+    File-name shape:
+        `<conv-slug>-<ms-ts>-<idx>-<rand4>.<ext>`
+    Lexicographic ordering matches chronology + idx, and the random
+    suffix avoids collisions when two uploads land in the same ms.
+    """
+
+    DEFAULT_RETENTION_DAYS = 30
+    MAX_BYTES_PER_FILE = 8 * 1024 * 1024  # 8 MB, claude-code's friendly upper bound
+    MAX_FILES_PER_DISPATCH = 12
+
+    # Media-type → file extension. Anything outside this map gets
+    # `.bin`, which the cockpit can still link / download but won't
+    # render as <img>.
+    _EXT_BY_MEDIA: Dict[str, str] = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/gif": "gif",
+        "image/webp": "webp",
+        "image/svg+xml": "svg",
+        "image/avif": "avif",
+        "image/bmp": "bmp",
+    }
+
+    def __init__(self, paths: Paths, cluster: "Cluster") -> None:
+        self.paths = paths
+        self.cluster = cluster
+
+    def _retention_days(self) -> int:
+        try:
+            data = self.cluster.data if isinstance(self.cluster.data, dict) else {}
+            cfg = data.get("uploads") if isinstance(data.get("uploads"), dict) else None
+            if cfg is None:
+                return self.DEFAULT_RETENTION_DAYS
+            n = int(cfg.get("retention_days", self.DEFAULT_RETENTION_DAYS))
+            return max(0, min(365, n))
+        except Exception:
+            return self.DEFAULT_RETENTION_DAYS
+
+    def _safe_slug(self, s: str) -> str:
+        out = []
+        for c in s:
+            if c.isalnum() or c in "-_":
+                out.append(c)
+            else:
+                out.append("_")
+        return ("".join(out) or "x")[:48]
+
+    def save_dispatch(
+        self,
+        *,
+        conv: str,
+        images: Optional[List[Dict[str, Any]]],
+        ts_iso: str,
+    ) -> List[Dict[str, Any]]:
+        """Persist the dispatch's images list. Returns a manifest list
+        ready to be embedded in the chat.user event. Each entry:
+
+            {
+              "kind": "image",
+              "media_type": "image/png",
+              "url": "/chat/uploads/2026-06-10/<file>",
+              "size_bytes": 12345,
+              "filename": "<file>"
+            }
+
+        Silently skips entries that fail validation; never raises."""
+        if not images:
+            return []
+        try:
+            self._gc_old()
+        except Exception as e:
+            _log(f"upload gc failed: {e}")
+        out: List[Dict[str, Any]] = []
+        # Daily bucket — yyyy-mm-dd, gitignored.
+        bucket = ts_iso[:10] if len(ts_iso) >= 10 else _iso_now()[:10]
+        bucket_dir = self.paths.uploads_dir / bucket
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        # Single millisecond timestamp shared across this dispatch so
+        # the operator's batch sorts together in `ls -lt`.
+        ms = int(time.time() * 1000)
+        conv_slug = self._safe_slug(conv)
+        for idx, img in enumerate(images[: self.MAX_FILES_PER_DISPATCH]):
+            if not isinstance(img, dict):
+                continue
+            media_type = str(img.get("media_type") or "image/png").lower()
+            data_b64 = img.get("data")
+            if not isinstance(data_b64, str) or not data_b64:
+                continue
+            try:
+                blob = base64.b64decode(data_b64, validate=True)
+            except Exception:
+                continue
+            if len(blob) > self.MAX_BYTES_PER_FILE or len(blob) == 0:
+                continue
+            ext = self._EXT_BY_MEDIA.get(media_type, "bin")
+            rand4 = secrets.token_hex(2)
+            fname = f"{conv_slug}-{ms}-{idx}-{rand4}.{ext}"
+            path = bucket_dir / fname
+            try:
+                path.write_bytes(blob)
+            except OSError as e:
+                _log(f"upload save failed for {fname}: {e}")
+                continue
+            out.append(
+                {
+                    "kind": "image",
+                    "media_type": media_type,
+                    "url": f"/chat/uploads/{bucket}/{fname}",
+                    "size_bytes": len(blob),
+                    "filename": fname,
+                }
+            )
+        return out
+
+    def serve_path(self, bucket: str, filename: str) -> Optional[Path]:
+        """Resolve `<uploads>/<bucket>/<filename>` if it's safe to
+        serve. Returns None on traversal attempts or missing file."""
+        if (
+            not bucket
+            or not filename
+            or ".." in bucket
+            or ".." in filename
+            or "/" in filename
+            or "\\" in filename
+            or "/" in bucket
+            or "\\" in bucket
+        ):
+            return None
+        # bucket should be YYYY-MM-DD shaped.
+        if len(bucket) != 10 or bucket[4] != "-" or bucket[7] != "-":
+            return None
+        path = (self.paths.uploads_dir / bucket / filename).resolve()
+        try:
+            path.relative_to(self.paths.uploads_dir.resolve())
+        except ValueError:
+            return None
+        if not path.is_file():
+            return None
+        return path
+
+    def _gc_old(self) -> None:
+        days = self._retention_days()
+        if days <= 0:
+            return
+        root = self.paths.uploads_dir
+        if not root.is_dir():
+            return
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+            "%Y-%m-%d",
+        )
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            # Only sweep YYYY-MM-DD-shaped buckets.
+            if len(name) != 10 or name[4] != "-" or name[7] != "-":
+                continue
+            if name < cutoff:
+                try:
+                    import shutil as _shutil
+
+                    _shutil.rmtree(entry, ignore_errors=True)
+                except Exception as e:
+                    _log(f"upload gc rmtree({entry}) failed: {e}")
+
+
 class ChatQueueManager:
     """Standard v16 chat-turn queue — per-conv FIFO at
     `.meshkore/queues/<conv>.json`. Survives daemon restarts; auto-flushes
@@ -5782,6 +5966,52 @@ def make_handler(daemon: "Daemon"):
                         200,
                         {"conv": cid, "items": items, "generated_at": _iso_now()},
                     )
+            # py-1.12.21 — serve persisted chat uploads.
+            #   GET /chat/uploads/<YYYY-MM-DD>/<filename>
+            # Returns the file with its inferred content-type so the
+            # cockpit's <img src=…> just works. No auth required for
+            # the file body itself — the URL is opaque (random suffix
+            # in the filename), the bucket+file pair is hard to guess,
+            # and the privileged endpoints that produce these URLs
+            # already gate on the portal-token at write time.
+            if p.startswith("/chat/uploads/"):
+                rest = p[len("/chat/uploads/") :]
+                parts = rest.split("/", 1)
+                if len(parts) != 2:
+                    return self._json(400, {"error": "bucket + filename required"})
+                bucket, filename = parts[0], urllib.parse.unquote(parts[1])
+                path = daemon.upload_store.serve_path(bucket, filename)
+                if path is None:
+                    return self._json(404, {"error": "not found"})
+                try:
+                    body_bytes = path.read_bytes()
+                except OSError:
+                    return self._json(404, {"error": "not found"})
+                # Infer content-type from extension; default to octet-stream.
+                ext = path.suffix.lower().lstrip(".")
+                ctype = {
+                    "png": "image/png",
+                    "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg",
+                    "gif": "image/gif",
+                    "webp": "image/webp",
+                    "svg": "image/svg+xml",
+                    "avif": "image/avif",
+                    "bmp": "image/bmp",
+                }.get(ext, "application/octet-stream")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body_bytes)))
+                # Cache for 1h — the filename has a 4-hex rand suffix so
+                # it's effectively immutable; a longer max-age is safe.
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                try:
+                    self.wfile.write(body_bytes)
+                except Exception:
+                    pass
+                return
             # D-CRON-02..05: scheduler introspection.
             if p == "/cron/list":
                 if self._need_auth():
@@ -7048,6 +7278,8 @@ class Daemon:
         # per conv. Auto-flushed after each turn via
         # `_maybe_flush_queue` invoked from ChatRunner's end-of-stream.
         self.chat_queue_manager = ChatQueueManager(self.paths, self.hub)
+        # py-1.12.21 — chat attachment persistence + retention GC.
+        self.upload_store = UploadStore(self.paths, self.cluster)
         # py-1.10.27 — Persistent quota state. Replaces the in-memory
         # `_agent_type_pauses` dict from py-1.10.26. State is keyed by
         # `<platform>/<model>` (the "quota_key" from _agent_manifest)
@@ -7755,16 +7987,34 @@ class Daemon:
                             "content": str(d.get("content") or ""),
                         }
                     )
+        # py-1.12.21 — persist any image attachments to
+        # `.meshkore/uploads/<bucket>/<file>` and embed a small
+        # manifest in the chat.user event so the cockpit can render
+        # thumbnails on hydrate. Failures are silently absorbed —
+        # the dispatch still proceeds with text-only.
+        attachments: List[Dict[str, Any]] = []
+        if has_images:
+            try:
+                attachments = self.upload_store.save_dispatch(
+                    conv=conv,
+                    images=body.get("images")
+                    if isinstance(body.get("images"), list)
+                    else None,
+                    ts_iso=_iso_now(),
+                )
+            except Exception as e:
+                _log(f"upload save_dispatch failed: {e}")
+                attachments = []
         # 1) Emit + persist the user event right away.
-        ev = _append_timeline(
-            self.paths,
-            {
-                "type": "chat.user",
-                "author": author,
-                "text": text,
-                "conv": conv,
-            },
-        )
+        user_ev: Dict[str, Any] = {
+            "type": "chat.user",
+            "author": author,
+            "text": text,
+            "conv": conv,
+        }
+        if attachments:
+            user_ev["attachments"] = attachments
+        ev = _append_timeline(self.paths, user_ev)
         self.hub.broadcast(ev)
         # 2) Queue if a turn is already running for this conv.
         if self.chat_sessions.has(conv):
