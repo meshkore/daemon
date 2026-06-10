@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.16"  # 1.12.16 — ChatSessionReaper: background sweeper (tick=30s) that force-cleans stuck `chat_sessions` slots. Two failure modes covered: (a) subprocess exited without runner.done.set() (broke the slot pop in ChatSessions._wait → conv stuck `live: true` forever → every subsequent /chat/dispatch silently queued → operator sees a STOP that never resolves); (b) hard-timeout (subprocess alive but running > 30 min, treated as deadlocked, force-cancelled). Reap broadcasts conv.activity {live:false} so cockpits drop the stale STOP UI immediately. Boot also runs an initial sweep. Closes operator field report 2026-06-10 IKA cluster (master conv stuck live 2.5 days). "El daemon debería gestionar eso, los usuarios no sabrán hacerlo ni deberían."
+DAEMON_VERSION = "py-1.12.17"  # 1.12.17 — Graceful shutdown drain. SIGTERM/SIGINT no longer immediately tears down the server — instead `request_shutdown` walks the in-flight `chat_sessions` list and waits up to `cluster.yaml.daemon.shutdown_grace_secs` (default 30s) for the subprocesses to finish on their own, broadcasting a `daemon.shutting_down` event to cockpits during the wait. Without this, killing the daemon (deploy, OS shutdown, accidental Ctrl+C) propagates SIGTERM down the process group and EVERY mid-flight claude-code subprocess dies — operator sees a chat with user messages and zero replies (field report 2026-06-10: PID 2020 died 4 min into a turn when I killed the daemon to deploy py-1.12.16). After the grace expires, leftover sessions are still allowed to die (we proceed with shutdown) — same behavior as today, just with an opportunity for short turns to land first. Pair with py-1.12.16 ChatSessionReaper for the case where the subprocess survives but the daemon still crashes.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -9235,10 +9235,88 @@ class Daemon:
                 pass
             self.cleanup()
 
+    # py-1.12.16+: graceful-drain default. Configurable via
+    # `cluster.yaml.daemon.shutdown_grace_secs` (int, 0 = no drain).
+    DEFAULT_SHUTDOWN_GRACE_SECS = 30
+
     def request_shutdown(self) -> None:
         if self.stopping.is_set():
             return
         self.stopping.set()
+        # py-1.12.16+: drain in-flight chat sessions BEFORE tearing down
+        # the server. Without this, SIGTERM kills the daemon → propagates
+        # to every claude-code subprocess → operator's mid-turn work is
+        # lost (field report 2026-06-10: 4-minute-old subprocess died
+        # mid-thinking when the daemon was killed to deploy py-1.12.16,
+        # the user prompt msg_count went up but no assistant reply ever
+        # came back).
+        try:
+            grace_cfg = (
+                self.cluster.data.get("daemon")
+                if isinstance(self.cluster.data, dict)
+                else None
+            ) or {}
+            grace_secs = int(
+                grace_cfg.get("shutdown_grace_secs", self.DEFAULT_SHUTDOWN_GRACE_SECS)
+            )
+        except Exception:
+            grace_secs = self.DEFAULT_SHUTDOWN_GRACE_SECS
+        try:
+            in_flight = list(self.chat_sessions.list_active())
+        except Exception:
+            in_flight = []
+        if in_flight and grace_secs > 0:
+            _log(
+                f"shutdown: draining {len(in_flight)} in-flight session(s) "
+                f"(grace={grace_secs}s) — {in_flight}"
+            )
+            _debug_emit(
+                "shutdown.drain.start",
+                msg=f"draining {len(in_flight)} session(s) with {grace_secs}s grace",
+                lvl="warn",
+                data={"in_flight": in_flight, "grace_secs": grace_secs},
+            )
+            try:
+                self.hub.broadcast(
+                    {
+                        "type": "daemon.shutting_down",
+                        "ts": _iso_now(),
+                        "in_flight": in_flight,
+                        "grace_secs": grace_secs,
+                    }
+                )
+            except Exception:
+                pass
+            deadline = time.time() + grace_secs
+            while time.time() < deadline:
+                try:
+                    still = self.chat_sessions.list_active()
+                except Exception:
+                    still = []
+                if not still:
+                    _log("shutdown: all sessions drained, proceeding")
+                    _debug_emit(
+                        "shutdown.drain.done",
+                        msg="all in-flight sessions finished cleanly",
+                    )
+                    break
+                time.sleep(0.5)
+            else:
+                try:
+                    still = self.chat_sessions.list_active()
+                except Exception:
+                    still = []
+                if still:
+                    _log(
+                        f"shutdown: grace expired with {len(still)} session(s) "
+                        f"still active — proceeding (subprocesses will die): {still}"
+                    )
+                    _debug_emit(
+                        "shutdown.drain.timeout",
+                        msg=f"{len(still)} session(s) still active after {grace_secs}s",
+                        lvl="warn",
+                        data={"still_active": still, "grace_secs": grace_secs},
+                    )
         _log("shutdown requested — closing clients + server")
         try:
             self.hub.broadcast({"type": "daemon.shutdown", "ts": _iso_now()})
