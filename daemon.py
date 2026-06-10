@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.19"  # 1.12.19 — Standard v16 chat-turn queue: actually shipped. The py-1.12.12 release note claimed the 5 routes existed but they were never implemented — the cockpit's clock-icon "enqueue" button hit `POST /chat/conv/<id>/queue` and got 404. This version ships ChatQueueManager (per-conv FIFO at `.meshkore/queues/<conv>.json`) + all 5 routes (GET list, POST enqueue, POST .../edit, POST .../move, POST .../promote, DELETE .../<id>) + WS events queue.item.added|updated|removed|sent + auto-flush hook (after each turn finishes with empty in-memory pending, pop the disk queue head and dispatch as the next turn — operator's accumulated instructions land seamlessly). ChatSessions.start now accepts an `on_idle` callback so the auto-flush runs AFTER the slot is popped, avoiding the chicken-and-egg with chat_dispatch's busy-branch. py-1.12.18 — /chat/dispatch accepts attachments-only payloads.
+DAEMON_VERSION = "py-1.12.20"  # 1.12.20 — ChatSessions.queue merges-on-arrival. When a /chat/dispatch arrives while the conv is busy, the new text is concatenated into the existing pending text with `\n\n` separators instead of appended as a separate item. Pending list is now at most ONE text that grows; `_wait`'s merge always takes the `pending[0]` branch — the agent sees a clean continuous message, no more "Several follow-up instructions while you were working: 1. … 2. …" prefix. Operator clarification 2026-06-10 case 1: messages typed while a turn is running get appended to the in-task pending bubble (one growing bubble), not added as separate disk-queue items. py-1.12.19 — Standard v16 chat-turn queue shipped (was vaporware from py-1.12.12).
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -4800,8 +4800,21 @@ class ChatSessions:
             sess = self._s.get(conv)
             if not sess:
                 return 0
-            sess["pending"].append(text)
-            return len(sess["pending"])
+            # py-1.12.20 — merge-on-arrival. Instead of accumulating
+            # separate pending texts that `_wait` then merges with the
+            # awkward "Several follow-up instructions while you were
+            # working: 1. … 2. …" prefix, we concatenate into a single
+            # pending text with `\n\n` separators. The agent sees one
+            # clean continuation; the cockpit collapses the matching
+            # QUEUED user bubbles into a single growing bubble.
+            # Operator clarification 2026-06-10 case 1: "si mandamos
+            # otro mientras hay uno en espera, añadimos el texto, con
+            # una linea en medio, para que se vea que es otro párrafo."
+            if sess["pending"]:
+                sess["pending"][0] = sess["pending"][0] + "\n\n" + text
+            else:
+                sess["pending"].append(text)
+            return 1
 
     def start(self, conv: str, runner: ChatRunner, on_chain, on_idle=None) -> None:
         with self._lock:
