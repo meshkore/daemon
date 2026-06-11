@@ -66,6 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # daemon.py in source; the bundler concatenates them into dist/daemon.py
 # in dependency order, stripping these import lines from the bundled
 # output. Source-tree runs hit the sibling files via sys.path[0].
+from hub import Hub, WSClient  # noqa: E402
 from paths import TLS_BUNDLE_NAME, TLS_CERT_FILENAME, TLS_KEY_FILENAME, Paths  # noqa: E402
 from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  # noqa: E402
 
@@ -73,9 +74,8 @@ from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  #
 # Configuration
 
 PORT_RANGE = (5570, 5589)
-HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.25"  # 1.12.25 — DM3 first real extraction. daemon.py shrank by ~550 LOC: Paths + TLS constants moved to daemon/paths.py; ChatArchive, StorageReport, UploadStore, ChatQueueManager moved to daemon/storage.py. daemon.py imports via `from paths import …` / `from storage import …`. Bundler (daemon/bundle.py) concatenates in dep order paths → storage → daemon, strips sibling imports + duplicate `from __future__`, prepends header. Bundle is behaviour-equivalent to pre-DM3 — full suite (68 cases incl. 5 parity) stays green. Initiative `daemon-modularize`. New feature: daemon.modular.layer-1.v1. 1.12.24 — DM2 diagnostics (SIGUSR1 + PoolHTTPServer). 1.12.23 — Standard v23 initiative-anchored execution.
+DAEMON_VERSION = "py-1.12.26"  # 1.12.26 — DM4 Hub extraction. WSClient + HEARTBEAT_SEC + Hub moved to daemon/hub.py (~115 LOC); daemon.py imports them via `from hub import …`. Bundler MODULES grew to [paths, hub, storage]. daemon.py is now -715 LOC vs pre-DM3. Feature: daemon.modular.layer-2.v1. 1.12.25 — DM3 paths.py + storage.py. 1.12.24 — DM2 diagnostics (SIGUSR1 + PoolHTTPServer). 1.12.23 — Standard v23 initiative-anchored execution.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -1373,93 +1373,6 @@ def normalize_status(s: Any) -> str:
     if s in ("backlog", "next", "active", "blocked", "done"):
         return s
     return "backlog"
-
-
-# ───────────────────────────────────────────────────────────────────────
-# WebSocket server — minimal text-frame implementation
-
-
-class WSClient:
-    __slots__ = ("sock", "closed")
-
-    def __init__(self, sock: socket.socket):
-        self.sock = sock
-        self.closed = False
-
-    def send_text(self, payload: str) -> None:
-        """Send a single, unmasked, unfragmented text frame (server → client)."""
-        if self.closed:
-            return
-        data = payload.encode("utf-8")
-        header = bytearray()
-        header.append(0x81)  # FIN + text opcode
-        n = len(data)
-        if n < 126:
-            header.append(n)
-        elif n < 65536:
-            header.append(126)
-            header.extend(struct.pack(">H", n))
-        else:
-            header.append(127)
-            header.extend(struct.pack(">Q", n))
-        try:
-            self.sock.sendall(bytes(header) + data)
-        except OSError:
-            self.close()
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-
-class Hub:
-    """Broadcaster — keeps the set of connected clients and a heartbeat."""
-
-    def __init__(self):
-        self._clients: set[WSClient] = set()
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-
-    def add(self, client: WSClient) -> None:
-        with self._lock:
-            self._clients.add(client)
-
-    def remove(self, client: WSClient) -> None:
-        with self._lock:
-            self._clients.discard(client)
-        client.close()
-
-    def broadcast(self, event: Dict[str, Any]) -> None:
-        payload = json.dumps(event, separators=(",", ":"))
-        with self._lock:
-            dead = []
-            for c in list(self._clients):
-                c.send_text(payload)
-                if c.closed:
-                    dead.append(c)
-            for c in dead:
-                self._clients.discard(c)
-
-    def shutdown(self) -> None:
-        self._stop.set()
-        with self._lock:
-            for c in list(self._clients):
-                c.close()
-            self._clients.clear()
-
-    def _heartbeat_loop(self) -> None:
-        while not self._stop.wait(HEARTBEAT_SEC):
-            self.broadcast({"type": "heartbeat", "ts": _iso_now()})
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -8972,6 +8885,7 @@ class Daemon:
             "diagnostics.sigusr1.v1",  # py-1.12.24 — `kill -USR1 <pid>` dumps every thread's stack to .meshkore/.runtime/threads.log via faulthandler.register. Designed for live diagnosis of lock-contention bugs like the 2026-06-10 ikamiro hang.
             "http.bounded-pool.v1",  # py-1.12.24 — ThreadingHTTPServer replaced with PoolHTTPServer (ThreadPoolExecutor with bounded max_workers; default 64, configurable via cluster.yaml.daemon.http.max_workers). Caps OS thread count regardless of request rate.
             "daemon.modular.layer-1.v1",  # py-1.12.25 DM3 — Paths + storage classes extracted to daemon/paths.py + daemon/storage.py. Bundler concatenates in dep order. Cockpit may use this feature to gate "view source layout" affordances in the future.
+            "daemon.modular.layer-2.v1",  # py-1.12.26 DM4 — Hub + WSClient + HEARTBEAT_SEC extracted to daemon/hub.py. ws.broadcast contract unchanged; cockpit + tests unaffected.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
