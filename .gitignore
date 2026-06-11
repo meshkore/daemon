@@ -28,4 +28,5 @@ state.json
 htmlcov/
 .pytest_cache/
 .pre-commit.bak
-dist/  # bundle output; canonical copy ships under webapp/reference/...
+# bundle output; canonical copy ships under webapp/reference/...
+dist/

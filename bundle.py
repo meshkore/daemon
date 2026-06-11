@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Bundle the daemon package into a single self-contained ``dist/daemon.py``.
 
-DM1 form: zero code moves yet. The "package" is one file (``daemon.py``);
-the bundler prepends an auto-generated header + writes the result. This
-exists to validate the publish pipeline BEFORE any extraction (DM3-DM7)
-moves code around.
+DM3+ form: walks the source modules in dependency order, strips the
+sibling-module imports (each module's body becomes part of one big
+file's global namespace, so the cross-module names resolve naturally),
+prepends an auto-generated header, writes ``dist/daemon.py``.
 
-DM3 onward this script learns to walk a real package layout and concat
-modules in dependency order. The header contract — git rev + timestamp
-marker — stays the same so the bundled artifact remains traceable to
-source for every release."""
+Dependency order (top of bundle → bottom):
+
+    paths.py    — Paths + TLS constants. No sibling deps.
+    storage.py  — ChatArchive, StorageReport, UploadStore,
+                  ChatQueueManager. Depends on paths.
+    daemon.py   — wiring + main + everything else. Depends on both.
+
+Shadowing rule: when paths.py / storage.py and daemon.py both define
+the same name (notably ``_log`` / ``_iso_now`` — storage.py keeps
+local copies for source-tree dev; daemon.py has the full
+debug-stream-aware versions), the LATER definition wins in Python
+module namespace. Bundle ordering must keep daemon.py last so
+production gets the canonical helpers."""
 
 from __future__ import annotations
 
@@ -21,6 +30,14 @@ ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "daemon.py"
 DIST = ROOT / "dist"
 OUT = DIST / "daemon.py"
+
+# Sibling modules to inline ahead of daemon.py, in dep order.
+MODULES = ["paths.py", "storage.py"]
+
+# Lines of the form ``from <mod> import …`` where <mod> is one of our
+# sibling modules. Stripped from each file so the bundle's flat global
+# namespace doesn't trip over missing modules.
+SIBLING_PREFIXES = tuple(f"from {m[:-3]} import " for m in MODULES)
 
 
 def _git_rev() -> str:
@@ -43,18 +60,52 @@ def _header(rev: str) -> str:
     )
 
 
+def _strip_sibling_imports(text: str) -> str:
+    """Drop sibling-module import lines + duplicate ``from __future__``
+    lines. Python's __future__ imports must appear at the very top of
+    a file; the bundle puts one canonical line at the very top and
+    every inlined module's local copy is stripped."""
+    drop_prefixes = SIBLING_PREFIXES + ("from __future__ import ",)
+    keep = [
+        line
+        for line in text.splitlines(keepends=True)
+        if not line.lstrip().startswith(drop_prefixes)
+    ]
+    return "".join(keep)
+
+
+def _strip_shebang(text: str) -> str:
+    """Drop the leading ``#!...`` line if present so the bundle has
+    exactly one (the header's)."""
+    if text.startswith("#!"):
+        return text.split("\n", 1)[1]
+    return text
+
+
 def bundle() -> Path:
-    """Write the bundled artifact + a tls/ symlink alongside it. Strips
-    the source file's own shebang (if any) so we don't end up with two.
-    The tls/ link mirrors the production layout — the daemon's
-    ``_find_tls_bundle()`` looks for ``<here>/tls/`` next to its own
-    ``__file__``; the publisher in DM6 must copy (not link) for the
-    public CDN."""
+    """Write the bundled artifact + a tls/ symlink alongside it.
+
+    Order: header → each sibling module (paths, storage, …) → daemon.py.
+    Each part is sibling-import-stripped. The tls/ link mirrors the
+    production layout — the daemon's ``_find_tls_bundle()`` looks for
+    ``<here>/tls/`` next to its own ``__file__``; the publisher in DM6
+    must copy (not link) for the public CDN."""
     DIST.mkdir(parents=True, exist_ok=True)
-    body = SRC.read_text()
-    if body.startswith("#!"):
-        body = body.split("\n", 1)[1]
-    OUT.write_text(_header(_git_rev()) + body)
+    parts = [
+        _header(_git_rev()),
+        "from __future__ import annotations\n\n",
+    ]
+    for mod in MODULES:
+        body = (ROOT / mod).read_text()
+        parts.append(
+            f"\n\n# ── inlined from daemon/{mod} (DM3+ bundle) ─────────────────────────\n"
+        )
+        parts.append(_strip_sibling_imports(_strip_shebang(body)))
+    parts.append(
+        "\n\n# ── inlined from daemon/daemon.py — main module ──────────────────────\n"
+    )
+    parts.append(_strip_sibling_imports(_strip_shebang(SRC.read_text())))
+    OUT.write_text("".join(parts))
     OUT.chmod(0o755)
     tls_link = DIST / "tls"
     if not tls_link.exists():
