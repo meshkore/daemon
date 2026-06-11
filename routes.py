@@ -31,33 +31,15 @@ import struct
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hub import WSClient
-
-
-# Local stubs — shadowed by daemon.py's real definitions in the bundle.
-def _iso_now() -> str:
-    return (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
-
-
-def _log(msg: str) -> None:
-    print(f"[routes] {msg}", flush=True)
-
-
-def _debug_emit(*args, **kwargs) -> None:  # no-op in source-tree
-    pass
-
+from utils import _debug_emit, _iso_now, debug_enabled, get_debug_log  # DM7
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-_DEBUG_LOG: Any = None  # shadowed in bundle
 
 
 def make_handler(daemon: Any):
@@ -238,7 +220,7 @@ def make_handler(daemon: Any):
             if p == "/debug/tail":
                 if self._need_auth():
                     return
-                if _DEBUG_LOG is None:
+                if not debug_enabled():
                     return self._json(200, {"events": [], "retained_secs": 0})
                 try:
                     last_secs = int(q.get("last") or "300")
@@ -247,7 +229,7 @@ def make_handler(daemon: Any):
                 tag_csv = (q.get("tag") or "").strip()
                 tags = set(t for t in tag_csv.split(",") if t) or None
                 lvl = (q.get("level") or "debug").lower()
-                events, retained = _DEBUG_LOG.tail(
+                events, retained = get_debug_log().tail(
                     last_secs=last_secs,
                     tags=tags,
                     min_level=lvl,
@@ -585,7 +567,7 @@ def make_handler(daemon: Any):
             # `cockpit` so a forged `src: "daemon"` from the wire is
             # impossible.
             if p == "/debug/log":
-                if _DEBUG_LOG is None:
+                if not debug_enabled():
                     return self._json(503, {"error": "debug stream not ready"})
                 body = self._read_json_body()
                 events = body.get("events") if isinstance(body, dict) else None
@@ -601,7 +583,7 @@ def make_handler(daemon: Any):
                     conv = ev.get("conv")
                     agent_id = ev.get("agent_id")
                     data = ev.get("data") if isinstance(ev.get("data"), dict) else None
-                    _DEBUG_LOG.emit(
+                    get_debug_log().emit(
                         tag=tag,
                         msg=msg,
                         lvl=lvl,

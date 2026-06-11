@@ -30,14 +30,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-
-# Local stubs — shadowed in bundle by daemon.py's later definitions.
-def _log(msg: str) -> None:
-    print(f"[chat] {msg}", flush=True)
-
-
-def _debug_emit(*args, **kwargs) -> None:  # no-op in source-tree dev
-    pass
+from utils import _debug_emit, _log  # DM7 — real helpers, no more shadow stubs
 
 
 class ChatSessions:

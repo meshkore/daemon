@@ -22,38 +22,22 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-# Local stubs — shadowed in bundle by daemon.py's later definitions.
-def _iso_now() -> str:
-    return (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
+from utils import _debug_emit, _iso_at, _iso_now, _log  # DM7 — real helpers
 
 
-def _iso_at(epoch_secs: int) -> str:
-    return datetime.fromtimestamp(epoch_secs, timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-
-
-def _log(msg: str) -> None:
-    print(f"[quota] {msg}", flush=True)
-
-
-def _debug_emit(*args, **kwargs) -> None:  # no-op in source-tree
-    pass
-
-
+# Shadowed in bundle — `_agent_manifest` + `AGENT_PROMPTS` live in daemon.py
+# (they reference the full prompt catalog). At call time the bundle's
+# late-binding global lookup resolves to the real ones.
 def _agent_manifest(agent_type: str) -> Dict[str, Any]:  # stub
     return {"quota_key": "claude-code/auto"}
 
 
-AGENT_PROMPTS: Dict[str, Any] = {}  # shadowed in bundle
+AGENT_PROMPTS: Dict[str, Any] = {}
 
 
 class QuotaState:

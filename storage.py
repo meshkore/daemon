@@ -33,19 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from paths import Paths
-
-
-# Local copies — shadowed in bundle by daemon.py's later definitions
-# (see module docstring). For source-tree runs these are sufficient.
-def _iso_now() -> str:
-    return (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
-
-
-def _log(msg: str) -> None:
-    print(f"[storage {_iso_now()}] {msg}", flush=True)
+from utils import _iso_now, _log  # DM7 — real helpers, no more shadow stubs
 
 
 # ───────────────────────────────────────────────────────────────────────

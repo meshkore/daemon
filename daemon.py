@@ -70,13 +70,24 @@ from paths import TLS_BUNDLE_NAME, TLS_CERT_FILENAME, TLS_KEY_FILENAME, Paths  #
 from quota import QuotaProber, QuotaState  # noqa: E402
 from routes import make_handler  # noqa: E402
 from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  # noqa: E402
+from utils import (  # noqa: E402
+    DebugLog,
+    _debug_emit,
+    _debug_enabled,
+    _iso_now,
+    _iter_timeline_files,
+    _log,
+    _read_timeline_file,
+    debug_enabled,
+    set_debug_log,
+)
 
 # ───────────────────────────────────────────────────────────────────────
 # Configuration
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.29"  # 1.12.29 — DM6 step 2: HTTP routing extraction. make_handler + _ws_read_frame + _recv_exact moved to daemon/routes.py (~1000 LOC). The Handler class (every do_GET / do_POST route) is inside make_handler so it closes over the daemon ref; coupling preserved verbatim. Bundler MODULES = [paths, hub, storage, chat, quota, routes]. daemon.py now -2240 LOC vs pre-DM3 (from 10918 → 8763). Feature: daemon.modular.layer-5.v1. 1.12.28 — DM6 step 1 quota. 1.12.27 — DM5 chat. 1.12.26 — DM4 Hub.
+DAEMON_VERSION = "py-1.12.30"  # 1.12.30 — DM7 phase A: utils.py extraction. _iso_now, _iso_at, _log, DebugLog, _debug_emit, _debug_enabled, _debug_redact, _iter_timeline_files, _read_timeline_file moved to daemon/utils.py (~390 LOC). _DEBUG_LOG singleton now wired via set_debug_log/debug_enabled/get_debug_log functions — sibling modules drop their shadow stubs and import REAL helpers from utils.py. Bundler multi-line import strip fix (parens with trailing comments). MODULES = [paths, utils, hub, storage, chat, quota, routes]. daemon.py -340 LOC (8763 → 8423). Feature: daemon.modular.layer-6.v1. 1.12.29 — DM6 step 2 routes. 1.12.28 — DM6 step 1 quota.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -1485,42 +1496,6 @@ def _conversation_history(
         out.append("")  # blank line before recent block
     # Recent turns at full 800-char truncation (same as before).
     out.extend(f"{w}: {t[:800]}" for w, t in recent)
-    return out
-
-
-def _iter_timeline_files(paths: "Paths") -> List[Any]:
-    """All timeline files (jsonl + jsonl.gz from rotation)."""
-    if not paths.timeline_dir.exists():
-        return []
-    files = list(paths.timeline_dir.glob("*.jsonl"))
-    files.extend(paths.timeline_dir.glob("*.jsonl.gz"))
-    # Also look in the archive subdir produced by rotation.
-    archive_dir = paths.timeline_dir / "archive"
-    if archive_dir.exists():
-        files.extend(archive_dir.glob("*.jsonl"))
-        files.extend(archive_dir.glob("*.jsonl.gz"))
-    return files
-
-
-def _read_timeline_file(path: Any) -> List[Dict[str, Any]]:
-    """Parse one timeline file (jsonl or jsonl.gz) → list of events.
-    Never raises; bad lines / unreadable files yield empty list."""
-    try:
-        if str(path).endswith(".gz"):
-            import gzip
-
-            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
-                lines = fh.read().splitlines()
-        else:
-            lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
     return out
 
 
@@ -7012,11 +6987,9 @@ class Daemon:
             # /debug/log buffer on this — when disabled it drains
             # silently instead of round-tripping.
             "debug": {
-                "enabled": _DEBUG_LOG is not None,
+                "enabled": debug_enabled(),
                 "path": (
-                    str(self.paths.runtime / "debug.jsonl")
-                    if _DEBUG_LOG is not None
-                    else None
+                    str(self.paths.runtime / "debug.jsonl") if debug_enabled() else None
                 ),
             },
             # py-1.10.26 — Agent-type pause state. Back-compat projection
@@ -7260,7 +7233,7 @@ class Daemon:
             "paused_agent_types": self._paused_agent_types_view(),
             "quota": self.quota.view(),
             "debug": {
-                "enabled": _DEBUG_LOG is not None,
+                "enabled": debug_enabled(),
             },
             "version": DAEMON_VERSION,
             "generated_at": _iso_now(),
@@ -7368,6 +7341,7 @@ class Daemon:
             "daemon.modular.layer-3.v1",  # py-1.12.27 DM5 — ChatSessions + ChatSessionReaper extracted to daemon/chat.py. Lock invariant doc'd. ChatRunner deferred to a later task.
             "daemon.modular.layer-4.v1",  # py-1.12.28 DM6 step 1 — QuotaState + QuotaProber extracted to daemon/quota.py.
             "daemon.modular.layer-5.v1",  # py-1.12.29 DM6 step 2 — make_handler + WS read helpers extracted to daemon/routes.py.
+            "daemon.modular.layer-6.v1",  # py-1.12.30 DM7 phase A — utils.py extracted. Sibling modules drop shadow stubs; single source of truth for _log/_iso_now/_debug_emit + DebugLog singleton wired via setter/getter functions.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -7751,16 +7725,18 @@ class Daemon:
         # py-1.10.21 — Honour `cluster.yaml.debug.enabled: false` for
         # downstream clusters that don't want the disk footprint.
         # Default is ON (this is MeshKore-native dogfooding).
-        global _DEBUG_LOG
+        # DM7 — _DEBUG_LOG lives in utils.py. set_debug_log() wires it
+        # so every sibling module's late-binding lookup finds the same
+        # singleton. Works identically in source-tree dev and bundle.
         if _debug_enabled(self.cluster):
-            _DEBUG_LOG = DebugLog(self.paths.runtime / "debug.jsonl")
+            set_debug_log(DebugLog(self.paths.runtime / "debug.jsonl"))
             _debug_emit(
                 "boot",
                 msg=f"daemon {DAEMON_VERSION} starting on port {self.port}",
                 data={"identity": self.identity, "cluster": self.cluster.id},
             )
         else:
-            _DEBUG_LOG = None
+            set_debug_log(None)
             _log("debug stream: disabled by cluster.yaml.debug.enabled=false")
         handler = make_handler(self)
         # py-1.12.24 — Bounded worker pool. Cap configurable via
@@ -7961,308 +7937,6 @@ class Daemon:
 
 # ───────────────────────────────────────────────────────────────────────
 # Helpers
-
-
-def _iso_now() -> str:
-    return (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
-
-
-def _iso_at(epoch_secs: int) -> str:
-    """ISO-8601 UTC for a given epoch — used for pause expiry stamps
-    (py-1.10.26). Cheap; no ms component (we only care about the
-    minute granularity for rate-limit cooldowns)."""
-    return datetime.fromtimestamp(epoch_secs, timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-
-
-# ── Debug stream (initiative `debug-stream`, py-1.10.17) ──────────────
-# Module-level singleton so `_log()` and any free function can emit
-# without threading a `daemon` ref through every call site.
-_DEBUG_LOG: Optional["DebugLog"] = None
-
-
-def _log(msg: str) -> None:
-    print(f"[meshcore-py {_iso_now()}] {msg}", flush=True)
-    # py-1.10.17 — mirror every daemon log line into the debug stream
-    # so a single tail covers the unstructured prose + the structured
-    # event hooks (architect-wake, chat-dispatch, …) below.
-    if _DEBUG_LOG is not None:
-        try:
-            _DEBUG_LOG.emit(tag="log", lvl="info", msg=msg, src="daemon")
-        except Exception:
-            # Debug stream failures must never block the program.
-            pass
-
-
-class DebugLog:
-    """Append-only JSONL debug stream.
-
-    Path: `.meshkore/.runtime/debug.jsonl`. Each line is one event:
-        {"ts": "...", "src": "daemon|cockpit|agent", "lvl": "...",
-         "tag": "...", "conv"?: ..., "agent_id"?: ..., "msg": "...",
-         "data"?: { ... }}
-
-    Retention: when the file exceeds `MAX_BYTES`, the writer reads it
-    back, keeps only events whose `ts` falls within `RETAIN_SECS` of
-    the current instant, and atomically rewrites the file. Worst-case
-    trim cost: O(file_size) but bounded by MAX_BYTES.
-
-    Thread-safe. Failures never raise — the daemon must keep running
-    even if the log disk is full or read-only."""
-
-    MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-    RETAIN_SECS = 30 * 60  # 30 min
-    TRIM_CHECK_EVERY = 50  # check size every N appends, not every time
-
-    def __init__(self, path: "Path") -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._writes_since_check = 0
-        # Touch the file so subsequent appends never hit ENOENT mid-write.
-        if not self.path.exists():
-            try:
-                self.path.write_text("")
-            except OSError:
-                pass
-        # py-1.10.21 — Trim once on boot. A long-running daemon that
-        # writes < TRIM_CHECK_EVERY events between restarts (low-traffic
-        # day) was leaving the file with stale head events that
-        # predated the rolling window by hours. One trim at startup
-        # gives the operator a clean window immediately.
-        with self._lock:
-            self._maybe_trim_locked()
-
-    def emit(
-        self,
-        *,
-        tag: str,
-        msg: str = "",
-        lvl: str = "info",
-        src: str = "daemon",
-        conv: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        rec: Dict[str, Any] = {
-            "ts": _iso_now(),
-            "src": src,
-            "lvl": lvl,
-            "tag": tag,
-            "msg": msg,
-        }
-        if conv:
-            rec["conv"] = conv
-        if agent_id:
-            rec["agent_id"] = agent_id
-        if data:
-            # Best-effort redaction. Token-like values get masked.
-            rec["data"] = _debug_redact(data)
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
-        with self._lock:
-            try:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except OSError:
-                return
-            self._writes_since_check += 1
-            if self._writes_since_check >= self.TRIM_CHECK_EVERY:
-                self._writes_since_check = 0
-                self._maybe_trim_locked()
-
-    def _maybe_trim_locked(self) -> None:
-        # py-1.10.21 — Trim by EITHER size OR age. The original code
-        # only checked size, so on low-traffic days the file kept
-        # events from 2-3 hours ago even though the convention says
-        # "30 min rolling window". We now also inspect the first line
-        # cheaply: if it's older than RETAIN_SECS we know the head is
-        # stale and read the full file to rewrite.
-        try:
-            size = self.path.stat().st_size
-        except OSError:
-            return
-        cutoff = time.time() - self.RETAIN_SECS
-        need_trim = size > self.MAX_BYTES
-        if not need_trim:
-            # Cheap age probe: read just the first non-empty line.
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                            ts_str = str(rec.get("ts") or "")
-                            norm = (
-                                ts_str[:-1] + "+00:00"
-                                if ts_str.endswith("Z")
-                                else ts_str
-                            )
-                            head_ts = datetime.fromisoformat(norm).timestamp()
-                            if head_ts < cutoff:
-                                need_trim = True
-                        except (ValueError, TypeError):
-                            pass
-                        break
-            except OSError:
-                return
-        if not need_trim:
-            return
-        try:
-            raw = self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return
-        kept: List[str] = []
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            ts_str = ""
-            try:
-                rec = json.loads(line)
-                ts_str = rec.get("ts") or ""
-            except (ValueError, TypeError):
-                continue
-            try:
-                # ts ends with Z; strptime via fromisoformat after Z→+00:00.
-                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
-                if datetime.fromisoformat(norm).timestamp() >= cutoff:
-                    kept.append(line)
-            except (ValueError, TypeError):
-                continue
-        new_blob = "\n".join(kept) + ("\n" if kept else "")
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            tmp.write_text(new_blob, encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError:
-            return
-
-    def tail(
-        self,
-        *,
-        last_secs: int = 300,
-        tags: Optional[set[str]] = None,
-        min_level: str = "debug",
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """Return (events, retained_secs). `retained_secs` is the
-        actual age of the oldest event still on disk — useful to detect
-        when the operator asked for a window wider than retention."""
-        levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
-        min_rank = levels.get(min_level.lower(), 0)
-        cutoff = time.time() - max(1, last_secs)
-        out: List[Dict[str, Any]] = []
-        oldest_ts: Optional[float] = None
-        try:
-            raw = self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return out, 0
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            ts_str = str(rec.get("ts") or "")
-            try:
-                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
-                ts = datetime.fromisoformat(norm).timestamp()
-            except (ValueError, TypeError):
-                continue
-            if oldest_ts is None or ts < oldest_ts:
-                oldest_ts = ts
-            if ts < cutoff:
-                continue
-            if tags and rec.get("tag") not in tags:
-                continue
-            if levels.get(str(rec.get("lvl") or "info"), 1) < min_rank:
-                continue
-            out.append(rec)
-        retained = int(time.time() - oldest_ts) if oldest_ts else 0
-        return out, retained
-
-
-_REDACT_KEYS = {
-    "token",
-    "authorization",
-    "bearer",
-    "api_key",
-    "apikey",
-    "secret",
-    "password",
-}
-
-
-def _debug_redact(data: Any) -> Any:
-    """Best-effort scrub of token-like values in arbitrary payloads."""
-    if isinstance(data, dict):
-        out: Dict[str, Any] = {}
-        for k, v in data.items():
-            if str(k).lower() in _REDACT_KEYS:
-                out[k] = "<redacted>"
-            else:
-                out[k] = _debug_redact(v)
-        return out
-    if isinstance(data, list):
-        return [_debug_redact(x) for x in data]
-    if isinstance(data, str) and len(data) > 24 and data.startswith("Bearer "):
-        return "Bearer <redacted>"
-    return data
-
-
-def _debug_emit(
-    tag: str,
-    *,
-    msg: str = "",
-    lvl: str = "info",
-    src: str = "daemon",
-    conv: Optional[str] = None,
-    agent_id: Optional[str] = None,
-    data: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Convenience: skip the `if _DEBUG_LOG is not None:` dance at
-    every emit site. No-op when the daemon hasn't initialised yet OR
-    when the operator opted out via `cluster.yaml.debug.enabled: false`
-    (py-1.10.21)."""
-    if _DEBUG_LOG is None:
-        return
-    try:
-        _DEBUG_LOG.emit(
-            tag=tag,
-            msg=msg,
-            lvl=lvl,
-            src=src,
-            conv=conv,
-            agent_id=agent_id,
-            data=data,
-        )
-    except Exception:
-        pass
-
-
-def _debug_enabled(cluster: "Cluster") -> bool:
-    """Read `cluster.yaml.debug.enabled` (default `True`). Falsy disables
-    DebugLog initialisation entirely — no file written, /debug/tail
-    returns empty, /debug/log accepts but drops. py-1.10.21. Note the
-    default is ON for MeshKore native development; downstream clusters
-    that want zero disk footprint flip it to false."""
-    try:
-        block = cluster.data.get("debug") if isinstance(cluster.data, dict) else None
-        if not isinstance(block, dict):
-            return True
-        v = block.get("enabled")
-        if v is None:
-            return True
-        if isinstance(v, bool):
-            return v
-        return str(v).strip().lower() not in ("0", "false", "no", "off")
-    except Exception:
-        return True
 
 
 def _hostname_default() -> str:

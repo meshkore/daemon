@@ -32,7 +32,15 @@ DIST = ROOT / "dist"
 OUT = DIST / "daemon.py"
 
 # Sibling modules to inline ahead of daemon.py, in dep order.
-MODULES = ["paths.py", "hub.py", "storage.py", "chat.py", "quota.py", "routes.py"]
+MODULES = [
+    "paths.py",
+    "utils.py",
+    "hub.py",
+    "storage.py",
+    "chat.py",
+    "quota.py",
+    "routes.py",
+]
 
 # Lines of the form ``from <mod> import …`` where <mod> is one of our
 # sibling modules. Stripped from each file so the bundle's flat global
@@ -64,13 +72,27 @@ def _strip_sibling_imports(text: str) -> str:
     """Drop sibling-module import lines + duplicate ``from __future__``
     lines. Python's __future__ imports must appear at the very top of
     a file; the bundle puts one canonical line at the very top and
-    every inlined module's local copy is stripped."""
+    every inlined module's local copy is stripped.
+
+    Handles the multi-line form ``from <sibling> import (\\n  A,\\n  B,\\n)``:
+    when the drop-prefix line ends with ``(``, every subsequent line is
+    dropped until the matching ``)``."""
     drop_prefixes = SIBLING_PREFIXES + ("from __future__ import ",)
-    keep = [
-        line
-        for line in text.splitlines(keepends=True)
-        if not line.lstrip().startswith(drop_prefixes)
-    ]
+    keep: list[str] = []
+    skip_until_close = False
+    for line in text.splitlines(keepends=True):
+        if skip_until_close:
+            if ")" in line:
+                skip_until_close = False
+            continue
+        if line.lstrip().startswith(drop_prefixes):
+            # If this opens a multi-line `from X import (` (has `(` but no
+            # matching `)` on the same line, ignoring trailing comments),
+            # skip continuation lines until we see the closing `)`.
+            if "(" in line and ")" not in line.split("#", 1)[0]:
+                skip_until_close = True
+            continue
+        keep.append(line)
     return "".join(keep)
 
 
