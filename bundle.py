@@ -32,7 +32,7 @@ DIST = ROOT / "dist"
 OUT = DIST / "daemon.py"
 
 # Sibling modules to inline ahead of daemon.py, in dep order.
-MODULES = ["paths.py", "hub.py", "storage.py", "chat.py"]
+MODULES = ["paths.py", "hub.py", "storage.py", "chat.py", "quota.py"]
 
 # Lines of the form ``from <mod> import …`` where <mod> is one of our
 # sibling modules. Stripped from each file so the bundle's flat global
