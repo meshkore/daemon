@@ -14,9 +14,11 @@ reference. Constructor-style "all deps explicit" would mean 30+
 parameters; the closure is cleaner.
 
 Bundler note: ``BaseHTTPRequestHandler``, ``_log``, ``_iso_now``,
-``_debug_emit``, ``MAX_BODY_BYTES``, ``WS_GUID``, ``DAEMON_VERSION``,
-``_DEBUG_LOG`` are looked up at call time. Local stubs at the top
-are shadowed by daemon.py's real definitions in ``dist/daemon.py``."""
+``_debug_emit``, ``_DEBUG_LOG`` are looked up at call time. Local
+stubs at the top are shadowed by daemon.py's real definitions in
+``dist/daemon.py``. The daemon version string is reached via
+``daemon.daemon_version`` (instance attribute) — single source of
+truth in daemon.py, no per-module duplication."""
 
 from __future__ import annotations
 
@@ -53,7 +55,6 @@ def _debug_emit(*args, **kwargs) -> None:  # no-op in source-tree
     pass
 
 
-DAEMON_VERSION = "py-unknown"  # shadowed in bundle
 MAX_BODY_BYTES = 4 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _DEBUG_LOG: Any = None  # shadowed in bundle
@@ -151,7 +152,7 @@ def make_handler(daemon: Any):
             # Expose-Headers entry is required because Allow-Origin
             # is `*` — without it, browser JS sees the response but
             # cannot read this custom header.
-            self.send_header("X-MeshKore-Daemon-Version", DAEMON_VERSION)
+            self.send_header("X-MeshKore-Daemon-Version", daemon.daemon_version)
             self.send_header(
                 "Access-Control-Expose-Headers", "X-MeshKore-Daemon-Version"
             )
@@ -211,7 +212,7 @@ def make_handler(daemon: Any):
                         "nonce": nonce,
                         "sig": sig,
                         "alg": "HMAC-SHA256",
-                        "version": DAEMON_VERSION,
+                        "version": daemon.daemon_version,
                         "ts": _iso_now(),
                     },
                 )

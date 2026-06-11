@@ -5219,6 +5219,11 @@ class Daemon:
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
     ):
         self.paths = paths
+        # DM6 step 2 — instance-bound version so routes.py (and any other
+        # extracted module) reads from `daemon.daemon_version` instead of
+        # the module-level DAEMON_VERSION (which in source-tree dev only
+        # exists in daemon.py's namespace, not the sibling module's).
+        self.daemon_version = DAEMON_VERSION
         self.cluster = Cluster(paths)
         # py-1.2.0 — Standard v7 migration: write a default `daemon:`
         # block into cluster.yaml if it's missing. Idempotent; quiet
