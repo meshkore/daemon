@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "parity: runs against both source tree and bundled dist/daemon.py",
+    "slow: spawns a daemon subprocess (slower than in-process tests)",
+    "cluster(name): which preset cluster the daemon fixture should build (empty | populated | heavy_archive)",
+    "target(which): which daemon binary to spawn — 'source' (default) or 'bundle'",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "dist/*", ".venv/*"]
+branch = true
+parallel = true  # subprocess + main process produce separate .coverage files
+concurrency = ["thread"]
+sigterm = true  # daemon dies via SIGTERM — coverage must flush before exit
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

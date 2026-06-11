@@ -21,3 +21,10 @@ __pycache__/
 # State produced by running the daemon
 .meshkore/
 state.json
+
+# DM0 — test runner artefacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+dist/
