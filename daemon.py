@@ -66,6 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # daemon.py in source; the bundler concatenates them into dist/daemon.py
 # in dependency order, stripping these import lines from the bundled
 # output. Source-tree runs hit the sibling files via sys.path[0].
+from chat import ChatSessionReaper, ChatSessions  # noqa: E402
 from hub import Hub, WSClient  # noqa: E402
 from paths import TLS_BUNDLE_NAME, TLS_CERT_FILENAME, TLS_KEY_FILENAME, Paths  # noqa: E402
 from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  # noqa: E402
@@ -75,7 +76,7 @@ from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  #
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.26"  # 1.12.26 — DM4 Hub extraction. WSClient + HEARTBEAT_SEC + Hub moved to daemon/hub.py (~115 LOC); daemon.py imports them via `from hub import …`. Bundler MODULES grew to [paths, hub, storage]. daemon.py is now -715 LOC vs pre-DM3. Feature: daemon.modular.layer-2.v1. 1.12.25 — DM3 paths.py + storage.py. 1.12.24 — DM2 diagnostics (SIGUSR1 + PoolHTTPServer). 1.12.23 — Standard v23 initiative-anchored execution.
+DAEMON_VERSION = "py-1.12.27"  # 1.12.27 — DM5 (reduced scope) chat coordinator extraction. ChatSessions + ChatSessionReaper moved to daemon/chat.py (~290 LOC). The lock-prone code from the 2026-06-10 incident now lives in a focused file where the lock invariant ("never call self.daemon._broadcast_conv_activity while holding ChatSessions._lock") is doc'd in the module header. ChatRunner (~800 LOC, many helper deps) deliberately stays in daemon.py — extracted in a later task with utils.py prep. Bundler MODULES = [paths, hub, storage, chat]. daemon.py now -960 LOC vs pre-DM3. Feature: daemon.modular.layer-3.v1. 1.12.26 — DM4 Hub. 1.12.25 — DM3 paths+storage. 1.12.24 — DM2 diagnostics. 1.12.23 — Standard v23.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -4420,156 +4421,6 @@ class RunStore:
         return out[:limit]
 
 
-class ChatSessions:
-    """conv → active runner + pending buffer. Same mid-turn-merge
-    protocol as Node's chatSessions: a second prompt while running
-    gets concatenated and runs as the next turn automatically."""
-
-    def __init__(self) -> None:
-        self._s: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-
-    def has(self, conv: str) -> bool:
-        with self._lock:
-            return conv in self._s
-
-    def list_active(self) -> List[str]:
-        """All conv ids with a turn in flight. Used by /self-update to
-        refuse mid-stream so claude-code processes aren't orphaned."""
-        with self._lock:
-            return list(self._s.keys())
-
-    def queue(self, conv: str, text: str) -> int:
-        with self._lock:
-            sess = self._s.get(conv)
-            if not sess:
-                return 0
-            # py-1.12.20 — merge-on-arrival. Instead of accumulating
-            # separate pending texts that `_wait` then merges with the
-            # awkward "Several follow-up instructions while you were
-            # working: 1. … 2. …" prefix, we concatenate into a single
-            # pending text with `\n\n` separators. The agent sees one
-            # clean continuation; the cockpit collapses the matching
-            # QUEUED user bubbles into a single growing bubble.
-            # Operator clarification 2026-06-10 case 1: "si mandamos
-            # otro mientras hay uno en espera, añadimos el texto, con
-            # una linea en medio, para que se vea que es otro párrafo."
-            if sess["pending"]:
-                sess["pending"][0] = sess["pending"][0] + "\n\n" + text
-            else:
-                sess["pending"].append(text)
-            return 1
-
-    def start(self, conv: str, runner: ChatRunner, on_chain, on_idle=None) -> None:
-        with self._lock:
-            self._s[conv] = {"runner": runner, "pending": [], "cancelled": False}
-
-        def _wait():
-            runner.done.wait()
-            with self._lock:
-                sess = self._s.get(conv)
-                if not sess:
-                    return
-                cancelled = sess["cancelled"]
-                pending = sess["pending"]
-                if cancelled or not pending:
-                    self._s.pop(conv, None)
-                    # py-1.12.19 — Notify the on_idle hook BEFORE returning,
-                    # AFTER the slot is popped. The Daemon wires this to
-                    # the disk-queue auto-flush: if a queued item exists
-                    # we'll spawn the next turn (and ChatSessions.start
-                    # will re-occupy the slot cleanly).
-                    if on_idle is not None:
-                        try:
-                            on_idle(conv)
-                        except Exception as e:
-                            _log(f"on_idle hook failed for {conv}: {e}")
-                    return
-                sess["pending"] = []
-            merged = (
-                pending[0]
-                if len(pending) == 1
-                else "Several follow-up instructions while you were working:\n\n"
-                + "\n\n".join(f"{i + 1}. {t}" for i, t in enumerate(pending))
-            )
-            on_chain(conv, merged)
-
-        threading.Thread(target=_wait, daemon=True).start()
-
-    def cancel(self, conv: str) -> Tuple[bool, int]:
-        with self._lock:
-            sess = self._s.pop(conv, None)
-        if not sess:
-            return False, 0
-        sess["cancelled"] = True
-        dropped = len(sess["pending"])
-        try:
-            sess["runner"].cancel()
-        except Exception:
-            pass
-        return True, dropped
-
-    def reap_dead(self) -> List[Tuple[str, str]]:
-        """Sweep every active session and force-clean any whose subprocess
-        is dead but whose `done` event was never set. Returns a list of
-        (conv, reason) tuples that were reaped — caller broadcasts.
-
-        Defense-in-depth against the failure mode where ChatRunner's
-        end-of-stream code (between proc.wait() and self.done.set()) raises
-        an uncaught exception or otherwise skips the done.set(). Without
-        this sweep the slot would stay forever — the conv would show
-        `live: true`, every subsequent /chat/dispatch would silently
-        queue, and the operator's chat would look dead. Field-reported
-        2026-06-10 (IKA cluster: master conv stuck live for >2 days)."""
-        reaped: List[Tuple[str, str]] = []
-        with self._lock:
-            convs = list(self._s.keys())
-        for conv in convs:
-            with self._lock:
-                sess = self._s.get(conv)
-                if sess is None:
-                    continue
-                runner = sess.get("runner")
-            if runner is None:
-                with self._lock:
-                    self._s.pop(conv, None)
-                reaped.append((conv, "runner-missing"))
-                continue
-            proc = getattr(runner, "proc", None)
-            done_set = (
-                getattr(runner, "done", None) is not None and runner.done.is_set()
-            )
-            if done_set:
-                # done is set but slot wasn't popped — _wait raced or
-                # threw. Pop it now so a future dispatch isn't blocked.
-                with self._lock:
-                    self._s.pop(conv, None)
-                reaped.append((conv, "done-set-but-slot-held"))
-                continue
-            # poll() returns None while the process is alive, the exit
-            # code (incl. 0) once it has exited. Treat "exited without
-            # done.set()" as a dead session.
-            exited = False
-            if proc is not None:
-                try:
-                    exited = proc.poll() is not None
-                except Exception:
-                    # Can't poll → treat as dead to be safe.
-                    exited = True
-            else:
-                # No proc attached yet (spawn raced) → don't reap mid-spawn.
-                continue
-            if exited:
-                try:
-                    runner.done.set()
-                except Exception:
-                    pass
-                with self._lock:
-                    self._s.pop(conv, None)
-                reaped.append((conv, "subprocess-exited"))
-        return reaped
-
-
 # ───────────────────────────────────────────────────────────────────────
 # Cron scheduler (D-CRON-02..05)
 #
@@ -6406,104 +6257,6 @@ class QuotaProber:
 # been stuck `live: true` for 2.5+ days because a subprocess ended
 # without the runner's done.set() being reached. Operator: "el daemon
 # debería gestionar eso, los usuarios no sabrán hacerlo ni deberían."
-
-
-class ChatSessionReaper:
-    TICK_SECS = 30
-    # Grace before we declare a session stuck even if the subprocess
-    # is still alive. Protects against a legitimately long-running
-    # subagent. Tuned to "no claude turn should ever take this long";
-    # if a real turn does, the reaper won't kill it — alive-pid check
-    # comes first.
-    HARD_TIMEOUT_SECS = 60 * 30  # 30 minutes
-
-    def __init__(self, daemon: "Daemon") -> None:
-        self.daemon = daemon
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        # Initial sweep — covers the boot path where a previous kill -9
-        # left state inconsistent (shouldn't happen with in-memory
-        # ChatSessions, but defense in depth).
-        try:
-            self._sweep("boot")
-        except Exception as e:
-            _log(f"chat-reaper: boot sweep failed ({e})")
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        _log(f"chat-reaper: started (tick={self.TICK_SECS}s)")
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self.TICK_SECS):
-            try:
-                self._sweep("tick")
-            except Exception as e:
-                _log(f"chat-reaper: tick failed ({e})")
-
-    def _sweep(self, source: str) -> None:
-        # Phase 1: subprocess-died-without-done sweep.
-        reaped = self.daemon.chat_sessions.reap_dead()
-        for conv, reason in reaped:
-            _log(f"chat-reaper: reaped conv={conv} reason={reason} source={source}")
-            _debug_emit(
-                "chat-session.reaped",
-                msg=f"reaped {conv} ({reason})",
-                lvl="warn",
-                conv=conv,
-                data={"reason": reason, "source": source},
-            )
-            # Tell every connected cockpit the conv is no longer live.
-            # Uses the same broadcast helper as the normal final path.
-            try:
-                self.daemon._broadcast_conv_activity(conv, live_override=False)
-            except Exception as e:
-                _log(f"chat-reaper: conv.activity broadcast failed for {conv}: {e}")
-        # Phase 2: hard-timeout sweep — if a session has been running
-        # for HARD_TIMEOUT_SECS straight without exiting, treat it as
-        # stuck. The subprocess is still alive but going nowhere; this
-        # catches deadlocks in claude-code that wouldn't trip the
-        # "subprocess exited" check.
-        now = time.time()
-        with self.daemon.chat_sessions._lock:
-            entries = list(self.daemon.chat_sessions._s.items())
-        for conv, sess in entries:
-            runner = sess.get("runner")
-            if runner is None:
-                continue
-            started_at = getattr(runner, "_started_at", None)
-            if started_at is None:
-                continue
-            if now - started_at < self.HARD_TIMEOUT_SECS:
-                continue
-            _log(
-                f"chat-reaper: hard-timeout conv={conv} "
-                f"runtime={int(now - started_at)}s — cancelling"
-            )
-            _debug_emit(
-                "chat-session.reaped",
-                msg=f"hard-timeout {conv} after {int(now - started_at)}s",
-                lvl="warn",
-                conv=conv,
-                data={
-                    "reason": "hard-timeout",
-                    "source": source,
-                    "runtime_secs": int(now - started_at),
-                },
-            )
-            try:
-                self.daemon.chat_sessions.cancel(conv)
-            except Exception as e:
-                _log(f"chat-reaper: cancel failed for {conv}: {e}")
-            try:
-                self.daemon._broadcast_conv_activity(conv, live_override=False)
-            except Exception as e:
-                _log(f"chat-reaper: hard-timeout broadcast failed for {conv}: {e}")
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -8886,6 +8639,7 @@ class Daemon:
             "http.bounded-pool.v1",  # py-1.12.24 — ThreadingHTTPServer replaced with PoolHTTPServer (ThreadPoolExecutor with bounded max_workers; default 64, configurable via cluster.yaml.daemon.http.max_workers). Caps OS thread count regardless of request rate.
             "daemon.modular.layer-1.v1",  # py-1.12.25 DM3 — Paths + storage classes extracted to daemon/paths.py + daemon/storage.py. Bundler concatenates in dep order. Cockpit may use this feature to gate "view source layout" affordances in the future.
             "daemon.modular.layer-2.v1",  # py-1.12.26 DM4 — Hub + WSClient + HEARTBEAT_SEC extracted to daemon/hub.py. ws.broadcast contract unchanged; cockpit + tests unaffected.
+            "daemon.modular.layer-3.v1",  # py-1.12.27 DM5 — ChatSessions + ChatSessionReaper extracted to daemon/chat.py. Lock invariant doc'd. ChatRunner deferred to a later task.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
