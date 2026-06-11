@@ -19,7 +19,14 @@ def test_health_shape(daemon: Daemon) -> None:
     assert isinstance(d["features"], list)
     # Sentinel features that EVERY daemon must report — if one of these
     # ever drops, the cockpit's feature-gap detector lights up.
-    for must_have in ("health", "state", "chat", "chat.snapshot.v1"):
+    for must_have in (
+        "health",
+        "state",
+        "chat",
+        "chat.snapshot.v1",
+        "diagnostics.sigusr1.v1",  # py-1.12.24 DM2
+        "http.bounded-pool.v1",  # py-1.12.24 DM2
+    ):
         assert must_have in d["features"], f"missing feature: {must_have}"
 
 

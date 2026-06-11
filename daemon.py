@@ -56,6 +56,8 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
+import faulthandler
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,7 +68,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PORT_RANGE = (5570, 5589)
 HEARTBEAT_SEC = 20.0
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.23"  # 1.12.23 — Standard v23 initiative-anchored execution. Universal-rules block (already mounted in every agent's briefing since py-1.7.0) gains a new bullet that walks the agent through the 3-case decision chain: anchor present → continue; initiative present + task missing → pick/create task; neither set → match operator intent against existing initiatives and create new ones if needed. Frontmatter contracts referenced for initiatives (slug `^[a-z][a-z0-9-]{1,31}$`) + tasks (id `^[A-Za-z][A-Za-z0-9_-]{1,31}$`, one module per task). Full recipe at `.meshkore/docs/conventions/initiative-anchored-execution.md`. No new HTTP endpoint, no new class — pure prompt augmentation. Enforcement is prompt-level (drift addressed with soft daemon check later if needed). py-1.12.22 — Standard v22 storage reporting.
+DAEMON_VERSION = "py-1.12.24"  # 1.12.24 — DM2 diagnostics. (1) SIGUSR1 → faulthandler.register dumps every thread's stack to .meshkore/.runtime/threads.log; operator runs `kill -USR1 <pid>` on a hung daemon and gets the lock-contention stacks the 2026-06-10 ikamiro incident lacked. (2) ThreadingHTTPServer replaced with PoolHTTPServer — concurrent.futures.ThreadPoolExecutor with bounded `max_workers` (cluster.yaml.daemon.http.max_workers, default 64). Caps OS thread count regardless of request rate; the ikamiro daemon had spawned 18k+ threads since boot before the lock-contention bug. New features: diagnostics.sigusr1.v1, http.bounded-pool.v1. Initiative `daemon-modularize`. 1.12.23 — Standard v23 initiative-anchored execution.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -5738,6 +5740,34 @@ class StateManager:
 # HTTP / WebSocket server
 
 
+class PoolHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bounded worker pool (py-1.12.24+).
+
+    The stdlib default spawns a fresh thread per request and never
+    recycles. On a long-running daemon the OS thread count grows
+    unboundedly; the 2026-06-10 ikamiro incident reached 18 000+ before
+    the daemon was killed. With a pool of ``max_workers`` the count
+    stays bounded; excess requests queue at the OS-accept layer (which
+    has its own limits, much higher than any sane workload).
+    ``cluster.yaml.daemon.http.max_workers`` overrides; default 64."""
+
+    def __init__(self, *args, max_workers: int = 64, **kw) -> None:
+        super().__init__(*args, **kw)
+        self.daemon_threads = True
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="http"
+        )
+
+    def process_request(self, request, client_address):  # type: ignore[override]
+        self._pool.submit(self.process_request_thread, request, client_address)
+
+    def server_close(self) -> None:  # type: ignore[override]
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        finally:
+            super().server_close()
+
+
 def make_handler(daemon: "Daemon"):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # silence default access log
@@ -9529,6 +9559,8 @@ class Daemon:
             "rate-limit.auto-pause.v1",  # py-1.10.26 — subagent finals classified as rate-limited auto-pause their agent_type for 30 min; chat_dispatch returns 503 during cooldown; manual POST /agent-types/<t>/{pause,unpause} for operator override; /health.paused_agent_types advertises state.
             "quota.aware-dispatch.v1",  # py-1.10.27 — per-(platform,model) persistent QuotaState at .runtime/quota-state.json + QuotaProber thread that auto-clears expired pauses; /quota GET + /quota/<key>/{pause,unpause} endpoints.
             "chat.snapshot.v1",  # py-1.11.0+ — daemon-authoritative conv list. GET /chat/snapshot (boot), GET /chat/convs, GET /chat/conv/<id>/meta, GET /chat/conv/<id>/messages?before=&limit= (paginated history). WS events: conv.created, conv.meta_updated, conv.archived, conv.unarchived, conv.activity. py-1.11.1 Phase 2 deleted the legacy back-compat surfaces (/health.chat_active_convs, /health.chat_activity, /state.timeline.recent_events, chat.archived/chat.unarchived WS aliases). Initiative `chat-state-rearchitecture`.
+            "diagnostics.sigusr1.v1",  # py-1.12.24 — `kill -USR1 <pid>` dumps every thread's stack to .meshkore/.runtime/threads.log via faulthandler.register. Designed for live diagnosis of lock-contention bugs like the 2026-06-10 ikamiro hang.
+            "http.bounded-pool.v1",  # py-1.12.24 — ThreadingHTTPServer replaced with PoolHTTPServer (ThreadPoolExecutor with bounded max_workers; default 64, configurable via cluster.yaml.daemon.http.max_workers). Caps OS thread count regardless of request rate.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -9924,8 +9956,28 @@ class Daemon:
             _DEBUG_LOG = None
             _log("debug stream: disabled by cluster.yaml.debug.enabled=false")
         handler = make_handler(self)
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
-        self.server.daemon_threads = True
+        # py-1.12.24 — Bounded worker pool. Cap configurable via
+        # cluster.yaml.daemon.http.max_workers (default 64). Prevents
+        # the unbounded thread spawn that caused the 2026-06-10 hang.
+        d_block = (
+            self.cluster.data.get("daemon")
+            if isinstance(self.cluster.data, dict)
+            else None
+        )
+        http_block = (d_block or {}).get("http") if isinstance(d_block, dict) else None
+        max_workers = int((http_block or {}).get("max_workers") or 64)
+        self.server = PoolHTTPServer(
+            ("127.0.0.1", self.port), handler, max_workers=max_workers
+        )
+        # py-1.12.24 — SIGUSR1 → faulthandler dump. Operator sends
+        # `kill -USR1 <pid>`; daemon appends every thread's stack to
+        # `.meshkore/.runtime/threads.log`. Caught lock-contention bugs
+        # (like 2026-06-10) leave actionable stacks for diagnosis.
+        threads_log = open(self.paths.runtime / "threads.log", "a")
+        faulthandler.register(
+            signal.SIGUSR1, file=threads_log, all_threads=True, chain=False
+        )
+        self._threads_log_fp = threads_log  # keep ref so GC doesn't close
         # D-TLS-01 — wrap the socket with TLS when the bundle is
         # present. Cockpit uses https://daemon.meshkore.com:<port>
         # then, no mixed-content / LNA Issues.
