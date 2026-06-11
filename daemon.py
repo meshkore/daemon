@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.31"  # 1.12.31 — LAL1 live-anchor-loop wire format. Universal-rules block teaches every agent the `⟦anchor⟧ {...}` first-line marker (4 shapes: existing init+task / new init+task / new task in existing init / info-only) + the mid-turn `⟦anchor-progress⟧ {...,"status":"done"}` transition. Parser + side-effects in LAL2/LAL3 — this version just advertises feature `anchor.v1` so cockpit can detect protocol-aware daemons. 1.12.30 — DM7 phase A utils.py. 1.12.29 — DM6 step 2 routes.
+DAEMON_VERSION = "py-1.12.32"  # 1.12.32 — LAL2 live-anchor-loop parser. ChatRunner now buffers the head of every reply, detects `⟦anchor⟧ {...}` opening markers, calls into _handle_anchor stubs (LAL3 implements real side-effects), and STRIPS the marker line from `chat.assistant.delta` broadcasts so the user never sees the protocol. Mid-turn `⟦anchor-progress⟧ {...}` lines also detected + stripped. Stubs broadcast `conv.anchor_rejected` (malformed) and `conv.anchor_missing` (skipped) so the cockpit can wire UI affordances. Feature: anchor.strip.v1. 1.12.31 — LAL1 wire format in briefing.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -3610,6 +3610,13 @@ class ChatRunner:
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
+        # LAL2 (py-1.12.32) — anchor protocol head buffering. The
+        # subprocess's first delta is held in `_head_buffer` until we
+        # either see a newline (decide if it's an anchor marker line)
+        # or exceed 4 KB. After the head is resolved, subsequent deltas
+        # also get scanned for `⟦anchor-progress⟧` lines mid-turn.
+        self._head_buffer = ""
+        self._anchor_head_resolved = False
         # py-1.10.16 — Back-reference for the architect-wake hook
         # (initiative `architect-wake-on-subagent`). When the
         # subprocess emits `chat.assistant.final`, the runner calls
@@ -3617,6 +3624,102 @@ class ChatRunner:
         # is automatically re-dispatched as each subagent completes.
         # Optional so tests / standalone uses don't need a daemon.
         self.daemon = daemon
+
+    # LAL2 — anchor protocol helpers. The agent's reply is expected to
+    # OPEN with one of:
+    #   ⟦anchor⟧ {"i":"...","t":"..."}        — anchor to existing
+    #   ⟦anchor⟧ {"new_i":{...},"new_t":{...}} — create both
+    #   ⟦anchor⟧ {"new_t":{...,"initiative":"..."}}  — task in existing init
+    #   ⟦anchor⟧ {"info":true}                — informational turn
+    # Mid-turn: ⟦anchor-progress⟧ {"t":"...","status":"done"}.
+    # The daemon strips these from the visible chat thread and acts on
+    # them in LAL3's _handle_anchor / _handle_anchor_progress.
+
+    _ANCHOR_RE = re.compile(
+        r"⟦anchor⟧\s*(\{[^\n]*\})\s*(?:\n|$)",
+    )
+    _ANCHOR_PROGRESS_RE = re.compile(
+        r"⟦anchor-progress⟧\s*(\{[^\n]*\})\s*(?:\n|$)",
+    )
+
+    def _resolve_anchor_head(self, more_text: str) -> str:
+        """Buffer the head of the reply until we can decide whether
+        it opens with an anchor marker. Returns the text that's safe
+        to forward downstream (i.e. the head minus any marker line).
+
+        Called for every delta until `_anchor_head_resolved` is True."""
+        self._head_buffer += more_text
+        # Wait for at least one full line OR a hard 4 KB cap before
+        # deciding — protects against fragmented first deltas.
+        if "\n" not in self._head_buffer and len(self._head_buffer) < 4096:
+            return ""  # hold the entire buffer for now
+        m = self._ANCHOR_RE.match(self._head_buffer.lstrip())
+        # Strip leading whitespace; re-anchor the offset.
+        lstripped_len = len(self._head_buffer) - len(self._head_buffer.lstrip())
+        if m:
+            raw_payload = m.group(1)
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError as e:
+                if self.daemon is not None:
+                    try:
+                        self.daemon._handle_anchor_rejected(
+                            self.conv, f"malformed JSON: {e}", raw=raw_payload
+                        )
+                    except Exception:
+                        pass
+                else:
+                    _log(f"anchor: malformed JSON in conv {self.conv}: {e}")
+                payload = None
+            if payload is not None and self.daemon is not None:
+                try:
+                    self.daemon._handle_anchor(self.conv, payload, raw=raw_payload)
+                except Exception as e:
+                    _log(f"anchor: handler raised for conv {self.conv}: {e}")
+            elif payload is not None:
+                # No daemon ref (standalone) — log and continue.
+                _log(f"anchor (no daemon ref): conv={self.conv} payload={payload!r}")
+            # Consume up to + including the matched marker line.
+            consumed_end = lstripped_len + m.end()
+            visible = self._head_buffer[consumed_end:]
+        else:
+            # No marker → operator-visible from the start. Notify the
+            # daemon so it can broadcast `conv.anchor_missing` once.
+            if self.daemon is not None:
+                try:
+                    self.daemon._handle_anchor_missing(self.conv)
+                except Exception:
+                    pass
+            visible = self._head_buffer
+        self._head_buffer = ""
+        self._anchor_head_resolved = True
+        return self._strip_anchor_progress(visible)
+
+    def _strip_anchor_progress(self, text: str) -> str:
+        """Detect `⟦anchor-progress⟧ {...}` lines anywhere in `text`,
+        notify the daemon, and remove them so they don't reach the
+        chat thread."""
+        if "⟦anchor-progress⟧" not in text:
+            return text
+        out_parts: List[str] = []
+        last = 0
+        for m in self._ANCHOR_PROGRESS_RE.finditer(text):
+            out_parts.append(text[last : m.start()])
+            raw_payload = m.group(1)
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                payload = None
+            if payload is not None and self.daemon is not None:
+                try:
+                    self.daemon._handle_anchor_progress(
+                        self.conv, payload, raw=raw_payload
+                    )
+                except Exception as e:
+                    _log(f"anchor-progress: handler raised: {e}")
+            last = m.end()
+        out_parts.append(text[last:])
+        return "".join(out_parts)
 
     def _briefing(self) -> str:
         # py-1.4.0 — the briefing is now composed by BriefingPipeline.
@@ -3829,7 +3932,21 @@ class ChatRunner:
                 ):
                     delta = (inner.get("delta") or {}).get("text") or ""
                     if delta:
-                        self._cumulative_text += delta
+                        # LAL2 — Anchor protocol head buffering. Until the
+                        # first newline (or 4 KB) the delta is held in
+                        # `_head_buffer`; once we can decide whether it
+                        # opens with `⟦anchor⟧ {...}` we strip the marker
+                        # and forward the rest. After the head is resolved
+                        # subsequent deltas just pass through the
+                        # `⟦anchor-progress⟧` stripper.
+                        if not self._anchor_head_resolved:
+                            visible = self._resolve_anchor_head(delta)
+                            if not self._anchor_head_resolved:
+                                # Still buffering; nothing to broadcast yet.
+                                continue
+                            self._cumulative_text += visible
+                        else:
+                            self._cumulative_text += self._strip_anchor_progress(delta)
                         now = time.monotonic()
                         if now - last_emit_at > 0.2:
                             last_emit_at = now
@@ -7242,6 +7359,70 @@ class Daemon:
             "generated_at": _iso_now(),
         }
 
+    # LAL2 (py-1.12.32) — anchor protocol handler stubs. Real
+    # side-effects (file creation, conv_meta writes, broadcasts) land
+    # in LAL3. For LAL2 these just log + emit minimal debug events so
+    # the stream-strip path can fire without crashing.
+
+    def _handle_anchor(self, conv: str, payload: Dict[str, Any], *, raw: str) -> None:
+        """LAL2 stub — log the parsed marker. LAL3 implements
+        validation, file creation, conv_meta write, WS broadcast."""
+        try:
+            _debug_emit(
+                "anchor",
+                msg=f"anchor parsed for conv {conv}",
+                conv=conv,
+                data={"payload": payload, "raw_len": len(raw)},
+            )
+        except Exception:
+            pass
+        _log(f"anchor: conv={conv} payload={payload!r} (LAL2 stub — no side effects)")
+
+    def _handle_anchor_progress(
+        self, conv: str, payload: Dict[str, Any], *, raw: str
+    ) -> None:
+        """LAL2 stub. LAL3 implements status: done write to the task .md."""
+        try:
+            _debug_emit(
+                "anchor.progress",
+                msg=f"anchor-progress for conv {conv}",
+                conv=conv,
+                data={"payload": payload},
+            )
+        except Exception:
+            pass
+        _log(f"anchor-progress: conv={conv} payload={payload!r} (LAL2 stub)")
+
+    def _handle_anchor_rejected(self, conv: str, reason: str, *, raw: str) -> None:
+        """LAL2 stub — broadcast warning + log. LAL3 keeps this shape."""
+        try:
+            self.hub.broadcast(
+                {
+                    "type": "conv.anchor_rejected",
+                    "conv": conv,
+                    "reason": reason,
+                    "raw_payload": raw[:512],
+                    "ts": _iso_now(),
+                }
+            )
+        except Exception as e:
+            _log(f"anchor.rejected broadcast failed for {conv}: {e}")
+        _log(f"anchor rejected: conv={conv} reason={reason!r}")
+
+    def _handle_anchor_missing(self, conv: str) -> None:
+        """LAL2 stub — once per turn, broadcast that the agent skipped
+        the marker. Cockpit can dim the 'anchored' affordance."""
+        try:
+            self.hub.broadcast(
+                {
+                    "type": "conv.anchor_missing",
+                    "conv": conv,
+                    "ts": _iso_now(),
+                }
+            )
+        except Exception as e:
+            _log(f"anchor.missing broadcast failed for {conv}: {e}")
+
     def _broadcast_conv_activity(
         self,
         conv: str,
@@ -7346,6 +7527,7 @@ class Daemon:
             "daemon.modular.layer-5.v1",  # py-1.12.29 DM6 step 2 — make_handler + WS read helpers extracted to daemon/routes.py.
             "daemon.modular.layer-6.v1",  # py-1.12.30 DM7 phase A — utils.py extracted. Sibling modules drop shadow stubs; single source of truth for _log/_iso_now/_debug_emit + DebugLog singleton wired via setter/getter functions.
             "anchor.v1",  # py-1.12.31 LAL1 — agent briefing teaches the ⟦anchor⟧ first-line marker protocol (4 shapes + ⟦anchor-progress⟧). Daemon-side parser + side-effects in LAL2/LAL3. Cockpit gates UI loaders behind this flag.
+            "anchor.strip.v1",  # py-1.12.32 LAL2 — ChatRunner buffers + parses the head, strips the marker line from chat.assistant.delta broadcasts, calls _handle_anchor stubs. LAL3 makes the stubs do real file creation + conv_meta + WS events.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
