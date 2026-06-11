@@ -27,4 +27,5 @@ state.json
 .coverage.*
 htmlcov/
 .pytest_cache/
-dist/
+.pre-commit.bak
+dist/  # bundle output; canonical copy ships under webapp/reference/...
