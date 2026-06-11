@@ -52,6 +52,46 @@ class ChatSessions:
         with self._lock:
             return list(self._s.keys())
 
+    def turn_snapshot(self, conv: str) -> Optional[Dict[str, Any]]:
+        """SRL2 (py-1.13.1) — for a live conv, return the data a
+        cockpit needs to rehydrate mid-turn after a browser refresh:
+
+            {
+              "current_turn": {
+                "started_at": "<iso ts when runner spawned>",
+                "stream_id":  "<runner.stream_id>",
+                "partial_text": "<runner._cumulative_text, capped 16 KB>",
+                "tool_calls_count": <int>,
+                "deltas_seen": <int>,
+              },
+              "queue": [{"text", "id", "queued_at"}, …],
+            }
+
+        Returns ``None`` if the conv has no live session. Single dict
+        lookup + a partial_text slice; safe to call on every
+        chat_convs() build."""
+        with self._lock:
+            sess = self._s.get(conv)
+            if not sess:
+                return None
+            runner = sess.get("runner")
+            pending = sess.get("pending") or []
+            queued_at = sess.get("queued_at") or ""
+        current_turn = None
+        if runner is not None:
+            current_turn = {
+                "started_at": getattr(runner, "started_at", None),
+                "stream_id": getattr(runner, "stream_id", None),
+                "partial_text": (getattr(runner, "_cumulative_text", "") or "")[:16000],
+                "tool_calls_count": int(getattr(runner, "tool_calls_count", 0) or 0),
+                "deltas_seen": int(getattr(runner, "deltas_seen", 0) or 0),
+            }
+        queue: List[Dict[str, Any]] = [
+            {"text": t, "id": f"q_{i}", "queued_at": queued_at}
+            for i, t in enumerate(pending)
+        ]
+        return {"current_turn": current_turn, "queue": queue}
+
     def queue(self, conv: str, text: str) -> int:
         with self._lock:
             sess = self._s.get(conv)

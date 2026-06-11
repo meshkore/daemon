@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.13.0"  # 1.13.0 — LAL3 live-anchor-loop side-effects (closes the v23 loop). `_handle_anchor` now: validates init/task slugs against the frontmatter regex contracts; CREATES `.meshkore/roadmap/initiatives/<id>.md` + `.meshkore/modules/<m>/tasks/<id>.md` when the payload carries `new_i` / `new_t`; persists `initiative_id` + `task_id` to `conv_meta.json`; broadcasts `conv.anchored` with `is_new_init` + `is_new_task` flags + the rendered frontmatter when new. `_handle_anchor_progress` writes `status: done` (or any payload-supplied status) to the task .md atomically + emits `conv.task_completed`. Minor bump because this is wire-level protocol load-bearing — the cockpit can now light up loaders on the exact initiative/task in real time. New features: anchor.handler.v1, anchor.auto-create.v1, anchor.progress.v1. 1.12.32 — LAL2 parser. 1.12.31 — LAL1 wire format in briefing.
+DAEMON_VERSION = "py-1.13.1"  # 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -7203,28 +7203,42 @@ class Daemon:
             idx = msg_index.get(conv) or {}
             is_live = conv in live
             kids = children_by_parent.get(conv) or []
-            entries.append(
-                {
-                    "conv": conv,
-                    "agent_type": _agent_type_normalised(
-                        _agent_type_from_conv_slug(conv) or meta.get("agent_type")
-                    ),
-                    "agent_id": meta.get("agent_id"),
-                    "parent_conv": meta.get("parent_conv"),
-                    "initiative_id": meta.get("initiative_id"),
-                    "task_id": meta.get("task_id"),
-                    "archived": arch is not None,
-                    "archived_at": arch.get("archived_at") if arch else None,
-                    "archived_by": arch.get("by") if arch else None,
-                    "live": is_live,
-                    "coordinating": (not is_live) and bool(kids),
-                    "waiting_on": sorted(kids),
-                    "created_at": idx.get("first_ts")
-                    or (arch.get("archived_at") if arch else ""),
-                    "last_activity_at": idx.get("last_ts") or "",
-                    "msg_count": int(idx.get("count") or 0),
-                }
-            )
+            entry: Dict[str, Any] = {
+                "conv": conv,
+                "agent_type": _agent_type_normalised(
+                    _agent_type_from_conv_slug(conv) or meta.get("agent_type")
+                ),
+                "agent_id": meta.get("agent_id"),
+                "parent_conv": meta.get("parent_conv"),
+                "initiative_id": meta.get("initiative_id"),
+                "task_id": meta.get("task_id"),
+                "archived": arch is not None,
+                "archived_at": arch.get("archived_at") if arch else None,
+                "archived_by": arch.get("by") if arch else None,
+                "live": is_live,
+                "coordinating": (not is_live) and bool(kids),
+                "waiting_on": sorted(kids),
+                "created_at": idx.get("first_ts")
+                or (arch.get("archived_at") if arch else ""),
+                "last_activity_at": idx.get("last_ts") or "",
+                "msg_count": int(idx.get("count") or 0),
+            }
+            # SRL2 (py-1.13.1) — for live convs, attach `current_turn`
+            # (partial_text + started_at + counters) and `queue` (the
+            # in-memory ChatSessions.pending list). Lets a cockpit
+            # that just connected rehydrate mid-turn UI without
+            # waiting for the first WS delta. Both fields are
+            # OPTIONAL — older cockpits ignore them. Cap: single
+            # dict lookup + a 16 KB partial_text slice per live
+            # conv, so cheap even with many active sessions.
+            if is_live:
+                snap = self.chat_sessions.turn_snapshot(conv)
+                if snap is not None:
+                    if snap.get("current_turn"):
+                        entry["current_turn"] = snap["current_turn"]
+                    if snap.get("queue"):
+                        entry["queue"] = snap["queue"]
+            entries.append(entry)
 
         # Order: live first, then idle, then archived. Inside each
         # bucket: newest activity first. Single sort with a composite
@@ -7813,6 +7827,7 @@ class Daemon:
             "anchor.handler.v1",  # py-1.13.0 LAL3 — _handle_anchor resolves existing or new init/task, persists to conv_meta, broadcasts conv.anchored.
             "anchor.auto-create.v1",  # py-1.13.0 LAL3 — `new_i` / `new_t` payloads atomically create initiative + task .md files with frontmatter contract enforced.
             "anchor.progress.v1",  # py-1.13.0 LAL3 — `⟦anchor-progress⟧ {"t":...,"status":"done"}` writes status to the task .md and broadcasts conv.task_completed.
+            "daemon.snapshot.turn_state.v1",  # py-1.13.1 SRL2 — `/chat/snapshot` carries `current_turn` (started_at + stream_id + partial_text + counters) + `queue` for live convs so the cockpit can rehydrate mid-turn UI after a browser refresh.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
