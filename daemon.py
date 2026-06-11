@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.12.32"  # 1.12.32 — LAL2 live-anchor-loop parser. ChatRunner now buffers the head of every reply, detects `⟦anchor⟧ {...}` opening markers, calls into _handle_anchor stubs (LAL3 implements real side-effects), and STRIPS the marker line from `chat.assistant.delta` broadcasts so the user never sees the protocol. Mid-turn `⟦anchor-progress⟧ {...}` lines also detected + stripped. Stubs broadcast `conv.anchor_rejected` (malformed) and `conv.anchor_missing` (skipped) so the cockpit can wire UI affordances. Feature: anchor.strip.v1. 1.12.31 — LAL1 wire format in briefing.
+DAEMON_VERSION = "py-1.13.0"  # 1.13.0 — LAL3 live-anchor-loop side-effects (closes the v23 loop). `_handle_anchor` now: validates init/task slugs against the frontmatter regex contracts; CREATES `.meshkore/roadmap/initiatives/<id>.md` + `.meshkore/modules/<m>/tasks/<id>.md` when the payload carries `new_i` / `new_t`; persists `initiative_id` + `task_id` to `conv_meta.json`; broadcasts `conv.anchored` with `is_new_init` + `is_new_task` flags + the rendered frontmatter when new. `_handle_anchor_progress` writes `status: done` (or any payload-supplied status) to the task .md atomically + emits `conv.task_completed`. Minor bump because this is wire-level protocol load-bearing — the cockpit can now light up loaders on the exact initiative/task in real time. New features: anchor.handler.v1, anchor.auto-create.v1, anchor.progress.v1. 1.12.32 — LAL2 parser. 1.12.31 — LAL1 wire format in briefing.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -7359,39 +7359,309 @@ class Daemon:
             "generated_at": _iso_now(),
         }
 
-    # LAL2 (py-1.12.32) — anchor protocol handler stubs. Real
-    # side-effects (file creation, conv_meta writes, broadcasts) land
-    # in LAL3. For LAL2 these just log + emit minimal debug events so
-    # the stream-strip path can fire without crashing.
+    # LAL3 (py-1.13.0) — anchor protocol side-effects. The parser in
+    # LAL2 (ChatRunner._resolve_anchor_head + _strip_anchor_progress)
+    # extracts the marker and calls these handlers. THIS is the
+    # closing of v23's loop — files get created, conv_meta gets
+    # written, the cockpit gets WS events.
+
+    _INIT_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+    _TASK_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,31}$")
 
     def _handle_anchor(self, conv: str, payload: Dict[str, Any], *, raw: str) -> None:
-        """LAL2 stub — log the parsed marker. LAL3 implements
-        validation, file creation, conv_meta write, WS broadcast."""
-        try:
-            _debug_emit(
-                "anchor",
-                msg=f"anchor parsed for conv {conv}",
-                conv=conv,
-                data={"payload": payload, "raw_len": len(raw)},
+        """Resolve the anchor payload to (init_id, task_id), creating
+        files on disk if `new_i` / `new_t` was specified, persist
+        conv_meta, and broadcast `conv.anchored`."""
+        if payload.get("info") is True:
+            try:
+                _debug_emit(
+                    "anchor.info",
+                    msg=f"info-only turn for conv {conv}",
+                    conv=conv,
+                )
+            except Exception:
+                pass
+            return
+
+        is_new_init = False
+        is_new_task = False
+        init_frontmatter: Optional[Dict[str, Any]] = None
+        task_frontmatter: Optional[Dict[str, Any]] = None
+
+        # --- Resolve initiative ---
+        if "new_i" in payload:
+            new_i = payload.get("new_i") or {}
+            ok, err, init_id, init_frontmatter = self._anchor_create_init(new_i, conv)
+            if not ok:
+                self._handle_anchor_rejected(conv, err, raw=raw)
+                return
+            is_new_init = True
+        elif "i" in payload:
+            init_id = str(payload.get("i") or "").strip()
+            if not self._INIT_SLUG_RE.match(init_id):
+                self._handle_anchor_rejected(
+                    conv, f"invalid initiative slug: {init_id!r}", raw=raw
+                )
+                return
+            if not (self.paths.initiatives / f"{init_id}.md").exists():
+                self._handle_anchor_rejected(
+                    conv, f"initiative #{init_id} not found on disk", raw=raw
+                )
+                return
+        else:
+            # payload had only `new_t` → look up initiative from new_t.initiative
+            new_t = payload.get("new_t") or {}
+            init_id = str(new_t.get("initiative") or "").strip()
+            if not init_id:
+                self._handle_anchor_rejected(
+                    conv,
+                    "no initiative — supply `i`, `new_i`, or `new_t.initiative`",
+                    raw=raw,
+                )
+                return
+            if not (self.paths.initiatives / f"{init_id}.md").exists():
+                self._handle_anchor_rejected(
+                    conv,
+                    f"initiative #{init_id} (from new_t.initiative) not found",
+                    raw=raw,
+                )
+                return
+
+        # --- Resolve task ---
+        if "new_t" in payload:
+            new_t = payload.get("new_t") or {}
+            ok, err, task_id, task_frontmatter = self._anchor_create_task(
+                new_t, init_id, conv
             )
-        except Exception:
-            pass
-        _log(f"anchor: conv={conv} payload={payload!r} (LAL2 stub — no side effects)")
+            if not ok:
+                self._handle_anchor_rejected(conv, err, raw=raw)
+                return
+            is_new_task = True
+        elif "t" in payload:
+            task_id = str(payload.get("t") or "").strip()
+            if not self._TASK_ID_RE.match(task_id):
+                self._handle_anchor_rejected(
+                    conv, f"invalid task id: {task_id!r}", raw=raw
+                )
+                return
+            if not self._find_task(task_id):
+                self._handle_anchor_rejected(
+                    conv, f"task #{task_id} not found on disk", raw=raw
+                )
+                return
+        else:
+            self._handle_anchor_rejected(
+                conv, "no task — supply `t` or `new_t`", raw=raw
+            )
+            return
+
+        # --- Persist conv_meta + broadcast ---
+        existing_meta = self._conv_meta_load().get(conv) or {}
+        agent_type = existing_meta.get("agent_type") or "custom"
+        agent_id = existing_meta.get("agent_id")
+        parent_conv = existing_meta.get("parent_conv")
+        self._conv_meta_set(
+            conv,
+            agent_type=agent_type,
+            agent_id=agent_id,
+            parent_conv=parent_conv,
+            initiative_id=init_id,
+            task_id=task_id,
+        )
+
+        evt = {
+            "type": "conv.anchored",
+            "conv": conv,
+            "initiative_id": init_id,
+            "task_id": task_id,
+            "is_new_init": is_new_init,
+            "is_new_task": is_new_task,
+            "ts": _iso_now(),
+        }
+        if init_frontmatter is not None:
+            evt["init_frontmatter"] = init_frontmatter
+        if task_frontmatter is not None:
+            evt["task_frontmatter"] = task_frontmatter
+        try:
+            self.hub.broadcast(evt)
+        except Exception as e:
+            _log(f"conv.anchored broadcast failed for {conv}: {e}")
+
+        if is_new_init or is_new_task:
+            try:
+                self.state_manager.rebuild(broadcast=True)
+            except Exception as e:
+                _log(f"state rebuild after anchor failed: {e}")
+
+    def _anchor_create_init(
+        self, payload: Dict[str, Any], conv: str
+    ) -> Tuple[bool, str, str, Dict[str, Any]]:
+        """Validate + write `.meshkore/roadmap/initiatives/<id>.md`.
+        Returns (ok, error_msg, id, frontmatter_dict)."""
+        iid = str(payload.get("id") or "").strip()
+        if not self._INIT_SLUG_RE.match(iid):
+            return (
+                False,
+                f"new_i.id {iid!r} doesn't match {self._INIT_SLUG_RE.pattern}",
+                "",
+                {},
+            )
+        target = self.paths.initiatives / f"{iid}.md"
+        if target.exists():
+            return False, f"initiative #{iid} already exists", iid, {}
+        title = str(payload.get("title") or iid).strip()
+        oneliner = str(payload.get("oneliner") or "").strip()
+        modules = payload.get("modules") or []
+        if not isinstance(modules, list) or not modules:
+            modules = ["general"]
+        priority = str(payload.get("priority") or "medium")
+        today = _iso_now()[:10]
+        fm = {
+            "id": iid,
+            "title": title,
+            "status": "active",
+            "priority": priority,
+            "oneliner": oneliner,
+            "modules": list(modules),
+            "created": today,
+            "updated": today,
+            "owner": self.identity,
+            "created_by": "live-anchor-loop",
+            "created_by_conv": conv,
+        }
+        body = (
+            f"# {title}\n\n"
+            f"{oneliner or '_New initiative created by an agent on first anchor._'}\n\n"
+            "_Body will be filled in by the agent or operator in subsequent turns._\n"
+        )
+        self.paths.initiatives.mkdir(parents=True, exist_ok=True)
+        target.write_text(self._fm_dump(fm) + "\n" + body)
+        return True, "", iid, fm
+
+    def _anchor_create_task(
+        self, payload: Dict[str, Any], init_id: str, conv: str
+    ) -> Tuple[bool, str, str, Dict[str, Any]]:
+        """Validate + write `.meshkore/modules/<m>/tasks/<id>.md`.
+        Returns (ok, error_msg, id, frontmatter_dict)."""
+        tid = str(payload.get("id") or "").strip()
+        if not self._TASK_ID_RE.match(tid):
+            return (
+                False,
+                f"new_t.id {tid!r} doesn't match {self._TASK_ID_RE.pattern}",
+                "",
+                {},
+            )
+        if self._find_task(tid):
+            return False, f"task #{tid} already exists", tid, {}
+        category = str(payload.get("category") or "general").strip().replace("/", "")
+        if not category:
+            category = "general"
+        title = str(payload.get("title") or tid).strip()
+        depends_on = payload.get("depends_on") or []
+        today = _iso_now()[:10]
+        fm = {
+            "id": tid,
+            "title": title,
+            "status": "active",
+            "owner": self.identity,
+            "category": category,
+            "initiative": init_id,
+            "depends_on": list(depends_on) if isinstance(depends_on, list) else [],
+            "created": today,
+            "updated": today,
+            "created_by": "live-anchor-loop",
+            "created_by_conv": conv,
+        }
+        body = (
+            f"# {title}\n\n"
+            "_New task — created by an agent on anchor._\n\n"
+            "Detail will be filled in by the agent during execution.\n"
+        )
+        tasks_dir = self.paths.modules_dir / category / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        (tasks_dir / f"{tid}.md").write_text(self._fm_dump(fm) + "\n" + body)
+        return True, "", tid, fm
+
+    def _fm_dump(self, fm: Dict[str, Any]) -> str:
+        """Render a frontmatter dict as the YAML subset our parser
+        round-trips (see parse_simple_yaml). Strings quoted only when
+        they contain colon, comma, hash, or leading whitespace."""
+        out = ["---"]
+        for k, v in fm.items():
+            if isinstance(v, list):
+                inner = ", ".join(
+                    json.dumps(x) if isinstance(x, str) else str(x) for x in v
+                )
+                out.append(f"{k}: [{inner}]")
+            elif isinstance(v, bool):
+                out.append(f"{k}: {'true' if v else 'false'}")
+            elif isinstance(v, (int, float)):
+                out.append(f"{k}: {v}")
+            else:
+                s = str(v)
+                if any(c in s for c in ":,#") or s != s.strip():
+                    out.append(f"{k}: {json.dumps(s)}")
+                else:
+                    out.append(f"{k}: {s}")
+        out.append("---")
+        return "\n".join(out)
 
     def _handle_anchor_progress(
         self, conv: str, payload: Dict[str, Any], *, raw: str
     ) -> None:
-        """LAL2 stub. LAL3 implements status: done write to the task .md."""
+        """Mid-turn task transition. Writes `status: done` (or whatever
+        the payload specifies) to the task .md and broadcasts."""
+        tid = str(payload.get("t") or "").strip()
+        new_status = str(payload.get("status") or "done").strip()
+        if not self._TASK_ID_RE.match(tid):
+            _log(f"anchor-progress: invalid task id {tid!r} from conv {conv}")
+            return
+        path = self._find_task(tid)
+        if not path:
+            _log(f"anchor-progress: task {tid} not found on disk (conv {conv})")
+            return
         try:
-            _debug_emit(
-                "anchor.progress",
-                msg=f"anchor-progress for conv {conv}",
-                conv=conv,
-                data={"payload": payload},
+            text = path.read_text()
+            today = _iso_now()[:10]
+            new = re.sub(
+                r"^status:\s*\S+\s*$",
+                f"status: {new_status}",
+                text,
+                count=1,
+                flags=re.M,
             )
-        except Exception:
-            pass
-        _log(f"anchor-progress: conv={conv} payload={payload!r} (LAL2 stub)")
+            if new == text:
+                # No status line — insert after the opening ---
+                new = re.sub(
+                    r"^---\s*$\n",
+                    f"---\nstatus: {new_status}\n",
+                    text,
+                    count=1,
+                    flags=re.M,
+                )
+            new = re.sub(r"^updated:.*$", f"updated: {today}", new, count=1, flags=re.M)
+            if new == text and "updated:" not in new:
+                # No updated line — append within frontmatter
+                new = re.sub(
+                    r"(---\s*$)", f"updated: {today}\n\\1", new, count=1, flags=re.M
+                )
+            path.write_text(new)
+        except Exception as e:
+            _log(f"anchor-progress: write failed for task {tid}: {e}")
+            return
+        try:
+            self.hub.broadcast(
+                {
+                    "type": "conv.task_completed",
+                    "conv": conv,
+                    "task_id": tid,
+                    "new_status": new_status,
+                    "ts": _iso_now(),
+                }
+            )
+            self.state_manager.rebuild(broadcast=True)
+        except Exception as e:
+            _log(f"task_completed broadcast/rebuild failed: {e}")
 
     def _handle_anchor_rejected(self, conv: str, reason: str, *, raw: str) -> None:
         """LAL2 stub — broadcast warning + log. LAL3 keeps this shape."""
@@ -7528,6 +7798,9 @@ class Daemon:
             "daemon.modular.layer-6.v1",  # py-1.12.30 DM7 phase A — utils.py extracted. Sibling modules drop shadow stubs; single source of truth for _log/_iso_now/_debug_emit + DebugLog singleton wired via setter/getter functions.
             "anchor.v1",  # py-1.12.31 LAL1 — agent briefing teaches the ⟦anchor⟧ first-line marker protocol (4 shapes + ⟦anchor-progress⟧). Daemon-side parser + side-effects in LAL2/LAL3. Cockpit gates UI loaders behind this flag.
             "anchor.strip.v1",  # py-1.12.32 LAL2 — ChatRunner buffers + parses the head, strips the marker line from chat.assistant.delta broadcasts, calls _handle_anchor stubs. LAL3 makes the stubs do real file creation + conv_meta + WS events.
+            "anchor.handler.v1",  # py-1.13.0 LAL3 — _handle_anchor resolves existing or new init/task, persists to conv_meta, broadcasts conv.anchored.
+            "anchor.auto-create.v1",  # py-1.13.0 LAL3 — `new_i` / `new_t` payloads atomically create initiative + task .md files with frontmatter contract enforced.
+            "anchor.progress.v1",  # py-1.13.0 LAL3 — `⟦anchor-progress⟧ {"t":...,"status":"done"}` writes status to the task .md and broadcasts conv.task_completed.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
