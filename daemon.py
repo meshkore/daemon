@@ -3610,6 +3610,16 @@ class ChatRunner:
         self.done = threading.Event()
         self.cancelled = False
         self._cumulative_text = ""
+        # SRL1 (py-1.13.1) — instance attrs the snapshot reader (SRL2)
+        # pulls via getattr. `started_at` is the ISO timestamp of turn
+        # spawn; `deltas_seen` + `tool_calls_count` are running
+        # counters incremented in `_read_stream`. Together they let a
+        # cockpit that just connected know how long the turn has been
+        # running and how much work it's done, even if no delta has
+        # arrived yet via WS.
+        self.started_at = _iso_now()
+        self.deltas_seen = 0
+        self.tool_calls_count = 0
         # LAL2 (py-1.12.32) — anchor protocol head buffering. The
         # subprocess's first delta is held in `_head_buffer` until we
         # either see a newline (decide if it's an anchor marker line)
@@ -3932,6 +3942,7 @@ class ChatRunner:
                 ):
                     delta = (inner.get("delta") or {}).get("text") or ""
                     if delta:
+                        self.deltas_seen += 1
                         # LAL2 — Anchor protocol head buffering. Until the
                         # first newline (or 4 KB) the delta is held in
                         # `_head_buffer`; once we can decide whether it
@@ -3964,6 +3975,7 @@ class ChatRunner:
                     inner.get("type") == "content_block_start"
                     and (inner.get("content_block") or {}).get("type") == "tool_use"
                 ):
+                    self.tool_calls_count += 1
                     cb = inner.get("content_block") or {}
                     # py-1.5.0 — Persist tool.use to timeline so the
                     # cockpit can replay full turn detail after a reload
