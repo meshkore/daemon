@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.13.2"  # 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
+DAEMON_VERSION = "py-1.13.3"  # 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -3588,10 +3588,21 @@ class ChatRunner:
         context_docs: Optional[List[Dict[str, Any]]] = None,
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
+        model: Optional[str] = None,
         daemon: Optional["Daemon"] = None,
     ):
         self.paths = paths
         self.cluster = cluster
+        # MP1 (py-1.13.3) — Per-turn model preference. None / 'auto' →
+        # claude-code uses its default; otherwise spawn injects
+        # `--model <id>` into the argv.
+        self.model = model
+        # CU1 (py-1.13.3) — Per-turn usage payload populated when the
+        # SDK emits its terminal `result` event with `usage` +
+        # `total_cost_usd`. Used in finalize to broadcast `chat.usage`
+        # and to accumulate cumulative-per-conv counters.
+        self.last_turn_usage: Optional[Dict[str, Any]] = None
+        self.last_turn_cost_usd: Optional[float] = None
         self.hub = hub
         self.identity = identity
         self.conv = conv
@@ -3820,6 +3831,12 @@ class ChatRunner:
             "--disallowed-tools",
             "AskUserQuestion,ExitPlanMode",
         ]
+        # MP1 (py-1.13.3) — Per-conv model override. `--model` accepts
+        # one of `opus` / `sonnet` / `haiku` or an explicit model id
+        # (claude-opus-4-7, etc.). When unset (`auto` / None), we omit
+        # the flag entirely and let claude-code pick its default.
+        if self.model:
+            args.extend(["--model", self.model])
         if use_session:
             args[2:2] = ["--session-id", session_id]
         # py-1.10.5 — Pipe the briefing through stdin instead of
@@ -4038,6 +4055,31 @@ class ChatRunner:
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
+                # CU1 (py-1.13.3) — Capture token usage + cost from the
+                # SDK's terminal event. claude-code emits e.g.
+                #   {"type":"result","result":"…","usage":{
+                #       "input_tokens":N,"output_tokens":N,
+                #       "cache_read_input_tokens":N,
+                #       "cache_creation_input_tokens":N},
+                #    "total_cost_usd":N,"num_turns":N}
+                # Daemon previously ignored both fields. Stored on the
+                # runner so `_finalize_usage` can broadcast + accumulate
+                # after the loop exits.
+                usage = ev.get("usage")
+                if isinstance(usage, dict):
+                    self.last_turn_usage = {
+                        "input_tokens": int(usage.get("input_tokens") or 0),
+                        "output_tokens": int(usage.get("output_tokens") or 0),
+                        "cache_read_input_tokens": int(
+                            usage.get("cache_read_input_tokens") or 0
+                        ),
+                        "cache_creation_input_tokens": int(
+                            usage.get("cache_creation_input_tokens") or 0
+                        ),
+                    }
+                cost = ev.get("total_cost_usd")
+                if isinstance(cost, (int, float)):
+                    self.last_turn_cost_usd = float(cost)
         # Finalize. py-1.13.2 — `result_text` (from the Claude SDK
         # `result` event) was bypassing the anchor stripper because the
         # stripper runs delta-by-delta on `_cumulative_text`. Sweep both
@@ -4068,6 +4110,33 @@ class ChatRunner:
                 },
             )
         )
+        # CU1 (py-1.13.3) — Broadcast token usage + cost AFTER the
+        # final lands. Cockpit ingests via `chat.usage` and updates
+        # `chatStore.state.convs[conv].usage` so the operator sees
+        # `12.3k in · 4.5k out · $0.15` in the agent's scope strip.
+        if self.last_turn_usage is not None and self.daemon is not None:
+            try:
+                cumulative = self.daemon.chat_sessions.record_usage(
+                    self.conv,
+                    self.last_turn_usage,
+                    self.last_turn_cost_usd,
+                )
+                self.hub.broadcast(
+                    {
+                        "type": "chat.usage",
+                        "conv": self.conv,
+                        "stream_id": self.stream_id,
+                        "turn": {
+                            **self.last_turn_usage,
+                            "cost_usd": self.last_turn_cost_usd,
+                        },
+                        "total": cumulative,
+                        "model": self.model,
+                        "ts": _iso_now(),
+                    }
+                )
+            except Exception as e:
+                _log(f"chat.usage broadcast failed for {self.conv}: {e}")
         # py-1.10.4 — surface the exit code in the daemon log so a
         # silent claude failure (empty stdout, no final, etc.) can
         # be traced back to e.g. "exited 1 with stderr 'context
@@ -5434,6 +5503,7 @@ class Daemon:
         parent_conv: Optional[str] = None,
         initiative_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
         prompt re-spawns automatically when the current turn finishes.
@@ -5469,7 +5539,13 @@ class Daemon:
             parent_conv=parent_conv,
             initiative_id=initiative_id,
             task_id=task_id,
+            model=model,
         )
+        # MP1 (py-1.13.3) — Resolve the model AFTER the sidecar write
+        # so chained turns inherit even when the dispatch body omitted
+        # `model`. Returns None when the preference is "auto" / unset
+        # — ChatRunner.spawn skips the CLI flag in that case.
+        resolved_model = self._conv_meta_get_model(conv)
         runner = ChatRunner(
             paths=self.paths,
             cluster=self.cluster,
@@ -5480,6 +5556,7 @@ class Daemon:
             context_docs=context_docs or [],
             agent_type=resolved_type,
             agent_id=resolved_id,
+            model=resolved_model,
             daemon=self,
         )
         runner.spawn()
@@ -5550,6 +5627,18 @@ class Daemon:
             (meta.get("agent_id") or None),
         )
 
+    def _conv_meta_get_model(self, conv: str) -> Optional[str]:
+        """MP1 (py-1.13.3) — Read the per-conv model preference stored
+        by the cockpit's NewAgentWizard. Returns None / 'auto' when no
+        override is set; otherwise one of 'opus' / 'sonnet' / 'haiku'
+        (or any string claude-code accepts). Used by ChatRunner.spawn
+        to inject `--model <id>` into the CLI argv."""
+        meta = self._conv_meta_load().get(conv) or {}
+        m = str(meta.get("model") or "").strip().lower()
+        if not m or m == "auto":
+            return None
+        return m
+
     def _conv_meta_set(
         self,
         conv: str,
@@ -5558,6 +5647,7 @@ class Daemon:
         parent_conv: Optional[str] = None,
         initiative_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         try:
             all_meta = self._conv_meta_load()
@@ -5585,6 +5675,16 @@ class Daemon:
                 entry["initiative_id"] = initiative_id
             if task_id:
                 entry["task_id"] = task_id
+            # MP1 (py-1.13.3) — Per-conv model preference. Normalised to
+            # lowercase; 'auto' is stored explicitly so chained turns
+            # don't pick up a stale value. Empty / None means "no
+            # override".
+            if model is not None:
+                m_norm = str(model).strip().lower()
+                if m_norm:
+                    entry["model"] = m_norm
+                elif "model" in entry:
+                    del entry["model"]
             all_meta[conv] = entry
             p = self._conv_meta_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -6056,6 +6156,14 @@ class Daemon:
         task_id = body.get("task_id")
         if task_id is not None:
             task_id = str(task_id).strip() or None
+        # MP1 (py-1.13.3) — per-conv model preference from the
+        # NewAgentWizard (cockpit). The wizard already collects
+        # `auto`/`opus`/`sonnet`/`haiku`; previously the value died in
+        # convMeta. Now it flows through to `_conv_meta_set` and
+        # ChatRunner.spawn, which injects `--model <id>` into claude-code.
+        model_pref = body.get("model")
+        if model_pref is not None:
+            model_pref = str(model_pref).strip() or None
         # py-1.10.25 — Daemon-side dispatch mutex. Enforces invariants
         # the architect prompt already claims but the LLM intermittently
         # violates (observed in cavioca 2026-05-30: same task got 4
@@ -6162,6 +6270,7 @@ class Daemon:
                 parent_conv=parent_conv,
                 initiative_id=initiative_id,
                 task_id=task_id,
+                model=model_pref,
             )
         except Exception as e:
             return 400, {"error": str(e)}
@@ -7238,6 +7347,10 @@ class Daemon:
                 "parent_conv": meta.get("parent_conv"),
                 "initiative_id": meta.get("initiative_id"),
                 "task_id": meta.get("task_id"),
+                # MP1 (py-1.13.3) — surface the per-conv model preference
+                # so the cockpit can show "running on opus" / etc. in
+                # the scope strip alongside the agent role.
+                "model": meta.get("model"),
                 "archived": arch is not None,
                 "archived_at": arch.get("archived_at") if arch else None,
                 "archived_by": arch.get("by") if arch else None,
@@ -7249,6 +7362,13 @@ class Daemon:
                 "last_activity_at": idx.get("last_ts") or "",
                 "msg_count": int(idx.get("count") or 0),
             }
+            # CU1 (py-1.13.3) — cumulative token usage + cost for the
+            # conv. None when no turn has finalised yet (the cockpit
+            # hides the chip). Accumulated in ChatSessions; resets on
+            # daemon restart (persisting is `usage-ledger` territory).
+            usage = self.chat_sessions.usage_total(conv)
+            if usage is not None:
+                entry["usage"] = usage
             # SRL2 (py-1.13.1) — for live convs, attach `current_turn`
             # (partial_text + started_at + counters) and `queue` (the
             # in-memory ChatSessions.pending list). Lets a cockpit

@@ -41,6 +41,56 @@ class ChatSessions:
     def __init__(self) -> None:
         self._s: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # CU1 (py-1.13.3) — cumulative usage per conv. Populated by
+        # ChatRunner via `record_usage()` after each `result` event.
+        # Survives the runner slot's lifetime (which only spans ONE
+        # turn) so chained turns + cockpit reconnects see the full
+        # consumption history. In-memory only; daemon restart resets.
+        # Persisting belongs to the broader `usage-ledger` initiative.
+        self._usage_total: Dict[str, Dict[str, Any]] = {}
+
+    # CU1 — accumulate usage by conv (called per-turn-final).
+    def record_usage(
+        self,
+        conv: str,
+        turn_usage: Dict[str, int],
+        turn_cost_usd: Optional[float],
+    ) -> Dict[str, Any]:
+        """Add this turn's tokens / cost to the conv's running total
+        and return the cumulative dict shaped as:
+            {input_tokens, output_tokens, cache_read_input_tokens,
+             cache_creation_input_tokens, cost_usd, turns}"""
+        with self._lock:
+            tot = self._usage_total.get(conv) or {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cost_usd": 0.0,
+                "turns": 0,
+            }
+            for k in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ):
+                tot[k] = int(tot.get(k, 0)) + int(turn_usage.get(k, 0) or 0)
+            if turn_cost_usd is not None:
+                tot["cost_usd"] = float(tot.get("cost_usd", 0.0)) + float(turn_cost_usd)
+            tot["turns"] = int(tot.get("turns", 0)) + 1
+            self._usage_total[conv] = tot
+            # Return a defensive copy so callers can broadcast it
+            # without holding the lock.
+            return dict(tot)
+
+    def usage_total(self, conv: str) -> Optional[Dict[str, Any]]:
+        """Read-only accessor for the cumulative usage dict. Returns
+        None when the conv has no recorded turns yet (cockpit hides
+        the chip)."""
+        with self._lock:
+            tot = self._usage_total.get(conv)
+            return dict(tot) if tot else None
 
     def has(self, conv: str) -> bool:
         with self._lock:
