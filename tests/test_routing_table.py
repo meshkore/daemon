@@ -27,6 +27,7 @@ ROUTES_GET = [
     "/quota",
     "/credentials",
     "/log",
+    "/context",
 ]
 
 

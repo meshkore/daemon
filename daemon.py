@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.13.3"  # 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
+DAEMON_VERSION = "py-1.14.1"  # 1.14.1 — context tree endpoint (Standard v14 §3.5). New `context_tree()` method walks `.meshkore/context/` and `GET /context` serves the folder/file tree (per-file title/updated/status from frontmatter + word count + §3.5 over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; `GET /context/<path>` serves a single file body (reuses `_serve_meshkore_file` rooted at context_dir, same path-traversal defence). Fixes the cockpit's Context tab which logged `GET /context 404` on every open (ContextPanel.tsx → daemon-client.contextTree, shipped V107.34 against a daemon endpoint that never existed). Feature flag `context.tree.v1`. New `paths.context_dir`. 1.14.0 — universal Output Contract (OC1). The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects. The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -3129,7 +3129,7 @@ class BriefingPipeline:
             f"- Don't invent version numbers; ask `POST {base}/version/next`.",
             "- Never edit `.meshkore/credentials/`, `.meshkore/.runtime/` or generated `state.json`.",
             "- The cockpit auto-refreshes ~2s after any write under `.meshkore/` — don't tell the user to reload.",
-            "- Reply concisely. The portal renders your stdout as the chat answer.",
+            "- Reply concisely — follow the **Output contract** below. The portal renders your stdout as the chat answer.",
             "- **Mention initiatives and tasks by their `#<id>` in chat output** (Standard §22, v20+). When you add, remove, rename, defer, or otherwise touch a roadmap item, the operator-facing line MUST start with — or contain — `#<id>`. Example: `✓ added #I18 task #T-vote-API`, `✗ removed #T-fixture-loader from #I19`, `↻ split #I21 into #I21 + #I27`. This lets the operator click-locate the item in the roadmap UI; bare titles in chat are not enough.",
             "- **Anchor every turn to (initiative, task)** (Standard §24, v23+; `anchor.v1` wire protocol, py-1.12.31+). The FIRST line of EVERY assistant reply MUST be a structured anchor marker — the daemon parses it, persists to `conv_meta`, creates files if needed, and STRIPS the line from the output the user sees. Four valid shapes:",
             '    `⟦anchor⟧ {"i":"<init_id>","t":"<task_id>"}`                              — both exist; resolve + persist',
@@ -3139,6 +3139,24 @@ class BriefingPipeline:
             '  Mid-turn task transitions: emit `⟦anchor-progress⟧ {"t":"<task_id>","status":"done"}` when you finish a task; the daemon writes `status: done` to the .md file. Then emit a NEW `⟦anchor⟧` if you\'re starting the next task in the same turn.',
             '  Frontmatter contracts the daemon enforces: initiative slug `^[a-z][a-z0-9-]{1,31}$`; task id `^[A-Za-z][A-Za-z0-9_-]{1,31}$`; exactly one module per task (Standard §4). The newly-created files land at the top of the cockpit\'s roadmap timeline with a ✨ NEW badge — that IS the chronology of "what is happening right now". Full recipe + worked examples: `.meshkore/docs/conventions/initiative-anchored-execution.md`.',
             '  Decision chain when conv_meta is empty: (a) read `.meshkore/roadmap/initiatives/`; if one matches the operator\'s intent by title+oneliner+module → emit `⟦anchor⟧ {"i":"<match>","t":"<existing-task>"}`; (b) if no clear match, CREATE a new initiative + 1-3 tasks via `⟦anchor⟧ {"new_i":{...},"new_t":{...}}` (pick a slug derived from the operator\'s request; modules from the area you\'ll touch); (c) if the user\'s question is purely informational (e.g. "¿qué versión del daemon?"), emit `⟦anchor⟧ {"info":true}` instead.',
+            "",
+            "## Output contract — how your chat answer is shaped (EVERY agent, EVERY turn)",
+            "",
+            "The operator reads your stdout on a chat wall and decides from a 5-second scan — NOT a full read. This contract OVERRIDES any urge to be thorough in the visible answer. Thoroughness goes inside collapsible blocks, never at the top level.",
+            "",
+            "1. **Lead with a ≤8-line summary.** Answer the actual question first: what you found / what you'll do, which files or areas you touch, and the plan as N steps. No preamble, no restating the request, no 'I'll now…'.",
+            "2. **All detail lives inside `<details>` blocks** — one per file or topic. Anything beyond the summary (per-file findings, SQL/code specifics, legacy-field lists, audit results, rationale) MUST be wrapped so the operator expands only what they care about. The cockpit renders `<details>` as a native click-to-expand block:",
+            "       <details><summary>apps/api/src/pieces/list.rs — 3 changes</summary>",
+            "",
+            "       - reads `?cx&cy&r`, adds bbox filter, caps `LIMIT 1000`",
+            "       - drops legacy `Tile` fields (cx/cy/span/tint/…)",
+            "       </details>",
+            "   The `<summary>` is a ONE-LINE headline: `<file> — <N changes>` or `<topic> — <verdict>`. Leave a BLANK LINE after the `</summary>`'s line so the markdown inside (lists, code fences) renders.",
+            "3. **No detail prose outside a `<details>`.** If a paragraph or bullet list isn't part of the ≤8-line summary, it belongs in a details block. Never dump a wall of bullets at the top level.",
+            "4. **Don't narrate process** ('I read X, then checked Y…'). State conclusions; the operator asks for steps if they want them.",
+            "5. When unsure, go SHORTER. The operator can click to expand or ask a follow-up — they cannot un-read 50 lines. A reply that needs scrolling has failed this contract.",
+            "",
+            "Full rationale + worked before/after: `.meshkore/docs/conventions/output-contract.md`.",
             "",
             "## MeshKore standard (where things live)",
             "",
@@ -7974,6 +7992,7 @@ class Daemon:
             "anchor.auto-create.v1",  # py-1.13.0 LAL3 — `new_i` / `new_t` payloads atomically create initiative + task .md files with frontmatter contract enforced.
             "anchor.progress.v1",  # py-1.13.0 LAL3 — `⟦anchor-progress⟧ {"t":...,"status":"done"}` writes status to the task .md and broadcasts conv.task_completed.
             "daemon.snapshot.turn_state.v1",  # py-1.13.1 SRL2 — `/chat/snapshot` carries `current_turn` (started_at + stream_id + partial_text + counters) + `queue` for live convs so the cockpit can rehydrate mid-turn UI after a browser refresh.
+            "context.tree.v1",  # py-1.14.1 — Standard v14 §3.5 project context tree. GET /context returns the `.meshkore/context/` folder/file tree (per-file title/updated/status + word count + over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; GET /context/<path> serves a single file body. Powers the cockpit's Context tab (ContextPanel.tsx, daemon-client.contextTree/contextFile). Fixes the 404 the cockpit logged on every Context-tab open prior to this version.
             "credentials",  # U-DAEMON-02 (list-only)
             "info",
             "shutdown",
@@ -8195,6 +8214,174 @@ class Daemon:
         commits.sort(key=lambda c: c.get("ts") or "", reverse=True)
         out["commits"] = commits[:50]
         return out
+
+    # ── Standard v14 §3.5 — project context tree ─────────────────────
+    #
+    # Per-file word caps from the brevity contract (§3.5 "Folder
+    # layout"). A file over its cap is flagged `over_cap` so the
+    # cockpit can paint a warning marker; the tree-level budget is the
+    # 3000-word / 4500-token total.
+    CONTEXT_WORD_CAPS: Dict[str, int] = {
+        "overview.md": 200,
+        "product.md": 200,
+        "stack.md": 200,
+        "architecture.md": 250,
+        "constraints.md": 250,
+        "glossary.md": 250,
+    }
+    # Files inside decisions/ and criteria/ each cap at 100 words
+    # (README.md is an index — exempt from the per-entry cap).
+    CONTEXT_FOLDER_ENTRY_CAP = 100
+    CONTEXT_BUDGET_WORDS = 3000
+    CONTEXT_BUDGET_TOKENS = 4500
+
+    def context_tree(self) -> Dict[str, Any]:
+        """py-1.14.1 — Standard v14 §3.5 project context tree.
+
+        Walks `.meshkore/context/` and returns the nested folder/file
+        shape the cockpit's Context tab renders: per-file `title`
+        (frontmatter `title`, falling back to a humanized filename),
+        `updated` + `status` (frontmatter), word count, and an
+        `over_cap` flag against the §3.5 brevity caps. Tree-level the
+        response carries `total_words`, `token_estimate` (~1.5 tokens /
+        word), the 4500-token budget, an `over_budget` flag, and a
+        `warnings` list (per-file over-cap notes + total-over-budget).
+
+        File bodies are NOT inlined — the cockpit lazy-fetches each on
+        selection via `/context/<path>`. Returns `exists: False` with
+        an empty tree when no `.meshkore/context/` directory is present
+        (e.g. a freshly bootstrapped cluster) so the cockpit can render
+        its empty-state hint instead of an error.
+
+        Path traversal is structurally impossible here — we only ever
+        `iterdir()` inside `context_dir`; `path` values are relative to
+        that root and consumed by `/context/<path>` which re-validates.
+        """
+        root = self.paths.context_dir
+        warnings: List[str] = []
+
+        def humanize(name: str) -> str:
+            stem = name[:-3] if name.endswith(".md") else name
+            return stem.replace("-", " ").replace("_", " ").strip().capitalize()
+
+        def word_count(text: str) -> int:
+            # Count words in the body only (frontmatter excluded) so the
+            # cap reflects prose, not YAML keys.
+            _fm, body = _split_frontmatter(text)
+            return len(body.split())
+
+        def build_file(fp: "Path", rel: str, cap: Optional[int]):
+            title = humanize(fp.name)
+            updated: Optional[str] = None
+            status: Optional[str] = None
+            words = 0
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                fm = parse_frontmatter(text)
+                if isinstance(fm.get("title"), str) and fm["title"].strip():
+                    title = fm["title"].strip()
+                if isinstance(fm.get("updated"), str):
+                    updated = fm["updated"].strip()
+                elif fm.get("updated") is not None:
+                    updated = str(fm["updated"])
+                if isinstance(fm.get("status"), str) and fm["status"].strip():
+                    status = fm["status"].strip()
+                words = word_count(text)
+            except OSError:
+                pass
+            over_cap = cap is not None and words > cap
+            if over_cap:
+                warnings.append(f"{rel}: {words}w over the {cap}w cap")
+            node: Dict[str, Any] = {
+                "kind": "file",
+                "name": fp.name,
+                "path": rel,
+                "title": title,
+                "words": words,
+                "over_cap": over_cap,
+            }
+            if updated:
+                node["updated"] = updated
+            if status:
+                node["status"] = status
+            return node, words
+
+        def cap_for(rel: str, name: str, in_folder: bool) -> Optional[int]:
+            if in_folder:
+                # README.md is an index, exempt; other entries cap at 100.
+                return None if name == "README.md" else self.CONTEXT_FOLDER_ENTRY_CAP
+            return self.CONTEXT_WORD_CAPS.get(name)
+
+        total_words = 0
+
+        def build_dir(dp: "Path", rel_prefix: str, in_folder: bool):
+            nonlocal total_words
+            children: List[Dict[str, Any]] = []
+            try:
+                entries = sorted(dp.iterdir(), key=lambda e: e.name)
+            except OSError:
+                return children
+            # Files first (alpha), then sub-dirs — but keep README.md at
+            # the top of a folder so the cockpit's "click dir → README"
+            # affordance lands on the index.
+            files = [
+                e
+                for e in entries
+                if e.is_file()
+                and e.suffix.lower() == ".md"
+                and not e.name.startswith(".")
+            ]
+            dirs = [e for e in entries if e.is_dir() and not e.name.startswith(".")]
+            files.sort(key=lambda e: (e.name != "README.md", e.name))
+            for f in files:
+                rel = f"{rel_prefix}{f.name}"
+                node, words = build_file(f, rel, cap_for(rel, f.name, in_folder))
+                total_words += words
+                children.append(node)
+            for d in dirs:
+                rel = f"{rel_prefix}{d.name}"
+                sub = build_dir(d, f"{rel}/", in_folder=True)
+                children.append(
+                    {
+                        "kind": "dir",
+                        "name": d.name,
+                        "path": rel,
+                        "title": humanize(d.name),
+                        "children": sub,
+                    }
+                )
+            return children
+
+        if not root.is_dir():
+            return {
+                "exists": False,
+                "root": ".meshkore/context",
+                "total_words": 0,
+                "token_estimate": 0,
+                "budget_tokens": self.CONTEXT_BUDGET_TOKENS,
+                "over_budget": False,
+                "warnings": [],
+                "tree": [],
+            }
+
+        tree = build_dir(root, "", in_folder=False)
+        token_estimate = int(round(total_words * 1.5))
+        over_budget = token_estimate > self.CONTEXT_BUDGET_TOKENS
+        if over_budget:
+            warnings.append(
+                f"context is {token_estimate} tokens — over the "
+                f"{self.CONTEXT_BUDGET_TOKENS}-token budget (§3.5)"
+            )
+        return {
+            "exists": True,
+            "root": ".meshkore/context",
+            "total_words": total_words,
+            "token_estimate": token_estimate,
+            "budget_tokens": self.CONTEXT_BUDGET_TOKENS,
+            "over_budget": over_budget,
+            "warnings": warnings,
+            "tree": tree,
+        }
 
     def log_listing(self) -> List[Dict[str, Any]]:
         """py-1.9.0 — Descending-by-date list of `.meshkore/log/*.md`

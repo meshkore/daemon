@@ -38,6 +38,13 @@ class Paths:
         self.timeline_dir = self.meshkore / "timeline"
         self.modules_dir = self.meshkore / "modules"
         self.docs_dir = self.meshkore / "docs"
+        # Standard v14 §3.5 — project-wide INVARIANT context tree. The
+        # canonical layout (overview/product/stack/architecture/
+        # constraints + glossary + decisions/ + criteria/). Served
+        # read-only over /context (tree) + /context/<path> (file body)
+        # for the cockpit's Context tab. Distinct from docs/context.md
+        # (the legacy single-file form predating v14).
+        self.context_dir = self.meshkore / "context"
         # py-1.9.0 — daily narrative logs (operator/Claude prose, one
         # file per day). Served read-only over /log/<YYYY-MM-DD>.md +
         # listed under /log so the cockpit Diary tab can lazy-page.

@@ -302,6 +302,26 @@ def make_handler(daemon: Any):
                 return self._serve_meshkore_file(
                     daemon.paths.log_dir, p[len("/log/") :]
                 )
+            # py-1.14.1 — Standard v14 §3.5 project context. `GET
+            # /context` returns the `.meshkore/context/` folder/file
+            # tree (per-file title/updated/status + word count +
+            # over_cap flag, tree-level budget + warnings). `GET
+            # /context/<path>` serves a single file's raw markdown body
+            # (lazy-fetched by the cockpit on node selection). Auth-
+            # gated like the other .meshkore/ reads — context can name
+            # internal decisions not meant for an anonymous browser.
+            # NB: the exact-match `/context` MUST precede the
+            # `/context/` prefix so the tree endpoint isn't shadowed.
+            if p == "/context":
+                if self._need_auth():
+                    return
+                return self._json(200, daemon.context_tree())
+            if p.startswith("/context/"):
+                if self._need_auth():
+                    return
+                return self._serve_meshkore_file(
+                    daemon.paths.context_dir, p[len("/context/") :]
+                )
             # py-1.9.3 — Per-initiative git activity. Runs git log on
             # the project root and returns commits whose subject/body
             # mentions the initiative id, plus the files each commit

@@ -95,6 +95,30 @@ def cluster_populated(root: Path) -> Path:
         ".meshkore/modules/webapp/tasks/T3.md",
         "---\nid: T3\ntitle: T3\nstatus: next\ncategory: webapp\ninitiative: beta\n---\n",
     )
+    # Standard v14 §3.5 context tree — a couple of canonical files +
+    # one decisions/ folder entry so /context has a non-trivial shape.
+    _write(
+        root,
+        ".meshkore/context/overview.md",
+        "---\ntitle: Overview\nupdated: 2026-06-06\nstatus: stable\n---\n"
+        "# Overview\n\nA test cluster. Local-first multi-agent cockpit.\n",
+    )
+    _write(
+        root,
+        ".meshkore/context/stack.md",
+        "---\ntitle: Stack\nupdated: 2026-06-06\n---\n# Stack\n\nPython daemon + SolidJS cockpit.\n",
+    )
+    _write(
+        root,
+        ".meshkore/context/decisions/README.md",
+        "---\ntitle: Decisions\n---\n# Decisions\n\nNewest first.\n",
+    )
+    _write(
+        root,
+        ".meshkore/context/decisions/2026-06-06-pick-python.md",
+        "---\ntitle: Daemon is Python\nupdated: 2026-06-06\nstatus: stable\n---\n"
+        "**Context**: needed a daemon.\n\n**Decision**: Python.\n",
+    )
     # conv_meta sidecar + archive
     _write(
         root,
