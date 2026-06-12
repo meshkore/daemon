@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.14.2"  # 1.14.2 — MP3 effort pass-through + full model ids. `/chat/dispatch` now accepts `effort` (low/medium/high/xhigh/max), persisted in conv_meta, resolved by `_conv_meta_get_effort`, and injected as `claude-code --effort <level>` by ChatRunner.spawn (skipped on the 'default' sentinel). This is claude-code's reasoning-depth dial — the cockpit's "thinking" control. `_conv_meta_set` no longer lowercases the model so pinned ids (claude-opus-4-8) survive verbatim alongside the opus/sonnet/haiku aliases. conv.created/meta_updated broadcasts + /chat/snapshot.convs[] now carry both `model` and `effort`. Pairs with cockpit NewAgentWizard which exposes a versioned model catalog (aliases + pinned 4.x) + an effort picker. 1.14.1 — context tree endpoint (Standard v14 §3.5). New `context_tree()` method walks `.meshkore/context/` and `GET /context` serves the folder/file tree (per-file title/updated/status from frontmatter + word count + §3.5 over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; `GET /context/<path>` serves a single file body (reuses `_serve_meshkore_file` rooted at context_dir, same path-traversal defence). Fixes the cockpit's Context tab which logged `GET /context 404` on every open (ContextPanel.tsx → daemon-client.contextTree, shipped V107.34 against a daemon endpoint that never existed). Feature flag `context.tree.v1`. New `paths.context_dir`. 1.14.0 — universal Output Contract (OC1). The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects. The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
+DAEMON_VERSION = "py-1.14.3"  # 1.14.3 — same-port self-update re-exec. self_update() previously spawned the replacement on a NEW free port and let the cockpit re-discover it (fragile: port hunting, WS-fatal, operator-visible "taking longer than usual"). Now the new process re-execs on the SAME port: the old daemon spawns the child with MESHKORE_REEXEC_WAIT_PORT=1, explicitly server_close()s its listen socket, and os._exit(0)s after a 0.6s flush delay; the child's serve_forever retries the bind for ~12s (250ms cadence) until the port frees, then comes up on the identical port. The cockpit's WS simply reconnects to the same URL — no port change, no port-recovery scan, no front-end reload. Falls back to SystemExit if the port never frees in 12s (old daemon stuck). 1.14.2 — MP3 effort pass-through + full model ids. `/chat/dispatch` now accepts `effort` (low/medium/high/xhigh/max), persisted in conv_meta, resolved by `_conv_meta_get_effort`, and injected as `claude-code --effort <level>` by ChatRunner.spawn (skipped on the 'default' sentinel). This is claude-code's reasoning-depth dial — the cockpit's "thinking" control. `_conv_meta_set` no longer lowercases the model so pinned ids (claude-opus-4-8) survive verbatim alongside the opus/sonnet/haiku aliases. conv.created/meta_updated broadcasts + /chat/snapshot.convs[] now carry both `model` and `effort`. Pairs with cockpit NewAgentWizard which exposes a versioned model catalog (aliases + pinned 4.x) + an effort picker. 1.14.1 — context tree endpoint (Standard v14 §3.5). New `context_tree()` method walks `.meshkore/context/` and `GET /context` serves the folder/file tree (per-file title/updated/status from frontmatter + word count + §3.5 over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; `GET /context/<path>` serves a single file body (reuses `_serve_meshkore_file` rooted at context_dir, same path-traversal defence). Fixes the cockpit's Context tab which logged `GET /context 404` on every open (ContextPanel.tsx → daemon-client.contextTree, shipped V107.34 against a daemon endpoint that never existed). Feature flag `context.tree.v1`. New `paths.context_dir`. 1.14.0 — universal Output Contract (OC1). The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects. The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -7089,19 +7089,23 @@ class Daemon:
                     # the operator already had on disk. The new daemon
                     # will fall back to plain HTTP if neither lands.
                     _log(f"self-update: tls/{fname} refresh skipped ({e})")
-        # 7. Spawn replacement on a free port (NOT this daemon's port —
-        #    we're still bound to it; the new process needs its own).
-        try:
-            new_port = _pick_port(self.paths, preferred=None)
-        except SystemExit as e:
-            return 500, {
-                "error": "no free port available for new daemon",
-                "detail": str(e),
-            }
+        # 7. Spawn the replacement on the SAME port (py-1.14.3).
+        #    Previously we picked a NEW free port and let the cockpit
+        #    re-discover the daemon — fragile (port hunting, WS fatal,
+        #    operator-visible "taking longer than usual"). Now the new
+        #    process is told to WAIT for OUR port to free
+        #    (MESHKORE_REEXEC_WAIT_PORT=1 → serve_forever retries the
+        #    bind for ~12 s). We release the socket by exiting promptly;
+        #    the new daemon binds the identical port and the cockpit's
+        #    WS just reconnects to the same URL — zero operator action,
+        #    no port change, no front-end reload.
+        new_port = self.port
+        child_env = {**os.environ, "MESHKORE_REEXEC_WAIT_PORT": "1"}
         try:
             proc = _sp.Popen(
                 [sys.executable, str(current), "--port", str(new_port)],
                 cwd=str(self.paths.root),
+                env=child_env,
                 stdin=_sp.DEVNULL,
                 stdout=_sp.DEVNULL,
                 stderr=_sp.DEVNULL,
@@ -7109,8 +7113,10 @@ class Daemon:
             )
         except Exception as e:
             return 500, {"error": "failed to spawn new daemon", "detail": str(e)}
-        # 8. Schedule own shutdown so the cockpit can reconnect.
-        SHUTDOWN_DELAY = 3.0
+        # 8. Release our socket + exit promptly so the child's bind-retry
+        #    succeeds fast. A short delay lets the 202 response flush and
+        #    the handoff broadcast reach connected cockpits first.
+        SHUTDOWN_DELAY = 0.6
 
         def _self_kill():
             try:
@@ -7119,9 +7125,18 @@ class Daemon:
                         "type": "daemon.self_update.handing_off",
                         "new_pid": proc.pid,
                         "new_port": new_port,
+                        "same_port": True,
                         "ts": _iso_now(),
                     }
                 )
+            except Exception:
+                pass
+            # Close the listen socket explicitly before exit so the OS
+            # frees the port immediately for the child's retry (don't
+            # wait for os._exit's implicit FD reclaim under load).
+            try:
+                if self.server is not None:
+                    self.server.server_close()
             except Exception:
                 pass
             os._exit(0)
@@ -7131,6 +7146,7 @@ class Daemon:
             "ok": True,
             "new_pid": proc.pid,
             "new_port": new_port,
+            "same_port": True,
             "shutdown_in_sec": SHUTDOWN_DELAY,
             "old_backup": str(backup.relative_to(self.paths.root))
             if backup.exists()
@@ -8617,9 +8633,43 @@ class Daemon:
         )
         http_block = (d_block or {}).get("http") if isinstance(d_block, dict) else None
         max_workers = int((http_block or {}).get("max_workers") or 64)
-        self.server = PoolHTTPServer(
-            ("127.0.0.1", self.port), handler, max_workers=max_workers
+        # py-1.14.3 — same-port re-exec support. When a self-update
+        # handed off to us with MESHKORE_REEXEC_WAIT_PORT=1, the OLD
+        # daemon is still releasing the listen socket on `self.port`.
+        # Retry the bind for up to ~12 s (250 ms cadence) so we come up
+        # on the SAME port — the cockpit's WS just reconnects to the
+        # identical URL, no port hunting, no operator action. Without
+        # the flag we bind once (fast-fail preserves the old behaviour
+        # for a normal boot where a stale daemon means a real conflict).
+        reexec_wait = os.environ.get("MESHKORE_REEXEC_WAIT_PORT", "").strip() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if reexec_wait:
+            deadline = time.monotonic() + 12.0
+            last_err: Optional[Exception] = None
+            self.server = None
+            while time.monotonic() < deadline:
+                try:
+                    self.server = PoolHTTPServer(
+                        ("127.0.0.1", self.port), handler, max_workers=max_workers
+                    )
+                    break
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.25)
+            if self.server is None:
+                _log(
+                    f"re-exec: port {self.port} never freed within 12s "
+                    f"({last_err}); the old daemon may be stuck"
+                )
+                raise SystemExit(f"re-exec bind failed on port {self.port}: {last_err}")
+        else:
+            self.server = PoolHTTPServer(
+                ("127.0.0.1", self.port), handler, max_workers=max_workers
+            )
         # py-1.12.24 — SIGUSR1 → faulthandler dump. Operator sends
         # `kill -USR1 <pid>`; daemon appends every thread's stack to
         # `.meshkore/.runtime/threads.log`. Caught lock-contention bugs
