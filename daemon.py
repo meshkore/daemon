@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.13.1"  # 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
+DAEMON_VERSION = "py-1.13.2"  # 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -3731,6 +3731,27 @@ class ChatRunner:
         out_parts.append(text[last:])
         return "".join(out_parts)
 
+    def _strip_all_anchor_markers(self, text: str) -> str:
+        """py-1.13.2 (anchor-strip-final fix, 2026-06-12). Belt-and-
+        suspenders strip for the FINAL assistant message. The Claude SDK
+        emits a `result` event with the entire reply in one piece; when
+        present, daemon prefers `result_text` over `_cumulative_text`
+        (the latter was already stripped delta-by-delta in
+        `_resolve_anchor_head` + `_strip_anchor_progress`). That bypass
+        meant `⟦anchor⟧ {...}` and `⟦anchor-progress⟧ {...}` lines
+        leaked into the persisted timeline AND the broadcast chat
+        message — operator saw the wire-protocol marker in chat.
+
+        This helper sweeps both marker shapes from the final text. Pure
+        text scrubbing — the side-effects (anchor handler, init/task
+        file creation, conv_meta persist) already ran during the
+        streaming pass. We only need to redact for display."""
+        if "⟦anchor" not in text:
+            return text
+        cleaned = self._ANCHOR_RE.sub("", text, count=1)
+        cleaned = self._ANCHOR_PROGRESS_RE.sub("", cleaned)
+        return cleaned.lstrip("\n")
+
     def _briefing(self) -> str:
         # py-1.4.0 — the briefing is now composed by BriefingPipeline.
         # Each section (role, core rules, cluster snapshot, project
@@ -4017,8 +4038,13 @@ class ChatRunner:
                 continue
             if ev_type == "result" and isinstance(ev.get("result"), str):
                 result_text = ev["result"]
-        # Finalize
-        final_text = result_text or self._cumulative_text
+        # Finalize. py-1.13.2 — `result_text` (from the Claude SDK
+        # `result` event) was bypassing the anchor stripper because the
+        # stripper runs delta-by-delta on `_cumulative_text`. Sweep both
+        # marker kinds from the final text before persisting/broadcasting.
+        final_text = self._strip_all_anchor_markers(
+            result_text or self._cumulative_text
+        )
         # py-1.7.0 — Harvest REMEMBER: lines into the role's shared
         # memory. Anything the agent flags ("REMEMBER: credentials live
         # at …") gets appended once, deduplicated. Lines are also
