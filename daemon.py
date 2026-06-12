@@ -87,7 +87,7 @@ from utils import (  # noqa: E402
 
 PORT_RANGE = (5570, 5589)
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.14.1"  # 1.14.1 — context tree endpoint (Standard v14 §3.5). New `context_tree()` method walks `.meshkore/context/` and `GET /context` serves the folder/file tree (per-file title/updated/status from frontmatter + word count + §3.5 over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; `GET /context/<path>` serves a single file body (reuses `_serve_meshkore_file` rooted at context_dir, same path-traversal defence). Fixes the cockpit's Context tab which logged `GET /context 404` on every open (ContextPanel.tsx → daemon-client.contextTree, shipped V107.34 against a daemon endpoint that never existed). Feature flag `context.tree.v1`. New `paths.context_dir`. 1.14.0 — universal Output Contract (OC1). The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects. The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
+DAEMON_VERSION = "py-1.14.2"  # 1.14.2 — MP3 effort pass-through + full model ids. `/chat/dispatch` now accepts `effort` (low/medium/high/xhigh/max), persisted in conv_meta, resolved by `_conv_meta_get_effort`, and injected as `claude-code --effort <level>` by ChatRunner.spawn (skipped on the 'default' sentinel). This is claude-code's reasoning-depth dial — the cockpit's "thinking" control. `_conv_meta_set` no longer lowercases the model so pinned ids (claude-opus-4-8) survive verbatim alongside the opus/sonnet/haiku aliases. conv.created/meta_updated broadcasts + /chat/snapshot.convs[] now carry both `model` and `effort`. Pairs with cockpit NewAgentWizard which exposes a versioned model catalog (aliases + pinned 4.x) + an effort picker. 1.14.1 — context tree endpoint (Standard v14 §3.5). New `context_tree()` method walks `.meshkore/context/` and `GET /context` serves the folder/file tree (per-file title/updated/status from frontmatter + word count + §3.5 over_cap flag) with tree-level total_words/token_estimate/budget_tokens/over_budget/warnings; `GET /context/<path>` serves a single file body (reuses `_serve_meshkore_file` rooted at context_dir, same path-traversal defence). Fixes the cockpit's Context tab which logged `GET /context 404` on every open (ContextPanel.tsx → daemon-client.contextTree, shipped V107.34 against a daemon endpoint that never existed). Feature flag `context.tree.v1`. New `paths.context_dir`. 1.14.0 — universal Output Contract (OC1). The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects. The single weak "Reply concisely" line in `_section_core_rules` is replaced by a prominent `## Output contract` section that EVERY agent type inherits every turn (previously only the architect had a LENGTH BUDGETS table; custom/audit/deploy/db/docs had no length guidance, so an audit-style turn dumped ~50 lines). The contract mandates: lead with a ≤8-line summary (problem + files touched + N-step plan), put ALL detail inside native HTML `<details>` blocks (one per file/topic, blank line after `</summary>` so inner markdown renders), no detail-prose at the top level, no process narration. Pairs with cockpit V107.36 which renders `<details>` natively + stops auto-expanding fresh finals (the auto-expand was un-clamping the very 50-line walls the operator complained about). Operator field report 2026-06-12: agent A108 audit reply was unreadable. Convention: `.meshkore/docs/conventions/output-contract.md`. 1.13.3 — model pass-through (MP1) + chat usage broadcast (CU1). Two initiatives shipped together. (a) The cockpit's NewAgentWizard model picker (auto/opus/sonnet/haiku) now wires end-to-end: `/chat/dispatch` accepts `model`, stored in conv_meta, ChatRunner.spawn injects `--model <id>` into claude-code argv (skipped when `auto`/None — lets the CLI use its default). Chained turns inherit. (b) ChatRunner captures `usage` + `total_cost_usd` from the SDK's terminal `result` event, ChatSessions accumulates cumulative-per-conv totals (input/output/cache_read/cache_creation/cost_usd/turns), `chat.usage` WS event fires after each turn final, and `/chat/snapshot.convs[].usage` exposes the cumulative dict on every snapshot. Cockpit can render `12.3k in · 4.5k out · $0.15` per agent. 1.13.2 — anchor-strip-final fix. The Claude SDK `result` event was bypassing the per-delta anchor stripper (which only runs on `_cumulative_text`). When the SDK emitted a final `result` block, daemon preferred that text and the leading `⟦anchor⟧ {...}` line + any `⟦anchor-progress⟧ {...}` lines leaked into the persisted timeline + the broadcast `chat.assistant.final`. New `_strip_all_anchor_markers` sweep applied to `final_text` before persisting. Pure scrubbing — the side-effects already ran during streaming. Operator field report 2026-06-12: agent A108 anchor marker visible in chat bubble. 1.13.1 — SRL2 state-recovery-loop snapshot expansion. `/chat/snapshot` (and `/chat/convs`) now carry, for each live conv, a `current_turn` dict (started_at + stream_id + partial_text up to 16 KB + tool_calls_count + deltas_seen) and a `queue` list (the in-memory ChatSessions.pending). Lets a cockpit that just connected mid-turn rehydrate the assistant bubble exactly where it was — restores "Reviewing the roadmap…" output + QUEUED user bubbles + the "preparing" indicator after a browser refresh. Both fields are OPTIONAL on the wire — older cockpits ignore them. New feature: daemon.snapshot.turn_state.v1. SRL1 (e647746) added ChatRunner.started_at / deltas_seen / tool_calls_count attrs that SRL2 reads via getattr. 1.13.0 — LAL3 live-anchor-loop side-effects.
 # 1.12.8 — architect curation-vs-execution rule. Operator field report 2026-06-02: after asking the architect to "review the roadmap", tasks the architect curated (trimmed body, fixed frontmatter cosmetic fields) ended up with `status: active` and stayed yellow/blinking in the cockpit, with no agent alive on them. Added explicit FORBIDDEN rule: setting `status: active` on a task purely to claim it for editing/curation is forbidden. `active` means a coder subagent is dispatched against this task RIGHT NOW (`activeTaskIds().has(task.id)`). Curating the body / fixing tags / trimming verbose intros is curation — leave `status` untouched. Pairs with TaskCard.tsx fix that removed the pulse animation from `status: active` alone — pulse is now reserved for the live-agent branch.
 # 1.12.7 — architect no-disguised-no-ops rule. Operator field report 2026-06-02: a 2-min Run-all pass closed 3 initiatives looking like real work — architect had only touched mtimes (re-wrote 21 files with identical content) to kick the daemon's stale in-memory `serverStore` view. Disk + HEAD both already said `status: done` for everything; the rewrite was cosmetic. Added explicit FORBIDDEN rule + correct behaviour spec (cite SHA, recommend /reload, no fake diary entry). 1.12.4 initiative status consistency guard preserved.
 # 1.12.3 — deploy escalation boundary. Added to architect's DECISION MATRIX 3 dedicated rows for handling `deploy` agent `✗` returns: (a) build/code error in app source → dispatch focused custom coder + re-dispatch deploy; (b) infra-only issue → re-dispatch deploy with edit-authorisation; (c) post-deploy verification mismatch → diagnose propagation, then `blocked: deploy-unverified` after 2 attempts. The `deploy` agent prompt gained an explicit BOUNDARY section listing files it CAN edit (wrangler.toml, fly.toml, links.yaml, deploy scripts, READMEs) vs files it CANNOT edit (apps/*/src, packages/*/src, business logic, tests, migrations). Closes the operator field-report bug where the deploy agent silently failed on a Next.js edge-incompat import and reported `✓ deploy done` while cavioca.com served the previous version for 13h.
@@ -3607,6 +3607,7 @@ class ChatRunner:
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         daemon: Optional["Daemon"] = None,
     ):
         self.paths = paths
@@ -3615,6 +3616,10 @@ class ChatRunner:
         # claude-code uses its default; otherwise spawn injects
         # `--model <id>` into the argv.
         self.model = model
+        # MP3 (py-1.13.4) — Per-turn effort (reasoning depth). None /
+        # 'default' → no flag; otherwise spawn injects
+        # `--effort <level>` (low/medium/high/xhigh/max).
+        self.effort = effort
         # CU1 (py-1.13.3) — Per-turn usage payload populated when the
         # SDK emits its terminal `result` event with `usage` +
         # `total_cost_usd`. Used in finalize to broadcast `chat.usage`
@@ -3855,6 +3860,10 @@ class ChatRunner:
         # the flag entirely and let claude-code pick its default.
         if self.model:
             args.extend(["--model", self.model])
+        # MP3 (py-1.13.4) — reasoning-depth dial. Omitted when None
+        # ('default' sentinel) so claude-code uses its own default.
+        if self.effort:
+            args.extend(["--effort", self.effort])
         if use_session:
             args[2:2] = ["--session-id", session_id]
         # py-1.10.5 — Pipe the briefing through stdin instead of
@@ -5522,6 +5531,7 @@ class Daemon:
         initiative_id: Optional[str] = None,
         task_id: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
         prompt re-spawns automatically when the current turn finishes.
@@ -5558,12 +5568,15 @@ class Daemon:
             initiative_id=initiative_id,
             task_id=task_id,
             model=model,
+            effort=effort,
         )
-        # MP1 (py-1.13.3) — Resolve the model AFTER the sidecar write
-        # so chained turns inherit even when the dispatch body omitted
-        # `model`. Returns None when the preference is "auto" / unset
-        # — ChatRunner.spawn skips the CLI flag in that case.
+        # MP1 (py-1.13.3) / MP3 (py-1.13.4) — Resolve model + effort
+        # AFTER the sidecar write so chained turns inherit even when the
+        # dispatch body omitted them. Each returns None when the
+        # preference is the "auto"/"default" sentinel — ChatRunner.spawn
+        # skips the matching CLI flag in that case.
         resolved_model = self._conv_meta_get_model(conv)
+        resolved_effort = self._conv_meta_get_effort(conv)
         runner = ChatRunner(
             paths=self.paths,
             cluster=self.cluster,
@@ -5575,6 +5588,7 @@ class Daemon:
             agent_type=resolved_type,
             agent_id=resolved_id,
             model=resolved_model,
+            effort=resolved_effort,
             daemon=self,
         )
         runner.spawn()
@@ -5649,13 +5663,28 @@ class Daemon:
         """MP1 (py-1.13.3) — Read the per-conv model preference stored
         by the cockpit's NewAgentWizard. Returns None / 'auto' when no
         override is set; otherwise one of 'opus' / 'sonnet' / 'haiku'
-        (or any string claude-code accepts). Used by ChatRunner.spawn
-        to inject `--model <id>` into the CLI argv."""
+        (or any string claude-code accepts, incl. pinned ids like
+        'claude-opus-4-8'). Used by ChatRunner.spawn to inject
+        `--model <id>` into the CLI argv."""
         meta = self._conv_meta_load().get(conv) or {}
-        m = str(meta.get("model") or "").strip().lower()
-        if not m or m == "auto":
+        m = str(meta.get("model") or "").strip()
+        if not m or m.lower() == "auto":
             return None
         return m
+
+    def _conv_meta_get_effort(self, conv: str) -> Optional[str]:
+        """MP3 (py-1.13.4) — Read the per-conv effort (reasoning-depth)
+        preference. Returns None / 'default' when unset; otherwise one
+        of low/medium/high/xhigh/max. Used by ChatRunner.spawn to inject
+        `--effort <level>` into the CLI argv. This is claude-code's
+        thinking dial — there is no separate thinking flag."""
+        meta = self._conv_meta_load().get(conv) or {}
+        e = str(meta.get("effort") or "").strip().lower()
+        if not e or e == "default":
+            return None
+        if e not in ("low", "medium", "high", "xhigh", "max"):
+            return None
+        return e
 
     def _conv_meta_set(
         self,
@@ -5666,6 +5695,7 @@ class Daemon:
         initiative_id: Optional[str] = None,
         task_id: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ) -> None:
         try:
             all_meta = self._conv_meta_load()
@@ -5698,11 +5728,20 @@ class Daemon:
             # don't pick up a stale value. Empty / None means "no
             # override".
             if model is not None:
-                m_norm = str(model).strip().lower()
+                # Preserve case for pinned ids (claude-opus-4-8); only
+                # the aliases are conventionally lowercase anyway.
+                m_norm = str(model).strip()
                 if m_norm:
                     entry["model"] = m_norm
                 elif "model" in entry:
                     del entry["model"]
+            # MP3 (py-1.13.4) — per-conv effort (reasoning depth).
+            if effort is not None:
+                e_norm = str(effort).strip().lower()
+                if e_norm:
+                    entry["effort"] = e_norm
+                elif "effort" in entry:
+                    del entry["effort"]
             all_meta[conv] = entry
             p = self._conv_meta_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -5722,6 +5761,8 @@ class Daemon:
                         "parent_conv": entry.get("parent_conv"),
                         "initiative_id": entry.get("initiative_id"),
                         "task_id": entry.get("task_id"),
+                        "model": entry.get("model"),
+                        "effort": entry.get("effort"),
                         "ts": _iso_now(),
                     }
                     if not existed_before:
@@ -6182,6 +6223,11 @@ class Daemon:
         model_pref = body.get("model")
         if model_pref is not None:
             model_pref = str(model_pref).strip() or None
+        # MP3 (py-1.13.4) — per-conv effort (reasoning depth) from the
+        # NewAgentWizard. Forwarded to claude-code as `--effort <level>`.
+        effort_pref = body.get("effort")
+        if effort_pref is not None:
+            effort_pref = str(effort_pref).strip() or None
         # py-1.10.25 — Daemon-side dispatch mutex. Enforces invariants
         # the architect prompt already claims but the LLM intermittently
         # violates (observed in cavioca 2026-05-30: same task got 4
@@ -6289,6 +6335,7 @@ class Daemon:
                 initiative_id=initiative_id,
                 task_id=task_id,
                 model=model_pref,
+                effort=effort_pref,
             )
         except Exception as e:
             return 400, {"error": str(e)}
@@ -7369,6 +7416,8 @@ class Daemon:
                 # so the cockpit can show "running on opus" / etc. in
                 # the scope strip alongside the agent role.
                 "model": meta.get("model"),
+                # MP3 (py-1.13.4) — per-conv effort (reasoning depth).
+                "effort": meta.get("effort"),
                 "archived": arch is not None,
                 "archived_at": arch.get("archived_at") if arch else None,
                 "archived_by": arch.get("by") if arch else None,
