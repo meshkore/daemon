@@ -96,3 +96,33 @@ def test_refresh_replaces_preamble_preserves_operator(tmp_path: Path) -> None:
     assert r.refresh_from_remote() is False
     # the per-CLI file picked up the new rule
     assert "Rule 3 (new)." in (tmp_path / "CLAUDE.md").read_text()
+
+
+def test_standard_drift_detection(tmp_path: Path) -> None:
+    paths = _build_cluster(tmp_path, std_version=24)
+    hub = _DummyHub()
+    r = AgentInstructionsRenderer(paths, hub)
+    # local 24, latest 25 → drift
+    r._fetch_standard_version = lambda: 25  # type: ignore[assignment]
+    assert r.check_standard_drift() is True
+    assert r.standard_drift is True
+    assert r.local_standard_version == 24
+    assert r.latest_standard_version == 25
+    assert any(e.get("type") == "standard.drift" for e in hub.events)
+    # second poll while still drifted does NOT re-broadcast
+    n = len([e for e in hub.events if e.get("type") == "standard.drift"])
+    r.check_standard_drift()
+    assert len([e for e in hub.events if e.get("type") == "standard.drift"]) == n
+    r.shutdown()
+
+
+def test_no_drift_when_current(tmp_path: Path) -> None:
+    paths = _build_cluster(tmp_path, std_version=25)
+    r = AgentInstructionsRenderer(paths, _DummyHub())
+    r._fetch_standard_version = lambda: 25  # type: ignore[assignment]
+    assert r.check_standard_drift() is False
+    assert r.standard_drift is False
+    # a failed fetch (None) must not flip drift or crash
+    r._fetch_standard_version = lambda: None  # type: ignore[assignment]
+    assert r.check_standard_drift() is False
+    r.shutdown()

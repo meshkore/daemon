@@ -8,7 +8,11 @@ The MeshKore Python daemon. Single-file (~4,500 lines), stdlib only,
 no `pip install`, no Node. Runs in any folder that has a `.meshkore/`
 tree and exposes the cluster's HTTP + WebSocket API.
 
-**Current version:** `py-1.8.0` (loopback TLS via `daemon.meshkore.com`).
+**Current version:** `py-1.14.7` (§17 agent-instructions render loop).
+The authoritative number is the `DAEMON_VERSION` constant in
+`daemon.py` and the live CDN copy at
+`https://meshkore.com/reference/cluster/scripts/daemon.py` — this line
+is a convenience pointer, not the source of truth.
 
 ## Source-of-truth deployment
 

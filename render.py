@@ -39,6 +39,7 @@ from paths import Paths
 from utils import _log
 
 CANONICAL_PREAMBLE_URL = "https://meshkore.com/standard/agent-instructions.md"
+STANDARD_VERSION_URL = "https://meshkore.com/standard/version"
 
 _PREAMBLE_BEGIN = (
     "<!-- MESHKORE_PREAMBLE_BEGIN"  # marker PREFIX (line carries an em-dash note)
@@ -76,6 +77,15 @@ class AgentInstructionsRenderer:
         self.hub = hub
         self._stop = threading.Event()
         self._mtime: Optional[float] = None
+        # Standard-version drift state (py-1.14.8). Detect-and-surface
+        # only — the daemon NEVER auto-applies the structural catch-up
+        # (folder/schema migrations from the CHANGELOG); that stays
+        # LLM/operator work per Standard §11. We seed the local number
+        # synchronously so /health is meaningful before the first tick;
+        # `latest` fills in on the first VersionWatcher poll.
+        self.local_standard_version: Optional[int] = self._read_local_standard_version()
+        self.latest_standard_version: Optional[int] = None
+        self.standard_drift: bool = False
         # Boot sync: bring the per-CLI files up to date with whatever
         # AGENT_INSTRUCTIONS.md currently says (heals drift left by an
         # older daemon that lacked this loop). Remote preamble refresh
@@ -91,11 +101,16 @@ class AgentInstructionsRenderer:
     def _source(self):
         return self.paths.public / "AGENT_INSTRUCTIONS.md"
 
-    def _standard_version(self) -> int:
+    def _read_local_standard_version(self) -> Optional[int]:
         try:
             return int((self.paths.meshkore / "STANDARD_VERSION").read_text().strip())
         except Exception:
-            return 0
+            return None
+
+    def _standard_version(self) -> int:
+        """Local STANDARD_VERSION as an int (0 if unreadable) — used to
+        gate the v19 render targets."""
+        return self._read_local_standard_version() or 0
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -201,6 +216,50 @@ class AgentInstructionsRenderer:
         except Exception:
             pass
         return True
+
+    # ── standard-version drift (detect + surface only) ──────────────
+    def check_standard_drift(self) -> bool:
+        """Compare the cluster's pinned STANDARD_VERSION against the
+        published one. Detect-and-surface ONLY: logs + emits a
+        `standard.drift` WS event on the transition into drift, and
+        keeps `/health.standard` current. Does NOT bump STANDARD_VERSION
+        and does NOT apply structural migrations — that catch-up is
+        LLM/operator work per Standard §11 (a daemon rewriting the
+        folder layout unattended is how clusters break)."""
+        local = self._read_local_standard_version()
+        self.local_standard_version = local
+        latest = self._fetch_standard_version()
+        if latest is None:
+            return self.standard_drift
+        self.latest_standard_version = latest
+        drift = local is not None and latest > local
+        if drift and not self.standard_drift:
+            _log(
+                f"standard-drift: cluster at v{local}, latest v{latest} — "
+                f"structural catch-up needed (Standard §11; instructions already auto-refreshed)"
+            )
+            try:
+                self.hub.broadcast(
+                    {"type": "standard.drift", "local": local, "latest": latest}
+                )
+            except Exception:
+                pass
+        self.standard_drift = drift
+        return drift
+
+    def _fetch_standard_version(self) -> Optional[int]:
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(
+                STANDARD_VERSION_URL,
+                headers={"User-Agent": "meshcore-py standard-drift"},
+            )
+            with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as r:
+                return int(r.read(64).decode("utf-8", errors="replace").strip())
+        except Exception as e:
+            _log(f"standard-drift: version fetch failed: {e}")
+            return None
 
     def _fetch_canonical(self) -> Optional[str]:
         try:
