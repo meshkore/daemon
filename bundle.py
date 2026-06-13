@@ -37,6 +37,7 @@ MODULES = [
     "utils.py",
     "hub.py",
     "registries.py",
+    "render.py",
     "runs.py",
     "storage.py",
     "chat.py",
