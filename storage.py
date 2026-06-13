@@ -505,6 +505,30 @@ class ChatQueueManager:
         with self._lock:
             return self._read(conv)
 
+    def conv_ids(self) -> List[str]:
+        """py-1.14.6 — Every conv id with a non-empty queue file on disk.
+        Powers the daemon's idle-flush sweep (boot + reaper tick), which
+        resumes queues stranded when no turn-completion fired the on_idle
+        hook — e.g. after a self-update re-exec wiped the in-memory
+        session + its _wait thread, or a session was abnormally reaped.
+        Reads the canonical `conv` field from each file rather than
+        un-sanitising the filename."""
+        out: List[str] = []
+        with self._lock:
+            qdir = self.paths.queues_dir
+            if not qdir.exists():
+                return out
+            for p in sorted(qdir.glob("*.json")):
+                try:
+                    data = json.loads(p.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                conv = data.get("conv")
+                items = data.get("items")
+                if isinstance(conv, str) and isinstance(items, list) and items:
+                    out.append(conv)
+        return out
+
     def enqueue(self, conv: str, text: str) -> Dict[str, Any]:
         text = (text or "").strip()
         if not text:

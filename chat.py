@@ -369,3 +369,22 @@ class ChatSessionReaper:
                 self.daemon._broadcast_conv_activity(conv, live_override=False)
             except Exception as e:
                 _log(f"chat-reaper: hard-timeout broadcast failed for {conv}: {e}")
+        # Phase 3 (py-1.14.6) — idle chat-queue flush. The disk queue
+        # (ChatQueueManager) is normally drained by the on_idle hook on
+        # turn-COMPLETION. But a conv can hold queued items while idle
+        # with no on_idle ever firing — daemon restart / self-update
+        # re-exec (in-memory ChatSessions + its _wait thread gone), a
+        # session reaped in Phase 1 above (pops the slot without firing
+        # on_idle), or an enqueue into an already-idle conv. Those queues
+        # sit forever ("N WAITING · runs after the current turn" with no
+        # current turn). Flushing a head re-registers on_idle, so the
+        # chain resumes. Runs on the boot sweep (resumes queues stranded
+        # by the update) and every tick (safety net). Operator field
+        # report 2026-06-13 (IKA cluster): queue stuck at 2 WAITING after
+        # the daemon was updated mid-session.
+        try:
+            flushed = self.daemon._flush_idle_chat_queues()
+            if flushed:
+                _log(f"chat-reaper: flushed {flushed} idle queue(s) source={source}")
+        except Exception as e:
+            _log(f"chat-reaper: idle-queue flush failed ({e})")
