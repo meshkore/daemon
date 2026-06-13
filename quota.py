@@ -11,10 +11,11 @@ Both classes are constructor-injected the daemon ref so they can call
 ``self.daemon._broadcast_conv_activity(...)``. Coupling is intentional —
 the prober's whole job is to talk to subagents the daemon manages.
 
-Bundler note: local stubs at the top (``_log``, ``_iso_now``,
-``_iso_at``, ``_debug_emit``, ``_agent_manifest``) are shadowed in
-``dist/daemon.py`` by daemon.py's later definitions. Source-tree dev
-runs ``QuotaState`` correctly; ``QuotaProber.probe_one`` requires the
+Bundler note: shared helpers (``_log``, ``_iso_now``, ``_iso_at``,
+``_debug_emit``) come from utils; ``_agent_manifest`` + ``AGENT_PROMPTS``
+come from prompts (DM-modularize-2 — was a local shadow stub, now a real
+import, so the bundle no longer relies on definition order). Source-tree
+dev runs ``QuotaState`` correctly; ``QuotaProber.probe_one`` requires the
 full daemon and is exercised only in production / integration runs."""
 
 from __future__ import annotations
@@ -27,17 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+from prompts import AGENT_PROMPTS, _agent_manifest  # DM-modularize-2 — real registry
 from utils import _debug_emit, _iso_at, _iso_now, _log  # DM7 — real helpers
-
-
-# Shadowed in bundle — `_agent_manifest` + `AGENT_PROMPTS` live in daemon.py
-# (they reference the full prompt catalog). At call time the bundle's
-# late-binding global lookup resolves to the real ones.
-def _agent_manifest(agent_type: str) -> Dict[str, Any]:  # stub
-    return {"quota_key": "claude-code/auto"}
-
-
-AGENT_PROMPTS: Dict[str, Any] = {}
 
 
 class QuotaState:

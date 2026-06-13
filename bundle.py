@@ -38,14 +38,22 @@ MODULES = [
     "hub.py",
     "storage.py",
     "chat.py",
+    "prompts.py",
+    "runner.py",
     "quota.py",
     "routes.py",
 ]
 
 # Lines of the form ``from <mod> import …`` where <mod> is one of our
 # sibling modules. Stripped from each file so the bundle's flat global
-# namespace doesn't trip over missing modules.
-SIBLING_PREFIXES = tuple(f"from {m[:-3]} import " for m in MODULES)
+# namespace doesn't trip over missing modules. ``from daemon import …``
+# is stripped too: there is no ``daemon`` module inside the single-file
+# bundle, so any such line (an extracted sibling reaching back for a
+# daemon-defined constant like ``DAEMON_VERSION`` at runtime) MUST be
+# dropped — the name resolves via the bundle's flat global namespace.
+SIBLING_PREFIXES = tuple(f"from {m[:-3]} import " for m in MODULES) + (
+    "from daemon import ",
+)
 
 
 def _git_rev() -> str:
