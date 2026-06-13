@@ -175,20 +175,34 @@ class ChatSessions:
                     return
                 cancelled = sess["cancelled"]
                 pending = sess["pending"]
-                if cancelled or not pending:
+                idle = cancelled or not pending
+                if idle:
                     self._s.pop(conv, None)
-                    # py-1.12.19 — Notify the on_idle hook BEFORE returning,
-                    # AFTER the slot is popped. The Daemon wires this to
-                    # the disk-queue auto-flush: if a queued item exists
-                    # we'll spawn the next turn (and ChatSessions.start
-                    # will re-occupy the slot cleanly).
-                    if on_idle is not None:
-                        try:
-                            on_idle(conv)
-                        except Exception as e:
-                            _log(f"on_idle hook failed for {conv}: {e}")
-                    return
-                sess["pending"] = []
+                else:
+                    sess["pending"] = []
+            # py-1.14.9 — Callbacks run OUTSIDE self._lock. Both re-enter
+            # ChatSessions (on_idle → Daemon._maybe_flush_chat_queue →
+            # chat_sessions.has()/start(); on_chain → _spawn_chat_turn →
+            # start()) and hit the broadcast hub. self._lock is a plain
+            # non-reentrant threading.Lock, so calling them while holding
+            # it self-deadlocks the _wait thread — it then keeps the lock
+            # forever and every list_active()/has()/reap_dead() (i.e.
+            # /chat/snapshot) blocks. That is the recurring ikamiro
+            # ChatSessions-lock deadlock; py-1.14.6's has()-guard at the
+            # top of _maybe_flush_chat_queue made on_idle hit it on EVERY
+            # turn-completion. The slot is already popped (idle) / cleared
+            # (chain) above, so the re-entrant calls see a clean state.
+            if idle:
+                # py-1.12.19 — disk-queue auto-flush hook. If a queued item
+                # exists the Daemon spawns the next turn (start re-occupies
+                # the slot cleanly); the has()-guard there absorbs any race
+                # with a dispatch that landed between the pop and here.
+                if on_idle is not None:
+                    try:
+                        on_idle(conv)
+                    except Exception as e:
+                        _log(f"on_idle hook failed for {conv}: {e}")
+                return
             merged = (
                 pending[0]
                 if len(pending) == 1
