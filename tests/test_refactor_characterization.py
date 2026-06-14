@@ -56,15 +56,20 @@ BRIEFING_GOLDEN_EMPTY = {
     "testing": "2db40888cb1f84413743f28b7b539214fdf6b12dc8886ace357641c6e078354c",
 }
 
+# Regenerated for Standard §3.5 / v25: BriefingPipeline now prepends the
+# `=== PROJECT CONTEXT === … === END CONTEXT ===` block (prompts.py
+# _section_project_context). The populated fixture has a .meshkore/context/
+# tree, so every agent type's briefing now carries it. The EMPTY golden is
+# unchanged (no context/ → empty section).
 BRIEFING_GOLDEN_POPULATED = {
-    "audit": "c0e4123f013f053c7c97bec156541cbc3f3f959cbc36e1eb45a563e7c579f94a",
-    "custom": "b30f20cc93c9146d3a86f0d2eb0bf0b17ace87fe157a8e60cd52fed4afd7e7ad",
-    "db": "6668ca58d400f564c237d7db8a821e1b72437755de75d9465e5da2d27619a668",
-    "deploy": "773515e9a85195a767a4e28a1b234f354201cb23712b0a78ba534a250f288006",
-    "docs": "25ea5e1258d74aee2e167d8674efe1390740c40eaa685d9abcca924d3b0cc031",
-    "review": "1caae4e64df57172b401ce74594b1cd67abf0157a24a41b47f8dae7f47df4ff7",
-    "roadmap-architect": "b40cabd78e3329ffe390515871c1e29245d57c43bc2a6c4357e85d9d303eeb9e",
-    "testing": "d1da6120505dde59a56863a0ea0487acd3e4c97ba147f34658f72db45995187d",
+    "audit": "a358f145911ea4c9ed11a7913cf15f41fe20e079bb4d35ffd522dfa395aa9a92",
+    "custom": "0b9820597e1553d97c541d62e6ef11d1a743b1f7323ca29f8bc02d93eb688e26",
+    "db": "e95fefe2395c217999e7ee8d93eb40729d00401825d47a67332ac1da796d7c31",
+    "deploy": "6577fe2fd5b28a8b755b4fa7407d451035730752dc00c37e4d71ef5b7fd79163",
+    "docs": "e9198c3b4cdaa397a97a6be6e580a842e37b950f612c760160d16b86c5beb753",
+    "review": "64df69f53b59f95ae37ed2d27650bd85bd9b69d3a1c3b2321a1cfdf42cd2b23f",
+    "roadmap-architect": "aeb9b08616013dd5443f2116f11624ebf5f9797163658b5bf1a8eaf705f53454",
+    "testing": "4ea007a638d6cca5c3fc0979003f333dd8171ed625ca30fab96f4eec8879a997",
 }
 
 AGENT_KEYS_GOLDEN = [
