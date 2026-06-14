@@ -169,11 +169,27 @@ class ChatRunner:
     # The daemon strips these from the visible chat thread and acts on
     # them in LAL3's _handle_anchor / _handle_anchor_progress.
 
+    # py-1.14.10 — TOLERANT bracket matching (Postel's law). The canonical
+    # marker uses the mathematical white square brackets ⟦ ⟧ (U+27E6/U+27E7),
+    # but LLMs do NOT reliably reproduce rare Unicode glyphs — they routinely
+    # normalise them to ASCII `[anchor]` / `[[anchor]]` (or CJK 【anchor】).
+    # When that happened the strict `⟦anchor⟧`-only regex matched NOTHING, so
+    # the marker (a) was never parsed → no init/task creation, no conv_meta,
+    # no live roadmap painting, AND (b) was never stripped → the raw
+    # `[anchor] {...}` line leaked into the chat bubble. Both symptoms, one
+    # cause. Operator field report 2026-06-13 (ikamiro: `[anchor]` visible in
+    # chat + spinner never lit on the roadmap). We keep instructing the
+    # canonical ⟦ ⟧ in the briefing but accept every common rendering here.
+    _ANCHOR_OPEN = r"(?:⟦|〚|【|\[\[?)"  # ⟦  〚  【  [[  [
+    _ANCHOR_CLOSE = r"(?:⟧|〛|】|\]\]?)"  # ⟧  〛  】  ]]  ]
     _ANCHOR_RE = re.compile(
-        r"⟦anchor⟧\s*(\{[^\n]*\})\s*(?:\n|$)",
+        _ANCHOR_OPEN + r"anchor" + _ANCHOR_CLOSE + r"\s*(\{[^\n]*\})\s*(?:\n|$)",
     )
     _ANCHOR_PROGRESS_RE = re.compile(
-        r"⟦anchor-progress⟧\s*(\{[^\n]*\})\s*(?:\n|$)",
+        _ANCHOR_OPEN
+        + r"anchor-progress"
+        + _ANCHOR_CLOSE
+        + r"\s*(\{[^\n]*\})\s*(?:\n|$)",
     )
 
     def _resolve_anchor_head(self, more_text: str) -> str:
@@ -233,7 +249,8 @@ class ChatRunner:
         """Detect `⟦anchor-progress⟧ {...}` lines anywhere in `text`,
         notify the daemon, and remove them so they don't reach the
         chat thread."""
-        if "⟦anchor-progress⟧" not in text:
+        # py-1.14.10 — bracket-agnostic fast-path guard (see _ANCHOR_RE).
+        if "anchor-progress" not in text:
             return text
         out_parts: List[str] = []
         last = 0
@@ -270,7 +287,10 @@ class ChatRunner:
         text scrubbing — the side-effects (anchor handler, init/task
         file creation, conv_meta persist) already ran during the
         streaming pass. We only need to redact for display."""
-        if "⟦anchor" not in text:
+        # py-1.14.10 — bracket-agnostic fast-path guard (see _ANCHOR_RE).
+        # "anchor" in prose is harmless: the regexes still require a
+        # bracket-wrapped marker + JSON body, so a bare word never matches.
+        if "anchor" not in text:
             return text
         cleaned = self._ANCHOR_RE.sub("", text, count=1)
         cleaned = self._ANCHOR_PROGRESS_RE.sub("", cleaned)

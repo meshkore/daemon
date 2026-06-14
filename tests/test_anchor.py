@@ -79,6 +79,76 @@ def test_anchor_regex_rejects_no_marker() -> None:
 
     assert d.ChatRunner._ANCHOR_RE.match("hello world\n") is None
     assert d.ChatRunner._ANCHOR_RE.match("just text without marker") is None
+    # A bare markdown link must NOT be mistaken for a marker (close
+    # bracket is followed by `(` not a `{` JSON body).
+    assert d.ChatRunner._ANCHOR_RE.match("[anchor](#link)\n") is None
+
+
+def test_anchor_regex_tolerates_ascii_and_cjk_brackets() -> None:
+    """py-1.14.10 — LLMs routinely render the canonical ⟦ ⟧ as ASCII
+    `[anchor]` / `[[anchor]]` (or CJK 【anchor】). The parser must accept
+    all of them or the marker leaks into chat AND the roadmap never lights
+    up. Operator field report 2026-06-13 (ikamiro showed `[anchor]`)."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import daemon as d  # type: ignore[import-not-found]
+
+    for opener, closer in [
+        ("[", "]"),
+        ("[[", "]]"),
+        ("【", "】"),
+        ("〚", "〛"),
+        ("⟦", "⟧"),
+    ]:
+        line = f'{opener}anchor{closer} {{"i":"I12","t":"WEB-wizard-kid"}}\n'
+        m = d.ChatRunner._ANCHOR_RE.match(line)
+        assert m is not None, f"failed to match {opener}anchor{closer}"
+        assert json.loads(m.group(1))["t"] == "WEB-wizard-kid"
+
+    # progress variant, same bracket tolerance
+    for opener, closer in [("[", "]"), ("[[", "]]"), ("⟦", "⟧")]:
+        text = f'work…\n{opener}anchor-progress{closer} {{"t":"X1","status":"done"}}\n'
+        m = d.ChatRunner._ANCHOR_PROGRESS_RE.search(text)
+        assert m is not None, f"failed to match {opener}anchor-progress{closer}"
+
+    # The plain anchor regex must NOT swallow an anchor-progress marker
+    # (the `-` after `anchor` blocks the close bracket).
+    assert d.ChatRunner._ANCHOR_RE.match('[anchor-progress] {"t":"X1"}\n') is None
+
+
+def test_resolve_anchor_head_strips_ascii_marker() -> None:
+    """End-to-end of the head resolver with an ASCII `[anchor]`: the
+    marker line is consumed (not forwarded to chat) and the handler fires."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import daemon as d  # type: ignore[import-not-found]
+
+    seen: dict = {}
+
+    class _StubDaemon:
+        def _handle_anchor(self, conv, payload, raw=None):
+            seen["payload"] = payload
+
+        def _handle_anchor_missing(self, conv):
+            seen["missing"] = True
+
+    runner = d.ChatRunner.__new__(d.ChatRunner)
+    runner.conv = "c1"
+    runner._head_buffer = ""
+    runner._anchor_head_resolved = False
+    runner.daemon = _StubDaemon()
+
+    visible = runner._resolve_anchor_head(
+        '[anchor] {"i":"I12","t":"WEB-wizard-kid"}\nHola, empiezo.\n'
+    )
+    assert "anchor" not in visible  # marker line stripped
+    assert visible.strip() == "Hola, empiezo."
+    assert seen.get("payload", {}).get("i") == "I12"
+    assert "missing" not in seen  # the missing-handler must NOT have fired
 
 
 # ── 2. Health surface — protocol-aware daemons announce the features ──

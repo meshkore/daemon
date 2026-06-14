@@ -22,6 +22,7 @@ production gets the canonical helpers."""
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -116,18 +117,43 @@ def _strip_shebang(text: str) -> str:
     return text
 
 
+def _extract_version(src_text: str) -> str:
+    """Pull the ``DAEMON_VERSION = "py-X.Y.Z"`` value out of daemon.py
+    source so the bundler can echo it into the bundle HEADER."""
+    m = re.search(r'^DAEMON_VERSION\s*=\s*"([^"]+)"', src_text, re.MULTILINE)
+    if not m:
+        raise SystemExit("bundle.py: could not find DAEMON_VERSION in daemon.py")
+    return m.group(1)
+
+
 def bundle() -> Path:
     """Write the bundled artifact + a tls/ symlink alongside it.
 
-    Order: header → each sibling module (paths, storage, …) → daemon.py.
-    Each part is sibling-import-stripped. The tls/ link mirrors the
-    production layout — the daemon's ``_find_tls_bundle()`` looks for
+    Order: header → early version marker → each sibling module
+    (paths, storage, …) → daemon.py. Each part is
+    sibling-import-stripped. The tls/ link mirrors the production
+    layout — the daemon's ``_find_tls_bundle()`` looks for
     ``<here>/tls/`` next to its own ``__file__``; the publisher in DM6
     must copy (not link) for the public CDN."""
     DIST.mkdir(parents=True, exist_ok=True)
+    src_text = SRC.read_text()
+    version = _extract_version(src_text)
+    # ── EARLY version marker (py-1.14.10) ──────────────────────────────
+    # The VersionWatcher detects new releases by HTTP Range-fetching only
+    # the FIRST 8 KB of the published bundle and parsing `^DAEMON_VERSION`.
+    # Since the DM3 modularization inlines daemon.py LAST, the canonical
+    # `DAEMON_VERSION` assignment sits ~334 KB deep — far past the 8 KB
+    # window — so `_fetch_remote_version` returned None and NO cluster
+    # ever auto-updated (published stuck at py-1.14.4, field-confirmed
+    # 2026-06-13). Echoing the value at the TOP fixes detection for every
+    # already-deployed watcher (they read the first 8 KB of THIS file).
+    # The canonical assignment (with the full changelog) is still inlined
+    # from daemon.py below; Python just reassigns the identical value.
     parts = [
         _header(_git_rev()),
         "from __future__ import annotations\n\n",
+        f'DAEMON_VERSION = "{version}"  # early bundle marker for the '
+        f"version-watcher 8 KB range-fetch; canonical def inlined below.\n\n",
     ]
     for mod in MODULES:
         body = (ROOT / mod).read_text()
@@ -138,7 +164,7 @@ def bundle() -> Path:
     parts.append(
         "\n\n# ── inlined from daemon/daemon.py — main module ──────────────────────\n"
     )
-    parts.append(_strip_sibling_imports(_strip_shebang(SRC.read_text())))
+    parts.append(_strip_sibling_imports(_strip_shebang(src_text)))
     OUT.write_text("".join(parts))
     OUT.chmod(0o755)
     tls_link = DIST / "tls"
