@@ -45,31 +45,30 @@ import daemon as d  # type: ignore[import-not-found]  # noqa: E402
 
 # Hashes are computed over the briefing with the (run-specific) absolute
 # cluster root path replaced by "<ROOT>" — see _briefing_hash.
+# Regenerated for py-1.14.11 (AS1): prompts.py anchor rule gained a line
+# clarifying that `i` is the lowercase file-stem slug, never the `#`-display
+# id. That line is in the universal core rules → every agent type's briefing
+# shifts, on BOTH the empty and populated fixtures.
 BRIEFING_GOLDEN_EMPTY = {
-    "audit": "0467662ac37ce4a4790209ff45052eaa04298d97e2e2f1f2cf294373c4d7918b",
-    "custom": "6d65527403f0f88b7e69e08be17d05ff1f84bfeb2383ed073d12d6716c43fc2a",
-    "db": "ca173a91968673d0a6a38cc7aa5b8720abcba1328ad1ae583df933d3c7883329",
-    "deploy": "29e552e8760158fb1ff233f7764a24ecdbb4b4ab9f6bcdbc5e8a5abf159badaa",
-    "docs": "7da216038a7a3e17eece1cd26002a5dcd146147e49813a577bb0e5097e912366",
-    "review": "75f11d855ead1ccebbab09a3633afe0ae246a3858ed2dd3d1ddae8ebd4e8604c",
-    "roadmap-architect": "c6ec58e7ef59cc857681d0afb48f749cd51b8b59f43c38e4cad9a6660c5ba809",
-    "testing": "2db40888cb1f84413743f28b7b539214fdf6b12dc8886ace357641c6e078354c",
+    "audit": "6308efd064d0ce2e508436da9808dd5d55858e07b67f21779fd264854d3cbf74",
+    "custom": "f5f434dc599cdeb8ca5cf2f11a7bd74bd2e187998818aa696c908dab0dec4790",
+    "db": "51291556f9b6e120fddd17b95242b33d154ef28a0dbabcdbb56720e4ccca8d31",
+    "deploy": "28fbebfacc86994239912998dd55d41ce5593597034287cd3543fbfb6f3c280f",
+    "docs": "2ed71b42e2b1b65bb5eaf538ab41c1c78a907aa2292a858010bf1a59049532f2",
+    "review": "86807cf234635b65de6f57e36e8e1ff24ac459e23fc94dcbaaf43552169b9109",
+    "roadmap-architect": "661cde5b8cb79b66924a6ff84f2a78fcec6f85fa926763a2900bdb643f9cf554",
+    "testing": "f8f28ddcad0f1210ae848f663669cb0d7284157bbae2c4901d5d224ed05860f5",
 }
 
-# Regenerated for Standard §3.5 / v25: BriefingPipeline now prepends the
-# `=== PROJECT CONTEXT === … === END CONTEXT ===` block (prompts.py
-# _section_project_context). The populated fixture has a .meshkore/context/
-# tree, so every agent type's briefing now carries it. The EMPTY golden is
-# unchanged (no context/ → empty section).
 BRIEFING_GOLDEN_POPULATED = {
-    "audit": "a358f145911ea4c9ed11a7913cf15f41fe20e079bb4d35ffd522dfa395aa9a92",
-    "custom": "0b9820597e1553d97c541d62e6ef11d1a743b1f7323ca29f8bc02d93eb688e26",
-    "db": "e95fefe2395c217999e7ee8d93eb40729d00401825d47a67332ac1da796d7c31",
-    "deploy": "6577fe2fd5b28a8b755b4fa7407d451035730752dc00c37e4d71ef5b7fd79163",
-    "docs": "e9198c3b4cdaa397a97a6be6e580a842e37b950f612c760160d16b86c5beb753",
-    "review": "64df69f53b59f95ae37ed2d27650bd85bd9b69d3a1c3b2321a1cfdf42cd2b23f",
-    "roadmap-architect": "aeb9b08616013dd5443f2116f11624ebf5f9797163658b5bf1a8eaf705f53454",
-    "testing": "4ea007a638d6cca5c3fc0979003f333dd8171ed625ca30fab96f4eec8879a997",
+    "audit": "6e54a7abe20a0e124a8f2c012671d60772f941ef834c453e494a5a53c8bf12df",
+    "custom": "3cd80affd62de66f9c9aedfa921efeb497343e1cf1eb9c7811b702c0a9086354",
+    "db": "c4307334ac61c4efc29269cdc2447ab9883143b617163a00e5c894e82d5544e3",
+    "deploy": "d4bfc0af74bc6cd97d7962c4f784c0f20a231d3a13dc4fecab8ab529e12aeaaf",
+    "docs": "f0c2733d849d5bb91457f31a92c0363f23ab9ea19350fda856888367c1ada673",
+    "review": "5618a5399b8939b6a41109adc48951013b1357df58c88ec725e1045663f02001",
+    "roadmap-architect": "dff2a639017d9a9452eac116a4c4f84d0f285f77cbdacacc04a1a40172466fee",
+    "testing": "e3723c56184b8a5532191a1ab41bcb3c37a216aef0ecb2f552339619bab99f6e",
 }
 
 AGENT_KEYS_GOLDEN = [

@@ -186,3 +186,27 @@ def test_daemon_health_advertises_anchor_features(daemon: Daemon) -> None:
 #       delta. After the turn, the initiative + task .md files
 #       exist on disk with the expected frontmatter; conv_meta.json
 #       has the new entry; a `conv.anchored` event was broadcast."""
+
+
+# ── 4. AS1 (py-1.14.11) — initiative-ref slug normalization ───────────
+
+
+def test_normalize_init_ref_strips_hash_and_lowercases() -> None:
+    """`Daemon._normalize_init_ref` recovers the common slip of pasting a
+    `#`-prefixed display id or varied casing as an initiative slug. It is
+    identity-SAFE: only strips leading `#`/whitespace + lowercases (a real
+    slug is already lowercase, no `#`). It deliberately does NOT strip a
+    display-id PREFIX like `I32-` (that's prompt-side — stripping it could
+    anchor to the wrong initiative)."""
+    import daemon as d  # type: ignore[import-not-found]
+
+    norm = d.Daemon._normalize_init_ref
+    assert norm("#model-v9-points-only") == "model-v9-points-only"
+    assert norm("Model-V9-Points-Only") == "model-v9-points-only"
+    assert norm("  ##payments-and-credits  ") == "payments-and-credits"
+    assert norm(None) == ""
+    # Display PREFIX is preserved (lowercased) — NOT silently rewritten to a
+    # different slug; the daemon will then reject/not-find it (prompt fixes it).
+    assert norm("I32-model-v9-points-only") == "i32-model-v9-points-only"
+    # A clean slug passes through unchanged.
+    assert norm("agent-run-coordinator") == "agent-run-coordinator"
