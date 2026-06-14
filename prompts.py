@@ -698,6 +698,10 @@ class BriefingPipeline:
 
     def build(self) -> str:
         sections = [
+            # Standard §3.5 (v25 hard_rule) — invariant project context,
+            # prepended BEFORE the role block. Empty when the cluster has
+            # no .meshkore/context/ tree yet.
+            self._section_project_context(),
             self._section_role(),
             self._section_core_rules(),
             self._section_agent_focus(),
@@ -725,6 +729,93 @@ class BriefingPipeline:
         return brief.replace("__MESHKORE_VERSION__", DAEMON_VERSION)
 
     # ── sections ──────────────────────────────────────────────────
+
+    def _section_project_context(self) -> str:
+        """Standard §3.5 (v25 hard_rule) — serialize `.meshkore/context/`
+        as the invariant PROJECT CONTEXT block, prepended before the role
+        on every spawn. Order + markers per `context.serialization_to_agent`.
+        Returns "" when the cluster has no context/ tree yet (a fresh
+        cluster) — the legacy `docs/context.md` pointers in other sections
+        still apply until the Roadmap Author bootstraps context/."""
+        root = self.paths.context_dir
+        if not root.is_dir():
+            return ""
+
+        def body_of(p: "Any") -> str:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+            # Strip YAML frontmatter (only when both fences are present).
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end != -1:
+                    nl = text.find("\n", end + 1)
+                    if nl != -1:
+                        text = text[nl + 1 :]
+            return text.strip()
+
+        parts: List[str] = []
+
+        def add(marker: str, p: "Any") -> None:
+            if p.is_file():
+                b = body_of(p)
+                if b:
+                    parts.append(f"{marker}\n{b}")
+
+        add("=== PROJECT CONTEXT ===", root / "overview.md")
+        add("=== PRODUCT ===", root / "product.md")
+        add("=== STACK ===", root / "stack.md")
+        add("=== ARCHITECTURE ===", root / "architecture.md")
+        add("=== CONSTRAINTS ===", root / "constraints.md")
+        add("=== GLOSSARY ===", root / "glossary.md")
+
+        def folder_chunk(folder: "Any", *, newest_first: bool) -> str:
+            if not folder.is_dir():
+                return ""
+            entries = [f for f in folder.glob("*.md") if f.name != "README.md"]
+            entries.sort(reverse=newest_first)  # filenames are date- or slug-sorted
+            chunk: List[str] = []
+            readme = folder / "README.md"
+            if readme.is_file():
+                b = body_of(readme)
+                if b:
+                    chunk.append(b)
+            for f in entries:
+                b = body_of(f)
+                if b:
+                    chunk.append(b)
+            return "\n\n".join(chunk)
+
+        dec = folder_chunk(root / "decisions", newest_first=True)
+        if dec:
+            parts.append("=== DECISIONS (newest first) ===\n" + dec)
+        crit = folder_chunk(root / "criteria", newest_first=False)
+        if crit:
+            parts.append("=== CRITERIA ===\n" + crit)
+
+        if not parts:
+            return ""
+
+        block = "\n\n".join(parts)
+        # Defensive cap (~ the §3.5 3000w/4500tok budget) so a runaway
+        # context/ can't blow the prompt. Dispatch-time budget refusal is
+        # a separate gate; here we just bound the briefing.
+        CAP = 24000
+        truncated = ""
+        if len(block) > CAP:
+            block = block[:CAP]
+            truncated = (
+                "\n…[context truncated — over the §3.5 4500-token budget; "
+                "trim .meshkore/context/]"
+            )
+
+        header = (
+            "Everything between the markers below is the project's INVARIANT "
+            "context (MeshKore Standard §3.5). Treat it as authoritative and "
+            "unchanging — do not re-derive or re-debate it.\n"
+        )
+        return f"{header}\n{block}{truncated}\n\n=== END CONTEXT ==="
 
     def _section_role(self) -> str:
         # py-1.7.0 — Role text is now driven by AGENT_PROMPTS so service
