@@ -46,6 +46,24 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 def make_handler(daemon: Any):
     class Handler(BaseHTTPRequestHandler):
+        # py-1.16.2 — HTTP keep-alive. The default is HTTP/1.0, so the
+        # cockpit opened a NEW TLS connection for EVERY fetch (/state,
+        # per-conv /chat queues, health polls). Each closed into TIME_WAIT;
+        # under a busy cockpit that exhausted the OS ephemeral-port table
+        # (30k+ TIME_WAIT observed) and NEW connections — including the
+        # cockpit's own /state — stalled in SYN_SENT and timed out. THIS is
+        # the chronic "connection refused / timeout / blank chats" we kept
+        # chasing through 1.15.x. HTTP/1.1 lets the browser + httpx reuse
+        # one connection for many requests → connection count collapses, no
+        # TIME_WAIT storm. Safe: every body response sends Content-Length;
+        # 204 (OPTIONS) and 101 (WS upgrade) are bodyless.
+        protocol_version = "HTTP/1.1"
+        # A kept-alive connection blocks a pool worker in handle() waiting
+        # for the next request; this read timeout closes truly-idle ones so
+        # the worker is freed (handle_one_request treats the timeout as a
+        # clean close).
+        timeout = 30
+
         def log_message(self, fmt, *args):  # silence default access log
             return
 

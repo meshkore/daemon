@@ -84,6 +84,55 @@ def test_ws_does_not_starve_http(daemon: Daemon) -> None:
                 pass
 
 
+def _tls_connect(port: int) -> ssl.SSLSocket:
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(raw, server_hostname="daemon.meshkore.com")
+
+
+def _http_get(s: ssl.SSLSocket, path: str) -> tuple[bytes, bytes]:
+    s.sendall(
+        (
+            f"GET {path} HTTP/1.1\r\n"
+            "Host: daemon.meshkore.com\r\n"
+            "Accept: application/json\r\n\r\n"
+        ).encode()
+    )
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            return b"", b""
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    cl = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":", 1)[1].strip())
+    body = rest
+    while len(body) < cl:
+        body += s.recv(cl - len(body))
+    return head.split(b"\r\n", 1)[0], body
+
+
+def test_http_keep_alive_reuses_connection(daemon: Daemon) -> None:
+    """py-1.16.2 — two requests over ONE TLS connection. Proves HTTP/1.1
+    keep-alive: without it (HTTP/1.0) the server closes after the first
+    response and the second read returns empty."""
+    s = _tls_connect(daemon.port)
+    try:
+        status1, _ = _http_get(s, "/health")
+        assert b"200" in status1, f"first request: {status1!r}"
+        # Same socket, second request — only works if the daemon kept the
+        # connection alive after the first response.
+        status2, _ = _http_get(s, "/health")
+        assert b"200" in status2, f"keep-alive second request failed: {status2!r}"
+    finally:
+        s.close()
+
+
 def test_ws_heartbeat_or_clean_close(daemon: Daemon) -> None:
     """A WS that the client closes is reaped without wedging the daemon."""
     s = _ws_open(daemon.port)
