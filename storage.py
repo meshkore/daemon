@@ -474,12 +474,20 @@ class ChatQueueManager:
         p = self._path(conv)
         if items:
             self.paths.queues_dir.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                json.dumps(
-                    {"conv": conv, "items": items, "updated_at": _iso_now()},
-                    indent=2,
-                ),
-            )
+            # py-1.16.0 (D-STORE-ATOMIC-01) — atomic tmp+replace, matching
+            # ChatArchive/RunStore/conv_meta. A plain write_text could be
+            # interrupted mid-write → a half-file that `_read` silently
+            # parses to [] (queued turns vanished). os.replace is atomic.
+            body = json.dumps(
+                {"conv": conv, "items": items, "updated_at": _iso_now()},
+                indent=2,
+            ).encode("utf-8")
+            tmp = p.with_suffix(".json.tmp")
+            with open(tmp, "wb") as fh:
+                fh.write(body)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, p)
         else:
             try:
                 p.unlink()

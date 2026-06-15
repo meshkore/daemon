@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hub import WSClient
+import traceback  # py-1.16.0 (D-HTTP-500-01) — handler exception guard
+
 from utils import _debug_emit, _iso_now, debug_enabled, get_debug_log  # DM7
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -154,7 +156,31 @@ def make_handler(daemon: Any):
             self._cors()
             self.end_headers()
 
+        def _guard(self, fn, verb: str) -> None:
+            # py-1.16.0 (D-HTTP-500-01) — turn an unexpected handler error
+            # into a 500 JSON instead of letting it propagate to
+            # BaseHTTPRequestHandler, which closes the socket with NO
+            # response → the cockpit sees a bare connection reset (000),
+            # indistinguishable from "daemon dead". A client abort is
+            # normal and stays quiet.
+            try:
+                fn()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception:
+                traceback.print_exc()  # → stderr → daemon.log
+                try:
+                    self._json(500, {"error": "internal daemon error", "verb": verb})
+                except Exception:
+                    pass  # response already (partly) sent — nothing safe to do
+
         def do_GET(self):  # noqa: N802
+            self._guard(self._do_GET, "GET")
+
+        def do_POST(self):  # noqa: N802
+            self._guard(self._do_POST, "POST")
+
+        def _do_GET(self):  # noqa: N802
             p, q = self._path()
             # WebSocket upgrade?
             if (
@@ -563,7 +589,7 @@ def make_handler(daemon: Any):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self):  # noqa: N802
+        def _do_POST(self):  # noqa: N802
             p, _ = self._path()
             if p == "/shutdown":
                 if self._need_auth():
@@ -930,34 +956,75 @@ def make_handler(daemon: Any):
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", accept)
             self.end_headers()
+            # Flush the 101 onto the wire BEFORE the ws-pump starts
+            # sending frames (else the client sees a frame before the
+            # upgrade response → protocol error).
+            try:
+                self.wfile.flush()
+            except OSError:
+                return
             sock = self.connection
             sock.settimeout(None)
+            # py-1.16.0 (D-WS-01) — hand the lifelong inbound read loop to
+            # a DEDICATED thread instead of blocking this PoolHTTPServer
+            # worker for the WS's whole life. Pinning bounded workers
+            # (max_workers=64) on long-lived WS could starve HTTP
+            # (/state, /health, /chat) of workers. We register the socket
+            # as hijacked so the server's shutdown_request does NOT close
+            # it when this (now-freed) worker returns; the ws-pump thread
+            # owns and closes it. `close_connection=True` exits the
+            # keep-alive loop so the worker returns immediately.
+            hijacked = False
+            srv = getattr(self, "server", None)
+            reg = getattr(srv, "_ws_hijacked", None)
+            if reg is not None:
+                reg.add(id(sock))
+                hijacked = True
+            self.close_connection = True
             client = WSClient(sock)
             daemon.hub.add(client)
-            # Greeting
-            client.send_text(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "identity": daemon.identity,
-                        "port": daemon.port,
-                        "ts": _iso_now(),
-                    }
-                )
-            )
-            # Drain inbound frames (we only care about close) so the
-            # socket pump keeps moving; ignore everything else.
-            try:
-                while not daemon.stopping.is_set() and not client.closed:
-                    op, _data = _ws_read_frame(sock)
-                    if op is None or op == 0x8:  # close frame
-                        break
-            except (OSError, ConnectionError):
-                pass
-            finally:
-                daemon.hub.remove(client)
+            if hijacked:
+                threading.Thread(
+                    target=_ws_pump,
+                    args=(daemon, client, sock, srv),
+                    name="ws-pump",
+                    daemon=True,
+                ).start()
+            else:
+                # Fallback (server without the hijack registry): keep the
+                # old in-worker behaviour so WS still functions.
+                _ws_pump(daemon, client, sock, None)
 
     return Handler
+
+
+def _ws_pump(daemon, client, sock, server) -> None:
+    """Drive one WebSocket: greet, then drain inbound frames until close.
+    Runs on a dedicated thread (D-WS-01) so it never holds a request-pool
+    worker. Owns the socket: closes it (via hub.remove) on exit and
+    deregisters the hijack so the fd can be reclaimed."""
+    try:
+        client.send_text(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "identity": daemon.identity,
+                    "port": daemon.port,
+                    "ts": _iso_now(),
+                }
+            )
+        )
+        while not daemon.stopping.is_set() and not client.closed:
+            op, _data = _ws_read_frame(sock)
+            if op is None or op == 0x8:  # close frame
+                break
+    except (OSError, ConnectionError):
+        pass
+    finally:
+        daemon.hub.remove(client)  # closes the socket
+        reg = getattr(server, "_ws_hijacked", None)
+        if reg is not None:
+            reg.discard(id(sock))
 
 
 def _ws_read_frame(sock: socket.socket) -> Tuple[Optional[int], bytes]:

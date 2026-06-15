@@ -250,6 +250,9 @@ def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Pop
     env = os.environ.copy()
     env["MESHKORE_DAEMON_NO_BOOT_UPDATE"] = "1"  # hermetic — no CDN calls in tests
     env["MESHKORE_DAEMON_SELF_UPDATED"] = "1"  # belt-and-braces — block re-exec
+    # D-TEST-ISO-01 — keep the sticky port registry in the test workdir so
+    # the suite never writes the operator's real ~/.meshkore/ports.json.
+    env["MESHKORE_PORTS_FILE"] = str(work / "ports.json")
     # Coverage in subprocess: tests/sitecustomize.py calls
     # coverage.process_startup() when COVERAGE_PROCESS_START is set. Adding
     # tests/ to PYTHONPATH gets sitecustomize.py imported automatically.

@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 HEARTBEAT_SEC = 20.0
+SEND_TIMEOUT_SEC = 5.0  # py-1.16.0 (D-WS-02) — bound a send so a stalled client can't wedge a broadcaster
 
 
 def _iso_now() -> str:
@@ -42,6 +43,21 @@ class WSClient:
     def __init__(self, sock: socket.socket):
         self.sock = sock
         self.closed = False
+        # py-1.16.0 (D-WS-02) — bound sends so a client with a full TCP
+        # send buffer (suspended laptop, paused devtools) can't block a
+        # broadcaster forever. SO_SNDTIMEO affects ONLY send, not the
+        # ws-pump's recv. Best-effort: the timeval struct layout is
+        # platform-specific, so fall back to untimed sends on failure
+        # (the broadcast-outside-the-lock change still prevents the
+        # whole-Hub stall; this just bounds the per-client cost).
+        try:
+            sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_SNDTIMEO,
+                struct.pack("ll", int(SEND_TIMEOUT_SEC), 0),
+            )
+        except (OSError, struct.error):
+            pass
 
     def send_text(self, payload: str) -> None:
         """Send a single, unmasked, unfragmented text frame (server → client)."""
@@ -97,15 +113,26 @@ class Hub:
         client.close()
 
     def broadcast(self, event: Dict[str, Any]) -> None:
+        # py-1.16.0 (D-WS-02) — snapshot the client set UNDER the lock,
+        # then send OUTSIDE it. Previously the per-client blocking
+        # `sendall` ran while holding `_lock`, so one stalled client
+        # froze every broadcaster (chat deltas, run.* events, heartbeat)
+        # — the docstring claimed sends were outside the lock but the
+        # code did the opposite. Sends are now bounded by SO_SNDTIMEO
+        # (see WSClient), so a wedged client is dropped within the
+        # timeout instead of blocking the fan-out.
         payload = json.dumps(event, separators=(",", ":"))
         with self._lock:
-            dead = []
-            for c in list(self._clients):
-                c.send_text(payload)
-                if c.closed:
-                    dead.append(c)
-            for c in dead:
-                self._clients.discard(c)
+            clients = list(self._clients)
+        dead = []
+        for c in clients:
+            c.send_text(payload)
+            if c.closed:
+                dead.append(c)
+        if dead:
+            with self._lock:
+                for c in dead:
+                    self._clients.discard(c)
 
     def shutdown(self) -> None:
         self._stop.set()
