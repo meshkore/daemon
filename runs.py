@@ -47,9 +47,19 @@ TIMELINE_ROTATE_SCAN_SEC = 3600.0  # once per hour
 class TimelineRotator:
     """Background gzipper for old jsonl files in .meshkore/timeline/."""
 
-    def __init__(self, paths: "Paths", age_days: int = TIMELINE_ROTATE_AGE_DAYS):
+    def __init__(
+        self,
+        paths: "Paths",
+        age_days: int = TIMELINE_ROTATE_AGE_DAYS,
+        delete_days: int = 0,
+    ):
         self.paths = paths
         self.age_days = age_days
+        # py-1.16.1 (D-STORE-RETENTION-01) — delete archived .gz this many
+        # days AFTER rotation. 0 = never delete (opt-in): auto-pruning chat
+        # history requires an explicit cluster.yaml `storage.retention_days`.
+        # Effective history ≈ age_days + delete_days.
+        self.delete_days = delete_days
         self._stop = threading.Event()
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -106,7 +116,32 @@ class TimelineRotator:
                 rotated += 1
             except OSError as e:
                 _log(f"timeline rotator: skipped {f.name}: {e}")
+        if self.delete_days > 0:
+            self._delete_old_archives()
         return rotated
+
+    def _delete_old_archives(self) -> int:
+        """py-1.16.1 (D-STORE-RETENTION-01) — opt-in prune of archived .gz
+        older than `delete_days` (by file mtime = rotation time). Off when
+        delete_days==0. Bounds otherwise-unbounded timeline growth."""
+        archive_dir = self.paths.timeline_dir / "archive"
+        if not archive_dir.exists():
+            return 0
+        cutoff = time.time() - (self.delete_days * 86400)
+        deleted = 0
+        for gz in archive_dir.glob("*.gz"):
+            try:
+                if gz.stat().st_mtime < cutoff:
+                    gz.unlink()
+                    deleted += 1
+            except OSError:
+                pass
+        if deleted:
+            _log(
+                f"timeline retention: deleted {deleted} archived .gz "
+                f"older than {self.delete_days}d"
+            )
+        return deleted
 
 
 class RunStore:

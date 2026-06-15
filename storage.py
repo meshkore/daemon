@@ -144,8 +144,9 @@ class StorageReport:
     documents the endpoint as the canonical surface for operator-side
     capacity reporting."""
 
-    CACHE_TTL_SECS = 5.0  # cheap-ish recompute; long enough that a
-    # rapid poll cluster doesn't burn IO.
+    CACHE_TTL_SECS = 30.0  # py-1.16.1 (D-STOREREPORT-01) — was 5s; a
+    # full-tree walk every 5s on a polling cockpit was wasteful. Storage
+    # sizes change slowly; 30s is plenty fresh for a capacity panel.
 
     # Each entry: (logical-name, attribute on Paths). The order is the
     # order the cockpit will render them in.
@@ -199,18 +200,28 @@ class StorageReport:
         so one unreadable subtree doesn't poison the whole report."""
         if not root.exists() or not root.is_dir():
             return 0, 0
+        # py-1.16.1 (D-STOREREPORT-01) — os.scandir recursion instead of
+        # rglob("*")+stat(): DirEntry carries size, so no extra stat()
+        # syscall per file (~halves the IO of this poll-driven walk on
+        # large clusters). Combined with the longer cache TTL below.
         total = 0
         files = 0
-        try:
-            for entry in root.rglob("*"):
-                try:
-                    if entry.is_file():
-                        total += entry.stat().st_size
-                        files += 1
-                except (OSError, PermissionError):
-                    continue
-        except (OSError, PermissionError):
-            pass
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                total += entry.stat().st_size
+                                files += 1
+                        except OSError:
+                            continue
+            except OSError:
+                continue
         return total, files
 
     def usage(self) -> Dict[str, Any]:
