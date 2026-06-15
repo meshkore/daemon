@@ -48,6 +48,11 @@ class ChatSessions:
         # consumption history. In-memory only; daemon restart resets.
         # Persisting belongs to the broader `usage-ledger` initiative.
         self._usage_total: Dict[str, Dict[str, Any]] = {}
+        # D-TURNSNAP-01 (py-1.17.0) — last finalized turn's stream_id per
+        # conv. Set when a runner's `done` fires (in start._wait). Lets the
+        # cockpit drop a stale "live" seed whose stream_id ≤ the last final
+        # (the eternal-loader fix's daemon half). In-memory; reset on restart.
+        self._last_final: Dict[str, str] = {}
 
     # CU1 — accumulate usage by conv (called per-turn-final).
     def record_usage(
@@ -122,13 +127,30 @@ class ChatSessions:
         chat_convs() build."""
         with self._lock:
             sess = self._s.get(conv)
+            last_final = self._last_final.get(conv)
             if not sess:
+                # No live session. Still surface last_final_stream_id so a
+                # reconnecting cockpit can drop a stale seed (D-TURNSNAP-01).
+                if last_final:
+                    return {
+                        "current_turn": None,
+                        "queue": [],
+                        "last_final_stream_id": last_final,
+                    }
                 return None
             runner = sess.get("runner")
             pending = sess.get("pending") or []
             queued_at = sess.get("queued_at") or ""
         current_turn = None
-        if runner is not None:
+        # D-TURNSNAP-01 — only report a turn as LIVE when the runner is
+        # genuinely still running. A finished runner lingers in `_s` until
+        # `start._wait` pops it; reporting its current_turn made the cockpit
+        # seed a `streaming:true` bubble that no future event would clear →
+        # the eternal "Recapping progress…" loader. `runner.done` is the
+        # authoritative "this turn ended" signal.
+        done = getattr(runner, "done", None)
+        runner_live = runner is not None and not (done is not None and done.is_set())
+        if runner_live:
             current_turn = {
                 "started_at": getattr(runner, "started_at", None),
                 "stream_id": getattr(runner, "stream_id", None),
@@ -140,7 +162,11 @@ class ChatSessions:
             {"text": t, "id": f"q_{i}", "queued_at": queued_at}
             for i, t in enumerate(pending)
         ]
-        return {"current_turn": current_turn, "queue": queue}
+        return {
+            "current_turn": current_turn,
+            "queue": queue,
+            "last_final_stream_id": last_final,
+        }
 
     def queue(self, conv: str, text: str) -> int:
         with self._lock:
@@ -170,6 +196,12 @@ class ChatSessions:
         def _wait():
             runner.done.wait()
             with self._lock:
+                # D-TURNSNAP-01 — record the finalized turn's stream_id so
+                # turn_snapshot can tell a reconnecting cockpit "this turn
+                # already ended" and it won't seed an orphan live bubble.
+                sid = getattr(runner, "stream_id", None)
+                if sid:
+                    self._last_final[conv] = sid
                 sess = self._s.get(conv)
                 if not sess:
                     return

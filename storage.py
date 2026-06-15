@@ -331,6 +331,7 @@ class UploadStore:
         conv: str,
         images: Optional[List[Dict[str, Any]]],
         ts_iso: str,
+        skipped: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Persist the dispatch's images list. Returns a manifest list
         ready to be embedded in the chat.user event. Each entry:
@@ -369,8 +370,33 @@ class UploadStore:
             try:
                 blob = base64.b64decode(data_b64, validate=True)
             except Exception:
+                # D-UPLOAD-FEEDBACK-01 — surface the drop instead of silence.
+                if skipped is not None:
+                    skipped.append(
+                        {
+                            "idx": idx,
+                            "reason": "decode_failed",
+                            "media_type": media_type,
+                        }
+                    )
                 continue
-            if len(blob) > self.MAX_BYTES_PER_FILE or len(blob) == 0:
+            if len(blob) == 0:
+                if skipped is not None:
+                    skipped.append(
+                        {"idx": idx, "reason": "empty", "media_type": media_type}
+                    )
+                continue
+            if len(blob) > self.MAX_BYTES_PER_FILE:
+                if skipped is not None:
+                    skipped.append(
+                        {
+                            "idx": idx,
+                            "reason": "too_large",
+                            "media_type": media_type,
+                            "size_bytes": len(blob),
+                            "max_bytes": self.MAX_BYTES_PER_FILE,
+                        }
+                    )
                 continue
             ext = self._EXT_BY_MEDIA.get(media_type, "bin")
             rand4 = secrets.token_hex(2)
