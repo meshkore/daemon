@@ -68,11 +68,21 @@ def make_handler(daemon: Any):
             return
 
         def setup(self):
-            # py-1.10.19 — capture wall-clock start for the debug stream's
-            # `http` hook. BaseHTTPRequestHandler builds one Handler per
-            # request, so this attribute is naturally per-request.
+            # Capture a connection-open stamp; the real per-request stamp
+            # is set in handle_one_request below.
             self._http_t0 = time.time()
             super().setup()
+
+        def handle_one_request(self):
+            # py-1.17.1 — stamp the request-start time PER REQUEST. Under
+            # HTTP/1.1 keep-alive (py-1.16.2) one Handler instance serves
+            # MANY requests, so `setup()` runs once per CONNECTION, not per
+            # request. The old code left `_http_t0` at connection-open, so
+            # log_request reported the CONNECTION AGE (e.g. "17838 ms" for
+            # an instant OPTIONS on an old kept-alive socket) instead of the
+            # request latency — badly misleading the debug/http stream.
+            self._http_t0 = time.time()
+            super().handle_one_request()
 
         def log_request(self, code="-", size="-"):  # noqa: D401
             # py-1.10.19 — emit one structured `http` event per response.
