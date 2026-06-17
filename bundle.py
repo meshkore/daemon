@@ -57,6 +57,7 @@ MODULES = [
     "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
+    "readapi.py",
     "runner.py",
     "quota.py",
     "routes.py",
@@ -139,7 +140,12 @@ def _strip_sibling_imports(text: str) -> str:
     tc_indent: int | None = None  # indent of an `if TYPE_CHECKING:` block being dropped
     for line in text.splitlines(keepends=True):
         if skip_until_close:
-            if ")" in line:
+            # Look for the closing paren on CODE only — a `)` inside a
+            # trailing comment (e.g. `name,  # see foo(bar)`) must NOT be
+            # mistaken for the end of the multi-line import, or the real
+            # closing `)` + remaining names leak into the bundle unstripped
+            # → IndentationError.
+            if ")" in line.split("#", 1)[0]:
                 skip_until_close = False
             continue
         # Drop `if TYPE_CHECKING:` blocks wholesale — they're type-only
