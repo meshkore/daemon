@@ -48,6 +48,7 @@ MODULES = [
     "runs.py",
     "storage.py",
     "chat.py",
+    "http_server.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
     "runner.py",
