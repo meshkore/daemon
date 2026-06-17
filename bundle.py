@@ -67,6 +67,8 @@ MODULES = [
     "chatsvc.py",
     "crud.py",
     "quota.py",
+    "routes_get.py",
+    "routes_post.py",
     "routes.py",
 ]
 
