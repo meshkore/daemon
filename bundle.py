@@ -53,6 +53,7 @@ MODULES = [
     "http_server.py",
     "bootstrap.py",
     "selfupdate.py",
+    "anchor.py",
     "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
