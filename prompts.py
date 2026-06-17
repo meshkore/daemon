@@ -720,11 +720,10 @@ class BriefingPipeline:
         ]
         brief = self.SECTION_SEP.join(s for s in sections if s and s.strip())
         # Substitute the live daemon version into the architect's commit-
-        # trailer SOP. DAEMON_VERSION lives in daemon.py (loaded last in the
-        # bundle); imported here at call time so the AGENT_PROMPTS dict can be
-        # built at module load without it (DM-modularize-2). No-op for agent
-        # types whose briefing doesn't carry the placeholder.
-        from daemon import DAEMON_VERSION
+        # trailer SOP. DAEMON_VERSION lives in the leaf `constants` module
+        # (DA-CONST-01) — a dependency-free import, no cycle, available at
+        # module load. No-op for agent types whose briefing lacks the token.
+        from constants import DAEMON_VERSION
 
         return brief.replace("__MESHKORE_VERSION__", DAEMON_VERSION)
 

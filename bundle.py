@@ -40,6 +40,7 @@ OUT = DIST / "daemon.py"
 # module be split into a ≤300-LOC granular subfolder while the single-file
 # bundle stays one flat namespace.
 MODULES = [
+    "constants.py",
     "paths.py",
     "utils.py",
     "cluster.py",
@@ -180,11 +181,12 @@ def _strip_shebang(text: str) -> str:
 
 
 def _extract_version(src_text: str) -> str:
-    """Pull the ``DAEMON_VERSION = "py-X.Y.Z"`` value out of daemon.py
-    source so the bundler can echo it into the bundle HEADER."""
+    """Pull the ``DAEMON_VERSION = "py-X.Y.Z"`` value out of the source so
+    the bundler can echo it into the bundle HEADER. As of DA-CONST-01,
+    DAEMON_VERSION lives in constants.py (a leaf), not daemon.py."""
     m = re.search(r'^DAEMON_VERSION\s*=\s*"([^"]+)"', src_text, re.MULTILINE)
     if not m:
-        raise SystemExit("bundle.py: could not find DAEMON_VERSION in daemon.py")
+        raise SystemExit("bundle.py: could not find DAEMON_VERSION in constants.py")
     return m.group(1)
 
 
@@ -199,7 +201,9 @@ def bundle() -> Path:
     must copy (not link) for the public CDN."""
     DIST.mkdir(parents=True, exist_ok=True)
     src_text = SRC.read_text()
-    version = _extract_version(src_text)
+    # DA-CONST-01 — DAEMON_VERSION moved to the leaf constants.py; read it
+    # from there for the early 8 KB version marker the VersionWatcher reads.
+    version = _extract_version((ROOT / "constants.py").read_text())
     # ── EARLY version marker (py-1.14.10) ──────────────────────────────
     # The VersionWatcher detects new releases by HTTP Range-fetching only
     # the FIRST 8 KB of the published bundle and parsing `^DAEMON_VERSION`.
