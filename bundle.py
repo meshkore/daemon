@@ -60,6 +60,8 @@ MODULES = [
     "prompts.py",
     "coordination.py",
     "readapi.py",
+    "chatread.py",
+    "credapi.py",
     "runner.py",
     "chatsvc.py",
     "crud.py",

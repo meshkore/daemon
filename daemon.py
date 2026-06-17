@@ -55,9 +55,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # in dependency order, stripping these import lines from the bundled
 # output. Source-tree runs hit the sibling files via sys.path[0].
 from anchor import AnchorMixin  # noqa: E402
+from chatread import ChatReadMixin  # noqa: E402
 from chatsvc import ChatMixin  # noqa: E402
 from crud import CrudMixin  # noqa: E402
 from coordination import CoordinationMixin  # noqa: E402
+from credapi import CredMixin  # noqa: E402
 from readapi import QueryMixin  # noqa: E402
 from state import StateManager  # noqa: E402
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
@@ -221,7 +223,15 @@ _CRON_RUN_STATUSES = frozenset(
 # near the top.
 
 
-class Daemon(AnchorMixin, ChatMixin, CoordinationMixin, CrudMixin, QueryMixin):
+class Daemon(
+    AnchorMixin,
+    ChatMixin,
+    ChatReadMixin,
+    CoordinationMixin,
+    CredMixin,
+    CrudMixin,
+    QueryMixin,
+):
     def __init__(
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
     ):
