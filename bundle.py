@@ -61,6 +61,7 @@ MODULES = [
     "readapi.py",
     "runner.py",
     "chatsvc.py",
+    "crud.py",
     "quota.py",
     "routes.py",
 ]
