@@ -57,6 +57,7 @@ MODULES = [
     "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
+    "coordination.py",
     "readapi.py",
     "runner.py",
     "quota.py",
