@@ -32,7 +32,13 @@ SRC = ROOT / "daemon.py"
 DIST = ROOT / "dist"
 OUT = DIST / "daemon.py"
 
-# Sibling modules to inline ahead of daemon.py, in dep order.
+# Sibling modules to inline ahead of daemon.py, in dep order. An entry may
+# be a FILE (``foo.py``) or a PACKAGE FOLDER (``agent_prompts`` — no .py).
+# A folder is expanded (DA-BUNDLER-01) into its ``*.py`` in deterministic
+# order: every non-dunder file sorted, then ``__init__.py`` LAST so it can
+# assemble names the fragment files defined above it. This lets a large
+# module be split into a ≤300-LOC granular subfolder while the single-file
+# bundle stays one flat namespace.
 MODULES = [
     "paths.py",
     "utils.py",
@@ -42,12 +48,31 @@ MODULES = [
     "runs.py",
     "storage.py",
     "chat.py",
-    "agent_prompts.py",
+    "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
     "runner.py",
     "quota.py",
     "routes.py",
 ]
+
+
+def _expand_module(entry: str) -> list[Path]:
+    """Resolve a MODULES entry to the ordered list of source files to
+    inline. A ``.py`` file → itself. A package folder → its fragment
+    ``*.py`` (sorted) followed by ``__init__.py`` last."""
+    p = ROOT / entry
+    if entry.endswith(".py"):
+        return [p]
+    if p.is_dir():
+        files = sorted(f for f in p.glob("*.py") if f.name != "__init__.py")
+        init = p / "__init__.py"
+        if init.exists():
+            files.append(init)
+        return files
+    raise SystemExit(
+        f"bundle.py: MODULES entry {entry!r} is neither a .py file nor a folder"
+    )
+
 
 # Lines of the form ``from <mod> import …`` where <mod> is one of our
 # sibling modules. Stripped from each file so the bundle's flat global
@@ -56,8 +81,19 @@ MODULES = [
 # bundle, so any such line (an extracted sibling reaching back for a
 # daemon-defined constant like ``DAEMON_VERSION`` at runtime) MUST be
 # dropped — the name resolves via the bundle's flat global namespace.
-SIBLING_PREFIXES = tuple(f"from {m[:-3]} import " for m in MODULES) + (
-    "from daemon import ",
+def _mod_name(entry: str) -> str:
+    return entry[:-3] if entry.endswith(".py") else entry
+
+
+# Import-line prefixes to strip: `from <sibling> import …` AND
+# `from <pkg>.<sub> import …` (intra-package), for every MODULES entry, plus
+# `from daemon import …`. Relative imports (`from .`) are handled in
+# _strip_sibling_imports directly (any package __init__ assembling its
+# fragments uses them, and the names already live in the flat namespace).
+SIBLING_PREFIXES = (
+    tuple(f"from {_mod_name(m)} import " for m in MODULES)
+    + tuple(f"from {_mod_name(m)}." for m in MODULES)
+    + ("from daemon import ",)
 )
 
 
@@ -98,7 +134,14 @@ def _strip_sibling_imports(text: str) -> str:
             if ")" in line:
                 skip_until_close = False
             continue
-        if line.lstrip().startswith(drop_prefixes):
+        stripped = line.lstrip()
+        # Intra-package relative imports (`from . import x`, `from .x import y`)
+        # — the names are already defined in the flat bundle namespace.
+        if stripped.startswith("from .") and " import " in stripped:
+            if "(" in line and ")" not in line.split("#", 1)[0]:
+                skip_until_close = True
+            continue
+        if stripped.startswith(drop_prefixes):
             # If this opens a multi-line `from X import (` (has `(` but no
             # matching `)` on the same line, ignoring trailing comments),
             # skip continuation lines until we see the closing `)`.
@@ -156,11 +199,13 @@ def bundle() -> Path:
         f"version-watcher 8 KB range-fetch; canonical def inlined below.\n\n",
     ]
     for mod in MODULES:
-        body = (ROOT / mod).read_text()
-        parts.append(
-            f"\n\n# ── inlined from daemon/{mod} (DM3+ bundle) ─────────────────────────\n"
-        )
-        parts.append(_strip_sibling_imports(_strip_shebang(body)))
+        for f in _expand_module(mod):
+            rel = f.relative_to(ROOT)
+            body = f.read_text()
+            parts.append(
+                f"\n\n# ── inlined from daemon/{rel} (DM3+ bundle) ─────────────────────────\n"
+            )
+            parts.append(_strip_sibling_imports(_strip_shebang(body)))
     parts.append(
         "\n\n# ── inlined from daemon/daemon.py — main module ──────────────────────\n"
     )
