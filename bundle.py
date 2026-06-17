@@ -60,6 +60,7 @@ MODULES = [
     "coordination.py",
     "readapi.py",
     "runner.py",
+    "chatsvc.py",
     "quota.py",
     "routes.py",
 ]
