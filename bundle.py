@@ -46,6 +46,7 @@ MODULES = [
     "cluster.py",
     "hub.py",
     "registries.py",
+    "state.py",
     "render.py",
     "runs.py",
     "storage.py",
