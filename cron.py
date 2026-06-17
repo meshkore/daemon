@@ -22,7 +22,7 @@ from paths import Paths
 from utils import _iso_now, _log
 
 if TYPE_CHECKING:
-    from daemon import Cluster  # noqa: F401 — type-only; bundler drops the whole TYPE_CHECKING block
+    from cluster import Cluster  # noqa: F401 — type-only; bundler drops the whole TYPE_CHECKING block
 
 
 def _parse_cron_field(field: str, lo: int, hi: int) -> set:

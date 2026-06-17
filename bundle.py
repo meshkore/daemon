@@ -42,6 +42,7 @@ OUT = DIST / "daemon.py"
 MODULES = [
     "paths.py",
     "utils.py",
+    "cluster.py",
     "hub.py",
     "registries.py",
     "render.py",
