@@ -18,7 +18,10 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import daemon as d  # type: ignore[import-not-found]  # noqa: E402
+# DA-BOOTSTRAP-01 — _pick_port + the port registry moved to bootstrap.py;
+# patch/call there (daemon re-exports them, but monkeypatching must target
+# the module the function actually resolves its globals from).
+import bootstrap as d  # type: ignore[import-not-found]  # noqa: E402
 
 
 class _FakePaths:

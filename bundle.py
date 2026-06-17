@@ -51,6 +51,7 @@ MODULES = [
     "storage.py",
     "chat.py",
     "http_server.py",
+    "bootstrap.py",
     "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
