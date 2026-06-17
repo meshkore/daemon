@@ -49,6 +49,7 @@ MODULES = [
     "storage.py",
     "chat.py",
     "http_server.py",
+    "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
     "prompts.py",
     "runner.py",
@@ -130,12 +131,28 @@ def _strip_sibling_imports(text: str) -> str:
     drop_prefixes = SIBLING_PREFIXES + ("from __future__ import ",)
     keep: list[str] = []
     skip_until_close = False
+    tc_indent: int | None = None  # indent of an `if TYPE_CHECKING:` block being dropped
     for line in text.splitlines(keepends=True):
         if skip_until_close:
             if ")" in line:
                 skip_until_close = False
             continue
+        # Drop `if TYPE_CHECKING:` blocks wholesale — they're type-only
+        # scaffolding never executed at runtime, and their bodies often
+        # import siblings (`from daemon import Cluster`) which the import
+        # strip below would otherwise remove, leaving a dangling `if:`
+        # → IndentationError in the bundle.
+        if tc_indent is not None:
+            if line.strip() == "":
+                continue
+            cur_indent = len(line) - len(line.lstrip())
+            if cur_indent > tc_indent:
+                continue  # block body
+            tc_indent = None  # dedent → block ended; process this line normally
         stripped = line.lstrip()
+        if stripped.rstrip() in ("if TYPE_CHECKING:", "if typing.TYPE_CHECKING:"):
+            tc_indent = len(line) - len(stripped)
+            continue
         # Intra-package relative imports (`from . import x`, `from .x import y`)
         # — the names are already defined in the flat bundle namespace.
         if stripped.startswith("from .") and " import " in stripped:
