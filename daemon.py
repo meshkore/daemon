@@ -64,6 +64,7 @@ from coordwake import WakeMixin  # noqa: E402
 from pausemgr import PauseMixin  # noqa: E402
 from credapi import CredMixin  # noqa: E402
 from readapi import QueryMixin  # noqa: E402
+from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
 from state import StateManager  # noqa: E402
@@ -222,6 +223,7 @@ class Daemon(
     LifecycleMixin,
     QueryMixin,
     SelfUpdateMixin,
+    WallsMixin,
 ):
     def __init__(
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]

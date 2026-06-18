@@ -178,6 +178,12 @@ def route_get(self, daemon):  # noqa: N802
     # touched. The cockpit's expanded InitiativeCard surfaces
     # this in its Activity tab so the operator can see what
     # actually shipped for a given initiative.
+    # py-1.20.0 — roadmap wall ordering. The cockpit reads the four
+    # walls (active/next/backlog/archived) ordered by `wall_order`.
+    if p == "/initiative/walls":
+        if self._need_auth():
+            return
+        return self._json(200, daemon.initiative_walls())
     if p.startswith("/initiative/") and p.endswith("/activity"):
         if self._need_auth():
             return

@@ -136,6 +136,11 @@ def route_post(self, daemon):  # noqa: N802
                 200, {"ok": True, "quota_key": key, "was_paused": cleared}
             )
 
+    # py-1.20.0 — roadmap wall reorder. Body {id, wall, order}; sets
+    # wall_order (+ status when the wall changes) and recompacts the wall.
+    if p == "/initiative/reorder":
+        return self._json(*daemon.initiative_reorder(self._read_json_body()))
+
     # U-DAEMON-06: chat dispatch + cancel.
     if p == "/chat/dispatch":
         return self._json(*daemon.chat_dispatch(self._read_json_body()))

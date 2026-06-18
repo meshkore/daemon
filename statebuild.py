@@ -142,6 +142,14 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                     "next": (str(fm.get("next")) if fm.get("next") else None),
                     "completed_at": str(fm.get("completed_at") or "") or None,
                     "commit_sha": str(fm.get("commit_sha") or "") or None,
+                    # py-1.20.0 — roadmap wall ordering; the cockpit reads
+                    # this to paint each wall in order. Optional → None.
+                    "wall_order": (
+                        int(fm["wall_order"])
+                        if isinstance(fm.get("wall_order"), int)
+                        and not isinstance(fm.get("wall_order"), bool)
+                        else None
+                    ),
                 }
             )
 

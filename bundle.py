@@ -80,6 +80,7 @@ MODULES = [
     "pausemgr.py",
     "readapi.py",
     "fsread.py",
+    "walls.py",
     "chatread.py",
     "credapi.py",
     "runnerutil.py",

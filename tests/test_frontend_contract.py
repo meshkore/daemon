@@ -119,6 +119,7 @@ CONTEXT = {
 }
 LINKS = {"modules": list}
 PROTOCOLS = {"protocols": list}
+WALLS = {"active": list, "next": list, "backlog": list, "archived": list}
 
 # (path, top_spec, list_field, item_spec)
 CONTRACT = [
@@ -133,6 +134,7 @@ CONTRACT = [
     ("/context", CONTEXT, "tree" and None, None),  # tree may be empty; shape-only
     ("/links", LINKS, None, None),
     ("/protocols", PROTOCOLS, None, None),
+    ("/initiative/walls", WALLS, None, None),
 ]
 
 

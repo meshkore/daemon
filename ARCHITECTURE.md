@@ -79,6 +79,7 @@ behaviour:
 | `AnchorMixin`/`AnchorProgressMixin` (`anchor`/`anchorprogress`) | the v23 anchor protocol side-effects |
 | `LifecycleMixin` (`lifecycle`) | `serve_forever` / `request_shutdown` / `cleanup` |
 | `SelfUpdateMixin` (`selfupdatesvc`) | `self_update` (download + validate + swap) |
+| `WallsMixin` (`walls`) | `/initiative/walls` + `/initiative/reorder` (roadmap wall ordering) |
 | `StateManager` (`state.py`) | the FS-poll loop (a held object, not a mixin) |
 
 ### Layer 3 — composition root

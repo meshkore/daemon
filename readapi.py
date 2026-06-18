@@ -145,6 +145,7 @@ class QueryMixin:
             "files.tasks",  # U-DAEMON-02
             "files.log",  # py-1.9.0 — narrative day-logs for Diary tab
             "initiative.activity",  # py-1.9.3 — per-initiative git commits + files
+            "initiative.walls.v1",  # py-1.20.0 — GET /initiative/walls + POST /initiative/reorder
             "runs.v1",  # py-1.10.0 — story-run coordinator
             "runs.cancel",  # POST /runs/<id>/cancel
             "runs.advance",  # POST /runs/<id>/advance

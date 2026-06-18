@@ -120,6 +120,7 @@ EXERCISE = [
         {("startswith", "/initiative/"), ("endswith", "/activity")},
     ),
     ("GET", "/runs/__probe__", True, {("startswith", "/runs/")}),
+    ("GET", "/initiative/walls", True, {("==", "/initiative/walls")}),
     ("GET", "/credentials/portal-token", True, {("startswith", "/credentials/")}),
     ("GET", "/chat/conv/general/meta", True, {("startswith", "/chat/conv/")}),
     ("GET", "/chat/uploads/2099-01-01/x.png", True, {("startswith", "/chat/uploads/")}),
@@ -137,6 +138,7 @@ EXERCISE = [
     ("POST", "/agents", True, {("==", "/agents")}),
     ("POST", "/workers", True, {("==", "/workers")}),
     ("POST", "/version/next", True, {("==", "/version/next")}),
+    ("POST", "/initiative/reorder", True, {("==", "/initiative/reorder")}),
     # ── POST, prefix / suffix ──
     (
         "POST",
