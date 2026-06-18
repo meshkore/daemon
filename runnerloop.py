@@ -6,6 +6,8 @@ every self.* resolves on the combined instance -> byte-identical."""
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import time
 from typing import List, Tuple
 
@@ -146,6 +148,25 @@ class RunnerLoopMixin:
         final_text = self._strip_all_anchor_markers(
             result_text or self._cumulative_text
         )
+        # py-1.21.1 — TRANSIENT API-ERROR RETRY SHIELD (TR1). claude-code
+        # 2.1.145 occasionally fails a long interleaved-thinking + multi-
+        # tool turn with `API Error: 400 … thinking/redacted_thinking
+        # blocks in the latest assistant message cannot be modified` — a
+        # CLI bug reconstructing the multi-block assistant message for the
+        # tool-loop continuation (the daemon never touches that array), so
+        # a fresh spawn rebuilds a clean array and the same turn succeeds.
+        # Siblings: transient 5xx / overloaded / rate-limit. These are
+        # TRANSPORT failures, NOT task outcomes. Before this shield the
+        # error string got persisted as the turn's chat.assistant.final —
+        # poisoning EVERY future briefing via `_section_history` — AND woke
+        # the parent architect with a bogus task-failure verdict (field
+        # 2026-06-18: `_onboarding_v1` exit=1 at content.12 → false
+        # one-retry-then-blocked on the roadmap). Re-spawn the SAME turn up
+        # to `_MAX_TRANSIENT_RETRIES`; the error is surfaced normally only
+        # after the budget is spent. We branch on `result_text` (the raw
+        # SDK `result`) so anchor-stripping can't mask the signature.
+        if self._maybe_retry_transient(result_text or self._cumulative_text):
+            return
         # py-1.7.0 — Harvest REMEMBER: lines into the role's shared
         # memory. Anything the agent flags ("REMEMBER: credentials live
         # at …") gets appended once, deduplicated. Lines are also
@@ -308,6 +329,125 @@ class RunnerLoopMixin:
                 except Exception as e:
                     _log(f"auto-archive of {self.conv} failed: {e}")
         self.done.set()
+
+    # TR1 (py-1.21.1) — re-spawn budget for transport-class API errors.
+    # 2 retries = 3 attempts total. Past this we surface the error so a
+    # genuinely stuck turn can't loop forever.
+    _MAX_TRANSIENT_RETRIES = 2
+    # Status codes claude-code surfaces as "API Error: <code> …" that a
+    # fresh spawn can clear (overload / upstream / gateway). 400/401/403/
+    # 404/413 are deliberately EXCLUDED — those are request-shape problems
+    # (bad model id, auth, prompt-too-long) a retry won't fix; the one 400
+    # we DO retry is matched by signature below, not by code.
+    _TRANSIENT_STATUS_RE = re.compile(r"api error:\s*(?:429|5\d\d)\b")
+
+    def _is_transient_api_error(self, text: str) -> bool:
+        """True iff `text` is a claude-code API error that a fresh spawn
+        can plausibly clear — a TRANSPORT failure, not a task outcome.
+        Conservative: only the explicit allowlist below qualifies."""
+        if not text:
+            return False
+        low = text.strip().lower()
+        if not low.startswith("api error"):
+            return False
+        # NEVER retry request-shape failures — a re-spawn rebuilds the same
+        # oversized/invalid request and burns the budget for nothing.
+        if "too long" in low or "prompt is too" in low:
+            return False
+        # The specific 400 we DO retry: the thinking/redacted_thinking
+        # "cannot be modified" CLI reconstruction bug — a fresh message
+        # array makes it disappear.
+        if "cannot be modified" in low or "redacted_thinking" in low:
+            return True
+        # Transient upstream conditions.
+        markers = (
+            "overloaded",
+            "rate limit",
+            "rate_limit",
+            "internal server error",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "timed out",
+            "timeout",
+        )
+        if any(m in low for m in markers):
+            return True
+        return bool(self._TRANSIENT_STATUS_RE.search(low))
+
+    def _maybe_retry_transient(self, result_text: str) -> bool:
+        """If the turn died on a transient API error and we still have
+        budget, reap the dead child, reset per-turn streaming state, and
+        re-spawn the SAME turn on a fresh `claude -p` process. Returns
+        True when a re-spawn was launched (the caller must `return`
+        immediately so the failed run does NOT broadcast a final / wake
+        the architect / set `done`). Returns False to let the normal
+        finalize path run (success, cancel, non-transient error, or
+        budget exhausted)."""
+        if self.cancelled:
+            return False
+        if not self._is_transient_api_error(result_text):
+            return False
+        # Reap the dead child + confirm it actually failed. A clean exit
+        # whose text merely *discusses* an API error must not be retried.
+        exit_code = None
+        try:
+            if self.proc is not None:
+                exit_code = self.proc.wait(timeout=5)
+        except Exception:
+            exit_code = None
+        if exit_code in (None, 0):
+            return False
+        attempt = getattr(self, "_transient_attempt", 0)
+        if attempt >= self._MAX_TRANSIENT_RETRIES:
+            _log(
+                f"claude({self.conv}) transient API error — retry budget "
+                f"({self._MAX_TRANSIENT_RETRIES}) exhausted; surfacing error"
+            )
+            return False
+        self._transient_attempt = attempt + 1
+        preview = (result_text or "").strip()[:200]
+        _log(
+            f"claude({self.conv}) transient API error "
+            f"(attempt {self._transient_attempt}/{self._MAX_TRANSIENT_RETRIES}) "
+            f"— re-spawning. err={preview!r}"
+        )
+        _debug_emit(
+            "transient-retry",
+            msg=(
+                f"{self.conv} transient API error — re-spawn "
+                f"{self._transient_attempt}/{self._MAX_TRANSIENT_RETRIES}"
+            ),
+            lvl="warn",
+            conv=self.conv,
+            agent_id=self.agent_id,
+            data={
+                "attempt": self._transient_attempt,
+                "agent_type": self.agent_type,
+                "preview": preview,
+            },
+        )
+        # Reset per-turn streaming + anchor + usage state so the fresh run
+        # starts from a clean slate (a NEW stream_id so the cockpit treats
+        # it as a brand-new bubble rather than appending to the dead one).
+        self._cumulative_text = ""
+        self._head_buffer = ""
+        self._anchor_head_resolved = False
+        self.deltas_seen = 0
+        self.tool_calls_count = 0
+        self.last_turn_usage = None
+        self.last_turn_cost_usd = None
+        self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
+        # Small backoff — helps 5xx/overloaded settle; harmless for the
+        # thinking-block 400 (which is instant-clearable).
+        time.sleep(min(2**self._transient_attempt, 8))
+        if self.cancelled:
+            return False
+        # Fresh spawn → new _reader_loop thread; THIS loop returns. The
+        # failed turn's error was never persisted, so `_briefing()` rebuilds
+        # clean history (the user turn was persisted at dispatch).
+        self.spawn()
+        return True
 
     def _harvest_remember_lines(self, text: str) -> Tuple[str, List[str]]:
         """Extract any `REMEMBER: …` lines from `text` and return
