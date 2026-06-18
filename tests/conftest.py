@@ -230,6 +230,9 @@ class Daemon:
     base: str  # e.g. "http://127.0.0.1:5573"
     root: Path
     client: httpx.Client
+    work: (
+        Path  # scratch dir; work/bin is on the daemon PATH (drop a fake `claude` there)
+    )
 
     def get(self, path: str, **kw: Any) -> httpx.Response:
         return self.client.get(self.base + path, **kw)
@@ -265,6 +268,12 @@ def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Pop
     cov_dir.mkdir(exist_ok=True)
     env["COVERAGE_FILE"] = str(cov_dir / ".coverage")
     env["PYTHONPATH"] = str(tests_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    # Put work/bin first on PATH so a test can drop a fake `claude` there and
+    # the daemon's shutil.which("claude") (runnerutil._find_claude) picks it up
+    # — enables the chat-dispatch happy-path integration test without a real CLI.
+    fake_bin = work / "bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
     proc = subprocess.Popen(
         [sys.executable, str(daemon_py), "--port", str(port), "--root", str(root)],
         env=env,
@@ -320,7 +329,13 @@ def daemon(
         with httpx.Client(timeout=5.0, verify=False) as client:
             _wait_ready(client, base, proc)
             yield Daemon(
-                proc=proc, port=port, token=TOKEN, base=base, root=root, client=client
+                proc=proc,
+                port=port,
+                token=TOKEN,
+                base=base,
+                root=root,
+                client=client,
+                work=work,
             )
     finally:
         proc.terminate()
