@@ -60,6 +60,7 @@ MODULES = [
     "anchor.py",
     "cron.py",
     "agent_prompts",  # package folder — see _expand_module()
+    "agent_types.py",
     "integrity.py",
     "prompts.py",
     "coordination.py",

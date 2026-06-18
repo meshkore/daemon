@@ -116,6 +116,7 @@ from chatqueue import ChatQueueManager  # noqa: E402
 from storage import ChatArchive, StorageReport  # noqa: E402
 from uploads import UploadStore  # noqa: E402
 from utils import (  # noqa: E402
+    _iso_now,  # noqa: F401 — re-exported as daemon._iso_now for test_prompts
     _log,
     parse_frontmatter,  # noqa: F401 — re-exported for test_refactor_characterization
     parse_simple_yaml,  # noqa: F401 — re-exported for test_refactor_characterization
