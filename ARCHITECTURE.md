@@ -104,8 +104,14 @@ behaviour:
 - `tests/test_refactor_characterization.py` — briefing SHAs, argv, anchor strip.
 - `tests/test_route_coverage.py` — every dispatched route is enumerated +
   live-exercised (the endpoint warranty); drift fails the build.
-- Run `pytest daemon/tests/ -q` (176 tests today). Rebuild the bundle with
-  `python daemon/bundle.py` before parity runs.
+- `tests/test_frontend_contract.py` — every response shape the cockpit
+  (`architect/src/lib/daemon-client.ts`) consumes is asserted present + typed —
+  the gate that proves the refactor never breaks the current frontend.
+- `tests/test_chat_dispatch_integration.py` — the full dispatch→spawn→stream→
+  finalise chain via a fake `claude` on the daemon PATH.
+- Run `pytest daemon/tests/ -q`. Rebuild the bundle (`python daemon/bundle.py`)
+  before parity runs. Coverage: `pytest --cov` (data confined to
+  `tests/.coverage_cache/`).
 
 ## Why mixins (Phase E2 decision)
 
