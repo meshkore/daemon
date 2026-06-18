@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional
 # in dependency order, stripping these import lines from the bundled
 # output. Source-tree runs hit the sibling files via sys.path[0].
 from anchor import AnchorMixin  # noqa: E402
+from anchorprogress import AnchorProgressMixin  # noqa: E402
 from chatread import ChatReadMixin  # noqa: E402
 from fsread import FsReadMixin  # noqa: E402
 from chatsvc import ChatMixin  # noqa: E402
@@ -221,6 +222,7 @@ _CRON_RUN_STATUSES = frozenset(
 
 class Daemon(
     AnchorMixin,
+    AnchorProgressMixin,
     ChatMixin,
     ChatSpawnMixin,
     ConvMetaMixin,

@@ -66,6 +66,7 @@ MODULES = [
     "bootupdate.py",
     "selfupdate.py",
     "anchor.py",
+    "anchorprogress.py",
     "cron.py",
     "cronsched.py",
     "agent_prompts",  # package folder — see _expand_module()
@@ -90,6 +91,7 @@ MODULES = [
     "chatspawn.py",
     "crud.py",
     "quota.py",
+    "quotaprober.py",
     "routes_get.py",
     "routes_post.py",
     "routes.py",

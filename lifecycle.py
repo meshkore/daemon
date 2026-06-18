@@ -15,7 +15,7 @@ from typing import Optional
 from chatreaper import ChatSessionReaper
 from constants import DAEMON_VERSION
 from http_server import PoolHTTPServer, _build_tls_context
-from quota import QuotaProber
+from quotaprober import QuotaProber
 from routes import make_handler
 from selfupdate import VersionWatcher
 from debuglog import DebugLog
