@@ -50,6 +50,8 @@ MODULES = [
     "render.py",
     "runs.py",
     "storage.py",
+    "uploads.py",
+    "chatqueue.py",
     "chat.py",
     "http_server.py",
     "bootstrap.py",

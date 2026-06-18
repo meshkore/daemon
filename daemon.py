@@ -113,7 +113,9 @@ from selfupdate import (  # noqa: E402,F401 — re-exported for serve_forever/ma
     VersionWatcher,
     _boot_self_update_if_needed,
 )
-from storage import ChatArchive, ChatQueueManager, StorageReport, UploadStore  # noqa: E402
+from chatqueue import ChatQueueManager  # noqa: E402
+from storage import ChatArchive, StorageReport  # noqa: E402
+from uploads import UploadStore  # noqa: E402
 from utils import (  # noqa: E402
     DebugLog,
     _debug_emit,

@@ -6,7 +6,7 @@ from pathlib import Path as _Path
 
 from conftest import Daemon
 from paths import Paths as _Paths
-from storage import ChatQueueManager as _ChatQueueManager
+from chatqueue import ChatQueueManager as _ChatQueueManager
 
 
 def test_storage_usage_shape(daemon: Daemon) -> None:
