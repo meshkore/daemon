@@ -56,7 +56,7 @@ BRIEFING_GOLDEN_EMPTY = {
     "deploy": "28fbebfacc86994239912998dd55d41ce5593597034287cd3543fbfb6f3c280f",
     "docs": "2ed71b42e2b1b65bb5eaf538ab41c1c78a907aa2292a858010bf1a59049532f2",
     "review": "86807cf234635b65de6f57e36e8e1ff24ac459e23fc94dcbaaf43552169b9109",
-    "roadmap-architect": "661cde5b8cb79b66924a6ff84f2a78fcec6f85fa926763a2900bdb643f9cf554",
+    "roadmap-architect": "13135428fb2883d88632cb15e7a4f3b5510222acb4b087cbe068057ddfe1905f",
     "testing": "f8f28ddcad0f1210ae848f663669cb0d7284157bbae2c4901d5d224ed05860f5",
 }
 
@@ -67,7 +67,7 @@ BRIEFING_GOLDEN_POPULATED = {
     "deploy": "d4bfc0af74bc6cd97d7962c4f784c0f20a231d3a13dc4fecab8ab529e12aeaaf",
     "docs": "f0c2733d849d5bb91457f31a92c0363f23ab9ea19350fda856888367c1ada673",
     "review": "5618a5399b8939b6a41109adc48951013b1357df58c88ec725e1045663f02001",
-    "roadmap-architect": "dff2a639017d9a9452eac116a4c4f84d0f285f77cbdacacc04a1a40172466fee",
+    "roadmap-architect": "264e87e5578bac508df0370d77985341f48a4064cf1528128eb70db41a7440f2",
     "testing": "e3723c56184b8a5532191a1ab41bcb3c37a216aef0ecb2f552339619bab99f6e",
 }
 
