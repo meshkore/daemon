@@ -82,6 +82,8 @@ MODULES = [
     "routes_get.py",
     "routes_post.py",
     "routes.py",
+    "selfupdatesvc.py",
+    "lifecycle.py",
 ]
 
 
