@@ -305,4 +305,4 @@ def route_post(self, daemon):  # noqa: N802
         )
         return self._json(code, resp)
 
-    return self._json(404, {"error": "not found", "path": p})
+    return self._json(404, {"error": "unknown route", "path": p})

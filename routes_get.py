@@ -369,4 +369,4 @@ def route_get(self, daemon):  # noqa: N802
         if proto is None:
             return self._json(404, {"error": "protocol not found", "id": rest})
         return self._json(200, proto)
-    return self._json(404, {"error": "not found", "path": p})
+    return self._json(404, {"error": "unknown route", "path": p})
