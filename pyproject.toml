@@ -10,6 +10,10 @@ markers = [
 
 [tool.coverage.run]
 source = ["."]
+# Confine the (parallel, per-subprocess) .coverage.* data files to one
+# gitignored dir so they never litter daemon/. Absolute COVERAGE_FILE in
+# tests/conftest.py covers the spawned-daemon subprocesses too.
+data_file = "tests/.coverage_cache/.coverage"
 omit = ["tests/*", "dist/*", ".venv/*"]
 branch = true
 parallel = true  # subprocess + main process produce separate .coverage files

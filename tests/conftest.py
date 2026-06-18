@@ -259,6 +259,11 @@ def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Pop
     tests_dir = Path(__file__).resolve().parent
     cov_cfg = tests_dir.parent / "pyproject.toml"
     env["COVERAGE_PROCESS_START"] = str(cov_cfg)
+    # Confine subprocess coverage data to tests/.coverage_cache/ (absolute,
+    # since the daemon subprocess runs with a different CWD).
+    cov_dir = tests_dir / ".coverage_cache"
+    cov_dir.mkdir(exist_ok=True)
+    env["COVERAGE_FILE"] = str(cov_dir / ".coverage")
     env["PYTHONPATH"] = str(tests_dir) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
         [sys.executable, str(daemon_py), "--port", str(port), "--root", str(root)],

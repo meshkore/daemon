@@ -30,3 +30,7 @@ htmlcov/
 .pre-commit.bak
 # bundle output; canonical copy ships under webapp/reference/...
 dist/
+
+# Coverage data (parallel per-subprocess files) — confined here
+tests/.coverage_cache/
+htmlcov/
