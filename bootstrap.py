@@ -78,7 +78,7 @@ def _migrate_cluster_daemon_block(paths: Paths) -> None:
         "# explicit confirmation for every version update via the V47 modal.\n"
         "daemon:\n"
         "  auto_update: true\n"
-        "  auto_update_source: https://meshkore.com/reference/cluster/scripts/daemon.py\n"
+        "  auto_update_source: https://architect.meshkore.com/reference/cluster/scripts/daemon.py\n"
     )
     # Ensure there's exactly one newline between the existing tail and our
     # appended block so YAML stays valid (no trailing whitespace gymnastics).

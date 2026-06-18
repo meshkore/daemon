@@ -45,30 +45,31 @@ import daemon as d  # type: ignore[import-not-found]  # noqa: E402
 
 # Hashes are computed over the briefing with the (run-specific) absolute
 # cluster root path replaced by "<ROOT>" — see _briefing_hash.
-# Regenerated for py-1.14.11 (AS1): prompts.py anchor rule gained a line
-# clarifying that `i` is the lowercase file-stem slug, never the `#`-display
-# id. That line is in the universal core rules → every agent type's briefing
-# shifts, on BOTH the empty and populated fixtures.
+# Regenerated for py-1.22.0 (control-plane source decoupling): prompts.py's
+# "canonical schemas" reference moved from meshkore.com/standard.json to
+# api.meshkore.com/v1/standard.json. That line is in the universal core rules
+# → every agent type's briefing shifts, on BOTH the empty and populated
+# fixtures.
 BRIEFING_GOLDEN_EMPTY = {
-    "audit": "6308efd064d0ce2e508436da9808dd5d55858e07b67f21779fd264854d3cbf74",
-    "custom": "f5f434dc599cdeb8ca5cf2f11a7bd74bd2e187998818aa696c908dab0dec4790",
-    "db": "51291556f9b6e120fddd17b95242b33d154ef28a0dbabcdbb56720e4ccca8d31",
-    "deploy": "28fbebfacc86994239912998dd55d41ce5593597034287cd3543fbfb6f3c280f",
-    "docs": "2ed71b42e2b1b65bb5eaf538ab41c1c78a907aa2292a858010bf1a59049532f2",
-    "review": "86807cf234635b65de6f57e36e8e1ff24ac459e23fc94dcbaaf43552169b9109",
-    "roadmap-architect": "13135428fb2883d88632cb15e7a4f3b5510222acb4b087cbe068057ddfe1905f",
-    "testing": "f8f28ddcad0f1210ae848f663669cb0d7284157bbae2c4901d5d224ed05860f5",
+    "audit": "e711537ca748a3faba0764a56f99bd216f3e16de2f89268856ec07380c6cdbd9",
+    "custom": "f61e75a2805de589d0c9024125588c368d0b3d677be541beb90596d318984aef",
+    "db": "3bfba6ca3396d2e8d69105fc83924b9121b21854465bc199dd7422b768921f2e",
+    "deploy": "f666ea50ff3cb0a44f32dbe1e64827ac94bafe67e3797fdd7f1784ff8071f566",
+    "docs": "d690b3c0ac1db2f739dcf7d2711524c1fd16453c0067eb680afd7469d48f3008",
+    "review": "5cefb86de236c1c94b9181df088a6e74291bf77f8da273e307b75d67ebf7b25b",
+    "roadmap-architect": "7eb724302f04ab7540ffd74e1e3bc6bba9eedd1e860beb1fb0cbd4c9b58af81f",
+    "testing": "ef278407eacabbb71d76c0a0103da834edc91118dfc63d64dd033f1f8fdb0f45",
 }
 
 BRIEFING_GOLDEN_POPULATED = {
-    "audit": "6e54a7abe20a0e124a8f2c012671d60772f941ef834c453e494a5a53c8bf12df",
-    "custom": "3cd80affd62de66f9c9aedfa921efeb497343e1cf1eb9c7811b702c0a9086354",
-    "db": "c4307334ac61c4efc29269cdc2447ab9883143b617163a00e5c894e82d5544e3",
-    "deploy": "d4bfc0af74bc6cd97d7962c4f784c0f20a231d3a13dc4fecab8ab529e12aeaaf",
-    "docs": "f0c2733d849d5bb91457f31a92c0363f23ab9ea19350fda856888367c1ada673",
-    "review": "5618a5399b8939b6a41109adc48951013b1357df58c88ec725e1045663f02001",
-    "roadmap-architect": "264e87e5578bac508df0370d77985341f48a4064cf1528128eb70db41a7440f2",
-    "testing": "e3723c56184b8a5532191a1ab41bcb3c37a216aef0ecb2f552339619bab99f6e",
+    "audit": "414d749f9c76f25456d3a9625c5187a1d2e9fcbc3c2f09efc6a5777d0844de6f",
+    "custom": "a5e033eef9d6ed82470154a236fac2af932bfed28688abd30a7d2b412c712b63",
+    "db": "992ed2af556e99603cbd85f1a8d229b3fc7953840dff8c9e8b90e19d480272a6",
+    "deploy": "569646bd0fca0dee0c3c585c5a96ddd1b2421bb4e298f173b37b1fbd0c84e078",
+    "docs": "f836c79b54584f2489aba4e3631284a29c522ae575c34cf7038fac52a0bb5aa1",
+    "review": "10f4865859ea3dd74f7b15687c700f8b77db54b9e52e114b1fed8c616cd97855",
+    "roadmap-architect": "9fae77f15e208a580744001d3b704c508a22f2d590af4f02dda031ae745d8b89",
+    "testing": "f7eaf910eccc4985750271a51a6d5a10dff19373285d0d15db22d0c33d78bc18",
 }
 
 AGENT_KEYS_GOLDEN = [

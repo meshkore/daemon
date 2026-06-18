@@ -89,7 +89,7 @@ class VersionWatcher:
                 return u.strip()
         except Exception:
             pass
-        return "https://meshkore.com/reference/cluster/scripts/daemon.py"
+        return "https://architect.meshkore.com/reference/cluster/scripts/daemon.py"
 
     def _loop(self) -> None:
         # Initial small grace so we don't fight the boot self-update if

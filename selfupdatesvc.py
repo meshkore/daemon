@@ -52,7 +52,7 @@ class SelfUpdateMixin:
         url = (
             (isinstance(cfg_src, str) and cfg_src.strip())
             or str(body.get("url") or "").strip()
-            or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+            or "https://architect.meshkore.com/reference/cluster/scripts/daemon.py"
         )
         if not (url.startswith("https://") or url.startswith("http://localhost")):
             return 400, {

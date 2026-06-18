@@ -42,7 +42,7 @@ class QueryMixin:
             "auto_update": bool(cfg.get("auto_update", True)),
             "auto_update_source": str(
                 cfg.get("auto_update_source")
-                or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+                or "https://architect.meshkore.com/reference/cluster/scripts/daemon.py"
             ),
         }
         return {

@@ -172,7 +172,7 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
     # (/chat/snapshot) carries enough conv metadata to render the rail
     # immediately without replaying any events.
     return {
-        "$schema": "https://meshkore.com/standard.json",
+        "$schema": "https://api.meshkore.com/v1/standard.json",
         "cluster": {
             "id": cluster.id,
             "name": cluster.name,

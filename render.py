@@ -38,8 +38,11 @@ from hub import Hub
 from paths import Paths
 from utils import _log
 
-CANONICAL_PREAMBLE_URL = "https://meshkore.com/standard/agent-instructions.md"
-STANDARD_VERSION_URL = "https://meshkore.com/standard/version"
+# platform-v2: the standard is consumed from the always-on API, not the public
+# website — a marketing-site redeploy can no longer break the preamble refresh
+# or drift detection. The human-readable standard still lives on the web.
+CANONICAL_PREAMBLE_URL = "https://api.meshkore.com/v1/standard/agent-instructions.md"
+STANDARD_VERSION_URL = "https://api.meshkore.com/v1/standard/version"
 
 _PREAMBLE_BEGIN = (
     "<!-- MESHKORE_PREAMBLE_BEGIN"  # marker PREFIX (line carries an em-dash note)

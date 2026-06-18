@@ -108,7 +108,7 @@ def _boot_self_update_if_needed(paths: Paths, args: Dict[str, Any]) -> None:
             return
     url = str(
         d_block.get("auto_update_source")
-        or "https://meshkore.com/reference/cluster/scripts/daemon.py"
+        or "https://architect.meshkore.com/reference/cluster/scripts/daemon.py"
     ).strip()
     if not url:
         _log("boot self-update: skipped (empty auto_update_source)")

@@ -439,7 +439,7 @@ class BriefingPipeline:
             "- The daemon harvests `REMEMBER:` lines and appends them to your role's `memory.md`. Don't write to that file directly.",
             "",
             "Reference docs:",
-            "  - https://meshkore.com/standard.json — canonical schemas",
+            "  - https://api.meshkore.com/v1/standard.json — canonical schemas",
             "  - https://meshkore.com/cluster/operate — operator manual",
             "  - `.meshkore/docs/context.md` — project-specific context (if present)",
             "  - `.meshkore/docs/conventions/*.md` — repo conventions",
