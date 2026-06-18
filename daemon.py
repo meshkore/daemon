@@ -58,6 +58,8 @@ from anchor import AnchorMixin  # noqa: E402
 from chatread import ChatReadMixin  # noqa: E402
 from fsread import FsReadMixin  # noqa: E402
 from chatsvc import ChatMixin  # noqa: E402
+from chatspawn import ChatSpawnMixin  # noqa: E402
+from convmeta import ConvMetaMixin  # noqa: E402
 from crud import CrudMixin  # noqa: E402
 from coordination import CoordinationMixin  # noqa: E402
 from coordwake import WakeMixin  # noqa: E402
@@ -231,6 +233,8 @@ _CRON_RUN_STATUSES = frozenset(
 class Daemon(
     AnchorMixin,
     ChatMixin,
+    ChatSpawnMixin,
+    ConvMetaMixin,
     ChatReadMixin,
     CoordinationMixin,
     PauseMixin,

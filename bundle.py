@@ -71,6 +71,8 @@ MODULES = [
     "credapi.py",
     "runner.py",
     "chatsvc.py",
+    "convmeta.py",
+    "chatspawn.py",
     "crud.py",
     "quota.py",
     "routes_get.py",
