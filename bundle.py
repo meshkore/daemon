@@ -42,7 +42,11 @@ OUT = DIST / "daemon.py"
 MODULES = [
     "constants.py",
     "paths.py",
+    "timeutil.py",
+    "yamlparse.py",
+    "timeline.py",
     "utils.py",
+    "debuglog.py",
     "cluster.py",
     "hub.py",
     "registries.py",
@@ -185,7 +189,13 @@ def _strip_sibling_imports(text: str) -> str:
                 continue  # block body
             tc_indent = None  # dedent → block ended; process this line normally
         stripped = line.lstrip()
-        if stripped.rstrip() in ("if TYPE_CHECKING:", "if typing.TYPE_CHECKING:"):
+        # Match the CODE part only — a trailing comment
+        # (`if TYPE_CHECKING:  # note`) must NOT defeat detection, or the
+        # block body's sibling imports get stripped leaving a dangling `if:`.
+        if stripped.split("#", 1)[0].rstrip() in (
+            "if TYPE_CHECKING:",
+            "if typing.TYPE_CHECKING:",
+        ):
             tc_indent = len(line) - len(stripped)
             continue
         # Intra-package relative imports (`from . import x`, `from .x import y`)

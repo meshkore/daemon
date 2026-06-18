@@ -18,8 +18,8 @@ from http_server import PoolHTTPServer, _build_tls_context
 from quota import QuotaProber
 from routes import make_handler
 from selfupdate import VersionWatcher
+from debuglog import DebugLog
 from utils import (
-    DebugLog,
     _debug_emit,
     _debug_enabled,
     _find_tls_bundle,

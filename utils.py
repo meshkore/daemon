@@ -14,36 +14,29 @@ self-contained."""
 
 from __future__ import annotations
 
-import json
-import os
-import re
 import socket  # noqa: F401 — re-exported for callers that prefer `utils.socket`
-import threading
-import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from paths import TLS_BUNDLE_NAME, TLS_CERT_FILENAME, TLS_KEY_FILENAME, Paths
+from paths import TLS_BUNDLE_NAME, TLS_CERT_FILENAME, TLS_KEY_FILENAME
+
+# Re-exports so existing `from utils import X` call sites are unchanged after the
+# Phase-3d split (time→timeutil, parse+_FM_RE→yamlparse, timeline→timeline). The
+# leaves are import-light (timeutil/yamlparse self-contained; timeline→timeutil
+# only), so utils→leaf is one-way — no cycle.
+from timeutil import _iso_at, _iso_now  # noqa: E402,F401
+from yamlparse import _FM_RE, parse_frontmatter, parse_simple_yaml  # noqa: E402,F401
+from timeline import (  # noqa: E402,F401
+    _append_timeline,
+    _iter_timeline_files,
+    _read_timeline_file,
+)
+
+if TYPE_CHECKING:  # only for annotations; DebugLog lives in debuglog.py
+    from debuglog import DebugLog  # noqa: F401
 
 
 # ── time helpers ──────────────────────────────────────────────────────
-
-
-def _iso_now() -> str:
-    return (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
-
-
-def _iso_at(epoch_secs: int) -> str:
-    """ISO-8601 UTC for a given epoch — used for pause expiry stamps
-    (py-1.10.26). Cheap; no ms component (we only care about the
-    minute granularity for rate-limit cooldowns)."""
-    return datetime.fromtimestamp(epoch_secs, timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
 
 
 # ── debug stream singleton + daemon log ──────────────────────────────
@@ -84,195 +77,6 @@ def _log(msg: str) -> None:
         except Exception:
             # Debug stream failures must never block the program.
             pass
-
-
-class DebugLog:
-    """Append-only JSONL debug stream.
-
-    Path: `.meshkore/.runtime/debug.jsonl`. Each line is one event:
-        {"ts": "...", "src": "daemon|cockpit|agent", "lvl": "...",
-         "tag": "...", "conv"?: ..., "agent_id"?: ..., "msg": "...",
-         "data"?: { ... }}
-
-    Retention: when the file exceeds `MAX_BYTES`, the writer reads it
-    back, keeps only events whose `ts` falls within `RETAIN_SECS` of
-    the current instant, and atomically rewrites the file. Worst-case
-    trim cost: O(file_size) but bounded by MAX_BYTES.
-
-    Thread-safe. Failures never raise — the daemon must keep running
-    even if the log disk is full or read-only."""
-
-    MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-    RETAIN_SECS = 30 * 60  # 30 min
-    TRIM_CHECK_EVERY = 50  # check size every N appends, not every time
-
-    def __init__(self, path: "Path") -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._writes_since_check = 0
-        # Touch the file so subsequent appends never hit ENOENT mid-write.
-        if not self.path.exists():
-            try:
-                self.path.write_text("")
-            except OSError:
-                pass
-        # py-1.10.21 — Trim once on boot. A long-running daemon that
-        # writes < TRIM_CHECK_EVERY events between restarts (low-traffic
-        # day) was leaving the file with stale head events that
-        # predated the rolling window by hours. One trim at startup
-        # gives the operator a clean window immediately.
-        with self._lock:
-            self._maybe_trim_locked()
-
-    def emit(
-        self,
-        *,
-        tag: str,
-        msg: str = "",
-        lvl: str = "info",
-        src: str = "daemon",
-        conv: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        rec: Dict[str, Any] = {
-            "ts": _iso_now(),
-            "src": src,
-            "lvl": lvl,
-            "tag": tag,
-            "msg": msg,
-        }
-        if conv:
-            rec["conv"] = conv
-        if agent_id:
-            rec["agent_id"] = agent_id
-        if data:
-            # Best-effort redaction. Token-like values get masked.
-            rec["data"] = _debug_redact(data)
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
-        with self._lock:
-            try:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except OSError:
-                return
-            self._writes_since_check += 1
-            if self._writes_since_check >= self.TRIM_CHECK_EVERY:
-                self._writes_since_check = 0
-                self._maybe_trim_locked()
-
-    def _maybe_trim_locked(self) -> None:
-        # py-1.10.21 — Trim by EITHER size OR age. The original code
-        # only checked size, so on low-traffic days the file kept
-        # events from 2-3 hours ago even though the convention says
-        # "30 min rolling window". We now also inspect the first line
-        # cheaply: if it's older than RETAIN_SECS we know the head is
-        # stale and read the full file to rewrite.
-        try:
-            size = self.path.stat().st_size
-        except OSError:
-            return
-        cutoff = time.time() - self.RETAIN_SECS
-        need_trim = size > self.MAX_BYTES
-        if not need_trim:
-            # Cheap age probe: read just the first non-empty line.
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                            ts_str = str(rec.get("ts") or "")
-                            norm = (
-                                ts_str[:-1] + "+00:00"
-                                if ts_str.endswith("Z")
-                                else ts_str
-                            )
-                            head_ts = datetime.fromisoformat(norm).timestamp()
-                            if head_ts < cutoff:
-                                need_trim = True
-                        except (ValueError, TypeError):
-                            pass
-                        break
-            except OSError:
-                return
-        if not need_trim:
-            return
-        try:
-            raw = self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return
-        kept: List[str] = []
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            ts_str = ""
-            try:
-                rec = json.loads(line)
-                ts_str = rec.get("ts") or ""
-            except (ValueError, TypeError):
-                continue
-            try:
-                # ts ends with Z; strptime via fromisoformat after Z→+00:00.
-                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
-                if datetime.fromisoformat(norm).timestamp() >= cutoff:
-                    kept.append(line)
-            except (ValueError, TypeError):
-                continue
-        new_blob = "\n".join(kept) + ("\n" if kept else "")
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            tmp.write_text(new_blob, encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError:
-            return
-
-    def tail(
-        self,
-        *,
-        last_secs: int = 300,
-        tags: Optional[set[str]] = None,
-        min_level: str = "debug",
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """Return (events, retained_secs). `retained_secs` is the
-        actual age of the oldest event still on disk — useful to detect
-        when the operator asked for a window wider than retention."""
-        levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
-        min_rank = levels.get(min_level.lower(), 0)
-        cutoff = time.time() - max(1, last_secs)
-        out: List[Dict[str, Any]] = []
-        oldest_ts: Optional[float] = None
-        try:
-            raw = self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return out, 0
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            ts_str = str(rec.get("ts") or "")
-            try:
-                norm = ts_str[:-1] + "+00:00" if ts_str.endswith("Z") else ts_str
-                ts = datetime.fromisoformat(norm).timestamp()
-            except (ValueError, TypeError):
-                continue
-            if oldest_ts is None or ts < oldest_ts:
-                oldest_ts = ts
-            if ts < cutoff:
-                continue
-            if tags and rec.get("tag") not in tags:
-                continue
-            if levels.get(str(rec.get("lvl") or "info"), 1) < min_rank:
-                continue
-            out.append(rec)
-        retained = int(time.time() - oldest_ts) if oldest_ts else 0
-        return out, retained
 
 
 _REDACT_KEYS = {
@@ -353,42 +157,6 @@ def _debug_enabled(cluster: Any) -> bool:
         return True
 
 
-def _iter_timeline_files(paths: "Paths") -> List[Any]:
-    """All timeline files (jsonl + jsonl.gz from rotation)."""
-    if not paths.timeline_dir.exists():
-        return []
-    files = list(paths.timeline_dir.glob("*.jsonl"))
-    files.extend(paths.timeline_dir.glob("*.jsonl.gz"))
-    # Also look in the archive subdir produced by rotation.
-    archive_dir = paths.timeline_dir / "archive"
-    if archive_dir.exists():
-        files.extend(archive_dir.glob("*.jsonl"))
-        files.extend(archive_dir.glob("*.jsonl.gz"))
-    return files
-
-
-def _read_timeline_file(path: Any) -> List[Dict[str, Any]]:
-    """Parse one timeline file (jsonl or jsonl.gz) → list of events.
-    Never raises; bad lines / unreadable files yield empty list."""
-    try:
-        if str(path).endswith(".gz"):
-            import gzip
-
-            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
-                lines = fh.read().splitlines()
-        else:
-            lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
-
-
 # ───────────────────────────────────────────────────────────────────────
 # Tiny YAML reader (stdlib has no yaml module — we only need flat scalars)
 #
@@ -400,198 +168,9 @@ def _read_timeline_file(path: Any) -> List[Dict[str, Any]]:
 # `daemon.parse_simple_yaml` stays a stable attribute.
 
 
-def parse_simple_yaml(text: str) -> Dict[str, Any]:
-    """Parses a YAML subset sufficient for our cluster.yaml + frontmatter
-    blocks. Supports scalars, dicts, lists, list-of-dicts, and inline
-    list scalars (`tags: [a, b]`). NOT a general YAML parser — fail
-    loudly for shapes we don't handle."""
-    out: Dict[str, Any] = {}
-    # Stack entry: (indent, container, key_in_parent, parent_ref_or_None)
-    stack: List[Tuple[int, Any, str, Any]] = [(-1, out, "", None)]
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        line = raw.rstrip()
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
-            i += 1
-            continue
-        indent = len(line) - len(stripped)
-        while stack and indent <= stack[-1][0] and len(stack) > 1:
-            stack.pop()
-        parent = stack[-1][1]
-
-        if stripped.startswith("- "):
-            value = stripped[2:].strip()
-            # Promote: if the current container is an empty dict that was
-            # just created as a nested holder for some key, convert it to
-            # a list in the grandparent — we now know the value is a list.
-            if isinstance(parent, dict) and not parent:
-                key = stack[-1][2]
-                gp = stack[-1][3]
-                if key and isinstance(gp, dict) and gp.get(key) is parent:
-                    new_list: List[Any] = []
-                    gp[key] = new_list
-                    stack[-1] = (stack[-1][0], new_list, key, gp)
-                    parent = new_list
-            if isinstance(parent, list):
-                # Two shapes:
-                #   "- value"               → scalar item
-                #   "- key: val\n  key2: …" → dict item (continues below)
-                if ":" in value:
-                    item: Dict[str, Any] = {}
-                    parent.append(item)
-                    # Treat the inline "key: val" as the first dict entry
-                    k2, _, v2 = value.partition(":")
-                    k2 = k2.strip()
-                    v2 = v2.strip()
-                    if v2:
-                        item[k2] = _coerce(_strip_inline_comment(v2))
-                        stack.append((indent, item, "", parent))
-                    else:
-                        # Nested key with no value yet
-                        nested: Dict[str, Any] = {}
-                        item[k2] = nested
-                        stack.append((indent, item, "", parent))
-                        stack.append((indent + 2, nested, k2, item))
-                else:
-                    parent.append(
-                        _coerce(_strip_inline_comment(value)) if value else None
-                    )
-
-        elif ":" in stripped:
-            key, _, val = stripped.partition(":")
-            key = key.strip()
-            val = _strip_inline_comment(val.strip())
-            if val == "":
-                nxt: Dict[str, Any] = {}
-                if isinstance(parent, dict):
-                    parent[key] = nxt
-                stack.append((indent, nxt, key, parent))
-            elif val.startswith("[") and val.endswith("]"):
-                # Inline list scalar: [a, b, "c d"]
-                inner = val[1:-1].strip()
-                items = (
-                    [_coerce(x.strip()) for x in _split_top_level_commas(inner)]
-                    if inner
-                    else []
-                )
-                if isinstance(parent, dict):
-                    parent[key] = items
-            else:
-                if isinstance(parent, dict):
-                    parent[key] = _coerce(val)
-        i += 1
-    return out
-
-
-def _strip_inline_comment(v: str) -> str:
-    return re.sub(r"\s+#.*$", "", v)
-
-
-def _split_top_level_commas(s: str) -> List[str]:
-    out, buf, depth, in_str = [], "", 0, None
-    for ch in s:
-        if in_str:
-            buf += ch
-            if ch == in_str:
-                in_str = None
-            continue
-        if ch in ('"', "'"):
-            in_str = ch
-            buf += ch
-            continue
-        if ch == "," and depth == 0:
-            out.append(buf)
-            buf = ""
-            continue
-        if ch in "[{":
-            depth += 1
-        elif ch in "]}":
-            depth -= 1
-        buf += ch
-    if buf.strip():
-        out.append(buf)
-    return out
-
-
-def _coerce(v: str) -> Any:
-    s = v.strip()
-    if not s:
-        return ""
-    if (s.startswith('"') and s.endswith('"')) or (
-        s.startswith("'") and s.endswith("'")
-    ):
-        return s[1:-1]
-    if s.lower() in ("true", "yes"):
-        return True
-    if s.lower() in ("false", "no"):
-        return False
-    if s.lower() in ("null", "~"):
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
-
-
-_FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-
-
-def parse_frontmatter(text: str) -> Dict[str, Any]:
-    m = _FM_RE.match(text)
-    if not m:
-        return {}
-    return parse_simple_yaml(m.group(1))
-
-
 # ───────────────────────────────────────────────────────────────────────
 # Timeline append (DM-modularize-2: relocated from daemon.py). Shared by
 # ChatRunner (runner.py) and the daemon's own chat/user event writers.
-
-
-def _append_timeline(paths: "Paths", event: Dict[str, Any]) -> Dict[str, Any]:
-    """Append one JSON-line event to today's timeline file.
-    Returns the event enriched with `ts` if it wasn't already set.
-
-    py-1.5.0 — atomic append. The line is rendered fully in memory,
-    then written + flushed + fsync'd in a single open/close cycle so
-    a daemon crash mid-write can't leave a half-written line in the
-    jsonl. We rely on the OS guarantee that `write()` is atomic for
-    buffers < PIPE_BUF (~4KB on most systems); for larger events
-    (very long assistant.final replies) we still get atomicity at the
-    page-cache level under POSIX. The added fsync forces durability
-    so we don't lose events on a power cut either."""
-    paths.timeline_dir.mkdir(parents=True, exist_ok=True)
-    if "ts" not in event:
-        event = {**event, "ts": _iso_now()}
-    date = event["ts"][:10]
-    f = paths.timeline_dir / f"{date}.jsonl"
-    payload = json.dumps(event, separators=(",", ":")) + "\n"
-    encoded = payload.encode("utf-8")
-    # Open with O_APPEND so concurrent writers (the StateManager poll
-    # loop + ChatRunner reader threads) interleave at line boundaries
-    # rather than overwrite each other. O_APPEND is atomic per write()
-    # on POSIX for any size up to PIPE_BUF; for larger writes (a multi-
-    # KB assistant.final) the worst case is interleaved bytes, but the
-    # daemon's writers never race on the same line. Single line per
-    # write() call preserves jsonl integrity.
-    fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-    try:
-        os.write(fd, encoded)
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass  # best-effort durability
-    finally:
-        os.close(fd)
-    return event
 
 
 # ───────────────────────────────────────────────────────────────────────
