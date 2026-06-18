@@ -63,6 +63,8 @@ MODULES = [
     "integrity.py",
     "prompts.py",
     "coordination.py",
+    "coordwake.py",
+    "pausemgr.py",
     "readapi.py",
     "fsread.py",
     "chatread.py",

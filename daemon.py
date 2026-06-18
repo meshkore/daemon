@@ -60,6 +60,8 @@ from fsread import FsReadMixin  # noqa: E402
 from chatsvc import ChatMixin  # noqa: E402
 from crud import CrudMixin  # noqa: E402
 from coordination import CoordinationMixin  # noqa: E402
+from coordwake import WakeMixin  # noqa: E402
+from pausemgr import PauseMixin  # noqa: E402
 from credapi import CredMixin  # noqa: E402
 from readapi import QueryMixin  # noqa: E402
 from state import StateManager  # noqa: E402
@@ -231,6 +233,8 @@ class Daemon(
     ChatMixin,
     ChatReadMixin,
     CoordinationMixin,
+    PauseMixin,
+    WakeMixin,
     CredMixin,
     CrudMixin,
     FsReadMixin,
