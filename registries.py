@@ -14,7 +14,8 @@ via the flat namespace)."""
 
 from __future__ import annotations
 
-import os
+from fsatomic import atomic_write_text
+
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -194,9 +195,7 @@ class LinksRegistry:
                 else:
                     found[k] = v
         data["version"] = 1
-        tmp = self.paths.links_yaml.with_suffix(".yaml.tmp")
-        tmp.write_text(_emit_links_yaml(data))
-        os.replace(tmp, self.paths.links_yaml)
+        atomic_write_text(self.paths.links_yaml, _emit_links_yaml(data))
         self.reload(broadcast=True)
         return True, "ok"
 

@@ -42,6 +42,7 @@ OUT = DIST / "daemon.py"
 MODULES = [
     "constants.py",
     "paths.py",
+    "fsatomic.py",
     "timeutil.py",
     "yamlparse.py",
     "timeline.py",

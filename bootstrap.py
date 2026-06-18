@@ -8,6 +8,8 @@ daemon.py (the entrypoint). No daemon backref, no DAEMON_VERSION coupling."""
 
 from __future__ import annotations
 
+from fsatomic import atomic_write_json
+
 import json
 import os
 import re
@@ -118,9 +120,9 @@ def _registry_write(mapping: Dict[str, int]) -> None:
     the next boot re-derives the same assignment, so it is never fatal."""
     try:
         _PORT_REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = _PORT_REGISTRY_FILE.with_name(_PORT_REGISTRY_FILE.name + ".tmp")
-        tmp.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n")
-        tmp.replace(_PORT_REGISTRY_FILE)
+        atomic_write_json(
+            _PORT_REGISTRY_FILE, mapping, sort_keys=True, trailing_newline=True
+        )
     except Exception as e:
         _log(f"port-registry write failed ({e}); assignment not persisted")
 

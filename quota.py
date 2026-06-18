@@ -20,6 +20,8 @@ full daemon and is exercised only in production / integration runs."""
 
 from __future__ import annotations
 
+from fsatomic import atomic_write_json
+
 import json
 import threading
 import time
@@ -90,9 +92,7 @@ class QuotaState:
     def _persist_locked(self) -> None:
         self._data["updated_at"] = _iso_now()
         try:
-            tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
-            tmp.replace(self.path)
+            atomic_write_json(self.path, self._data, sort_keys=True)
         except OSError as e:
             _log(f"quota-state: persist failed ({e})")
 

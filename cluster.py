@@ -9,7 +9,8 @@ the utils YAML/frontmatter helpers — no daemon backref. Consumers
 
 from __future__ import annotations
 
-import os
+from fsatomic import atomic_write_text
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -135,9 +136,7 @@ def _patch_frontmatter(fp: "Path", patch: Dict[str, Any]) -> bool:
     if not new_fm.endswith("\n"):
         new_fm += "\n"
     new_text = "---\n" + new_fm + "---\n" + rest.lstrip("\n")
-    tmp = fp.with_suffix(fp.suffix + ".tmp")
-    tmp.write_text(new_text)
-    os.replace(tmp, fp)
+    atomic_write_text(fp, new_text)
     return True
 
 

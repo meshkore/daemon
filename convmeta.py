@@ -5,6 +5,8 @@ every self.* resolves on the combined instance -> byte-identical."""
 
 from __future__ import annotations
 
+from fsatomic import atomic_write_json
+
 import json
 from typing import Any, Dict, Optional, Tuple
 
@@ -145,9 +147,7 @@ class ConvMetaMixin:
             all_meta[conv] = entry
             p = self._conv_meta_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(all_meta, indent=2, sort_keys=True))
-            tmp.replace(p)
+            atomic_write_json(p, all_meta, sort_keys=True)
             # py-1.11.0 — Broadcast conv.created (first-time) or
             # conv.meta_updated (subsequent) so cockpits update the rail
             # WITHOUT waiting for a state.rebuilt + refetch. The hub may

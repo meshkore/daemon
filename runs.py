@@ -12,8 +12,9 @@ via the flat namespace)."""
 
 from __future__ import annotations
 
+from fsatomic import atomic_write_json
+
 import json
-import os
 import threading
 import uuid
 from pathlib import Path
@@ -112,10 +113,8 @@ class RunStore:
         corrupt the file. Called inside the lock."""
         fp = self._runs_path()
         fp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = fp.with_suffix(".json.tmp")
         try:
-            tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
-            os.replace(tmp, fp)
+            atomic_write_json(fp, self._data, sort_keys=True)
         except OSError as e:
             _log(f"runs.json save failed: {e}")
 

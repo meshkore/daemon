@@ -5,8 +5,9 @@ imported back where used."""
 
 from __future__ import annotations
 
+from fsatomic import atomic_write_json
+
 import json
-import os
 import secrets
 import threading
 from pathlib import Path
@@ -61,16 +62,11 @@ class ChatQueueManager:
             # ChatArchive/RunStore/conv_meta. A plain write_text could be
             # interrupted mid-write → a half-file that `_read` silently
             # parses to [] (queued turns vanished). os.replace is atomic.
-            body = json.dumps(
+            atomic_write_json(
+                p,
                 {"conv": conv, "items": items, "updated_at": _iso_now()},
-                indent=2,
-            ).encode("utf-8")
-            tmp = p.with_suffix(".json.tmp")
-            with open(tmp, "wb") as fh:
-                fh.write(body)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, p)
+                fsync=True,
+            )
         else:
             try:
                 p.unlink()
