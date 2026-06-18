@@ -108,7 +108,8 @@ from runner import ChatRunner  # noqa: E402,F401 — re-exported as daemon.ChatR
 from runnerutil import (  # noqa: E402,F401 — _session_id_for_conv re-exported for tests
     _session_id_for_conv,
 )
-from runs import RunStore, TimelineRotator  # noqa: E402
+from runrotator import TimelineRotator  # noqa: E402
+from runs import RunStore  # noqa: E402
 from bootupdate import _boot_self_update_if_needed  # noqa: E402,F401
 from selfupdate import VersionWatcher  # noqa: E402,F401
 from chatqueue import ChatQueueManager  # noqa: E402

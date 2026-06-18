@@ -55,6 +55,7 @@ MODULES = [
     "state.py",
     "render.py",
     "runs.py",
+    "runrotator.py",
     "storage.py",
     "uploads.py",
     "chatqueue.py",
@@ -70,6 +71,7 @@ MODULES = [
     "agent_prompts",  # package folder — see _expand_module()
     "agent_types.py",
     "integrity.py",
+    "integritycheck.py",
     "prompts.py",
     "coordination.py",
     "coordwake.py",

@@ -36,7 +36,8 @@ from agent_types import (  # noqa: F401 — re-exported for the ~7 importers + d
     _agent_type_from_conv_slug,
     _agent_type_normalised,
 )
-from integrity import ProjectState, StateIntegrityChecker
+from integrity import ProjectState
+from integritycheck import StateIntegrityChecker
 from paths import Paths
 from utils import (
     _daemon_base_url,
