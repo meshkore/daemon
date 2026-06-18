@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Optional
 
-from chat import ChatSessionReaper
+from chatreaper import ChatSessionReaper
 from constants import DAEMON_VERSION
 from http_server import PoolHTTPServer, _build_tls_context
 from quota import QuotaProber

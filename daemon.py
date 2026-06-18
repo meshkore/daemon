@@ -86,7 +86,8 @@ from constants import (  # noqa: E402,F401 — leaf consts; re-exported for call
     _PORT_REGISTRY_DIR,
     _PORT_REGISTRY_FILE,
 )
-from cron import CronRunner, CronScheduler  # noqa: E402,F401
+from cron import CronRunner  # noqa: E402,F401
+from cronsched import CronScheduler  # noqa: E402,F401
 from hub import Hub  # noqa: E402
 from paths import Paths  # noqa: E402
 from prompts import (  # noqa: E402,F401 — F401: re-exported for callers/tests
@@ -97,9 +98,9 @@ from prompts import (  # noqa: E402,F401 — F401: re-exported for callers/tests
     _agent_type_normalised,
 )
 from quota import QuotaState  # noqa: E402
+from protocols import ProtocolsRegistry  # noqa: E402
 from registries import (  # noqa: E402,F401 — F401: _split_frontmatter re-exported
     LinksRegistry,
-    ProtocolsRegistry,
     _split_frontmatter,
 )
 from render import AgentInstructionsRenderer  # noqa: E402
@@ -108,10 +109,8 @@ from runnerutil import (  # noqa: E402,F401 — _session_id_for_conv re-exported
     _session_id_for_conv,
 )
 from runs import RunStore, TimelineRotator  # noqa: E402
-from selfupdate import (  # noqa: E402,F401 — re-exported for serve_forever/main + tests
-    VersionWatcher,
-    _boot_self_update_if_needed,
-)
+from bootupdate import _boot_self_update_if_needed  # noqa: E402,F401
+from selfupdate import VersionWatcher  # noqa: E402,F401
 from chatqueue import ChatQueueManager  # noqa: E402
 from storage import ChatArchive, StorageReport  # noqa: E402
 from uploads import UploadStore  # noqa: E402
