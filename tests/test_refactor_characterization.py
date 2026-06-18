@@ -233,10 +233,11 @@ class _FakeProc:
 
 
 def _runner_module() -> Any:
-    """The module that currently OWNS ChatRunner — 'daemon' before the
-    refactor, 'runner' after. Patching its `_find_claude` global works
-    in both worlds (the bare call resolves against the owning module)."""
-    return sys.modules[d.ChatRunner.__module__]
+    """The module whose namespace `spawn` resolves `_find_claude` against —
+    'daemon' before the refactor, 'runner' after DM-modularize, 'runnerspawn'
+    after the Phase-3d ChatRunner mixin split. Keyed off spawn's own module so
+    the monkeypatch lands wherever spawn is defined."""
+    return sys.modules[d.ChatRunner.spawn.__module__]
 
 
 def _build_runner(cluster_root: Path, **kw: Any) -> Any:

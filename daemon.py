@@ -109,8 +109,8 @@ from registries import (  # noqa: E402,F401 — F401: _split_frontmatter re-expo
 )
 from render import AgentInstructionsRenderer  # noqa: E402
 from routes import make_handler  # noqa: E402
-from runner import (  # noqa: E402,F401 — F401: _session_id_for_conv re-exported for tests
-    ChatRunner,
+from runner import ChatRunner  # noqa: E402,F401 — re-exported as daemon.ChatRunner
+from runnerutil import (  # noqa: E402,F401 — _session_id_for_conv re-exported for tests
     _session_id_for_conv,
 )
 from runs import RunStore, TimelineRotator  # noqa: E402
