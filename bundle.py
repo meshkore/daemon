@@ -64,6 +64,7 @@ MODULES = [
     "prompts.py",
     "coordination.py",
     "readapi.py",
+    "fsread.py",
     "chatread.py",
     "credapi.py",
     "runner.py",

@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # output. Source-tree runs hit the sibling files via sys.path[0].
 from anchor import AnchorMixin  # noqa: E402
 from chatread import ChatReadMixin  # noqa: E402
+from fsread import FsReadMixin  # noqa: E402
 from chatsvc import ChatMixin  # noqa: E402
 from crud import CrudMixin  # noqa: E402
 from coordination import CoordinationMixin  # noqa: E402
@@ -232,6 +233,7 @@ class Daemon(
     CoordinationMixin,
     CredMixin,
     CrudMixin,
+    FsReadMixin,
     QueryMixin,
 ):
     def __init__(
