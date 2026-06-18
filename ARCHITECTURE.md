@@ -106,3 +106,30 @@ behaviour:
   live-exercised (the endpoint warranty); drift fails the build.
 - Run `pytest daemon/tests/ -q` (176 tests today). Rebuild the bundle with
   `python daemon/bundle.py` before parity runs.
+
+## Why mixins (Phase E2 decision)
+
+`Daemon` inherits ~15 mixins rather than composing ~15 service objects. This was
+deliberate and is the **kept** end-state:
+
+- **Each mixin is already one cohesive concern** — the separation-of-
+  responsibilities goal is met at the module level. The mixin boundary == the
+  responsibility boundary.
+- **They genuinely share broad daemon state.** A dispatch check reads
+  `self.chat_sessions` + `self._conv_meta_load()` + `self.quota`; a chat spawn
+  touches `self.hub` + `self.cluster` + `self.upload_store` + `self.runs`.
+  Threading all of that through explicit service constructors would add
+  ceremony without reducing coupling — the coupling is intrinsic to "one daemon
+  orchestrating one cluster".
+- **The known downside — implicit method resolution** (you can't tell from
+  `self._dispatch_mutex_check(...)` which file owns it) — is paid down by THIS
+  map: the Layer-2 table says exactly which mixin owns which surface. An LLM
+  reads the table, not the MRO.
+
+**Rule for adding a facet:** new behaviour = a new mixin module with (1) a
+top docstring naming the `self.*` it depends on, (2) one responsibility, (3) an
+entry in the Layer-2 table above, (4) added to `class Daemon(...)` + `MODULES`.
+If a facet ever needs to be unit-tested in isolation or reused outside Daemon,
+*then* promote it to a composed service with an explicit dependency dataclass —
+not before. (`StateManager` is already that shape: a held object, not a mixin,
+because the FS-poll loop runs independently.)
