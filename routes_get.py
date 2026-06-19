@@ -172,6 +172,21 @@ def route_get(self, daemon):  # noqa: N802
         return self._serve_meshkore_file(
             daemon.paths.context_dir, p[len("/context/") :]
         )
+    # knowledge-tree-unified KT4 — the unified knowledge tree. `GET
+    # /knowledge` returns the manifest-driven concept tree (an overlay
+    # over context/ + docs/ + modules/ defined in context/_index.yaml;
+    # per-node load policy + spawn-token budget). `GET /knowledge/<id>`
+    # returns a single node's processed body (lazy-fetched by the
+    # cockpit + by agents on demand). Exact-match before the prefix.
+    if p == "/knowledge":
+        if self._need_auth():
+            return
+        return self._json(200, daemon.knowledge_tree())
+    if p.startswith("/knowledge/"):
+        if self._need_auth():
+            return
+        node_id = urllib.parse.unquote(p[len("/knowledge/") :]).strip("/")
+        return self._json(200, daemon.knowledge_node(node_id))
     # py-1.9.3 — Per-initiative git activity. Runs git log on
     # the project root and returns commits whose subject/body
     # mentions the initiative id, plus the files each commit

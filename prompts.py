@@ -254,14 +254,126 @@ class BriefingPipeline:
 
     # ── sections ──────────────────────────────────────────────────
 
+    def _knowledge_onboarding(self, manifest_path: "Any") -> str:
+        """knowledge-tree-unified KT5 — build the invariant onboarding block
+        from the unified knowledge manifest (`context/_index.yaml`).
+
+        Injects a KNOWLEDGE MAP (every concept node as an indented
+        `title — desc` line, so the agent learns WHAT EXISTS and WHERE) plus
+        the PINNED bodies in full. Non-pinned nodes that carry a body show
+        their `GET /knowledge/<id>` fetch id, so the agent knows to pull them
+        on demand instead of paying for them on every spawn. Returns "" when
+        the manifest is empty/unparseable so the caller can fall back to the
+        legacy per-file serialization."""
+        try:
+            from yamlparse import parse_simple_yaml
+
+            data = parse_simple_yaml(
+                manifest_path.read_text(encoding="utf-8", errors="replace")
+            )
+        except Exception:
+            return ""
+        nodes = [
+            n
+            for n in (data.get("nodes") or [])
+            if isinstance(n, dict) and n.get("id") and n.get("title")
+        ]
+        if not nodes:
+            return ""
+
+        meshroot = self.paths.meshkore
+        by_id = {str(n["id"]).strip(): n for n in nodes}
+        children: Dict[str, List[str]] = {}
+        roots: List[str] = []
+        for n in nodes:
+            nid = str(n["id"]).strip()
+            pid = str(n.get("parent")).strip() if n.get("parent") else None
+            if pid and pid in by_id:
+                children.setdefault(pid, []).append(nid)
+            else:
+                roots.append(nid)
+
+        def read_body(src: "Any") -> str:
+            if not (isinstance(src, str) and src.strip()):
+                return ""
+            fp = (meshroot / src.strip()).resolve()
+            try:
+                if not str(fp).startswith(str(meshroot.resolve())) or not fp.is_file():
+                    return ""
+                text = fp.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end != -1:
+                    nl = text.find("\n", end + 1)
+                    if nl != -1:
+                        text = text[nl + 1 :]
+            return text.strip()
+
+        map_lines: List[str] = []
+        pinned: List[str] = []
+
+        def walk(nid: str, depth: int) -> None:
+            n = by_id[nid]
+            title = str(n["title"]).strip()
+            desc = str(n.get("desc") or "").strip()
+            load = str(n.get("load") or "skeleton").strip()
+            indent = "  " * depth
+            line = f"{indent}{'★ ' if load == 'pinned' else ''}{title}"
+            if desc:
+                line += f" — {desc}"
+            if load != "pinned" and isinstance(n.get("src"), str) and n["src"].strip():
+                line += f"  → GET /knowledge/{nid}"
+            map_lines.append(line)
+            if load == "pinned":
+                b = read_body(n.get("src"))
+                if b:
+                    pinned.append(f"[{title}]\n{b}")
+            for c in children.get(nid, []):
+                walk(c, depth + 1)
+
+        for r in roots:
+            walk(r, 0)
+        if not map_lines:
+            return ""
+
+        header = (
+            "Everything between the markers below is the project's INVARIANT "
+            "knowledge (MeshKore Standard §3.5). Treat it as authoritative — do "
+            "not re-derive or re-debate it. The KNOWLEDGE MAP lists every "
+            "concept the project documents; ★ nodes are included in full under "
+            "PINNED. For any other node, fetch its body on demand with the "
+            "GET /knowledge/<id> shown.\n"
+        )
+        out = header + "\n=== KNOWLEDGE MAP ===\n" + "\n".join(map_lines)
+        if pinned:
+            out += "\n\n=== PINNED (full bodies) ===\n\n" + "\n\n".join(pinned)
+        CAP = 24000
+        if len(out) > CAP:
+            out = out[:CAP] + (
+                "\n…[knowledge truncated — over the §3.5 4500-token budget; "
+                "trim context/_index.yaml]"
+            )
+        return out + "\n\n=== END CONTEXT ==="
+
     def _section_project_context(self) -> str:
-        """Standard §3.5 (v25 hard_rule) — serialize `.meshkore/context/`
-        as the invariant PROJECT CONTEXT block, prepended before the role
-        on every spawn. Order + markers per `context.serialization_to_agent`.
-        Returns "" when the cluster has no context/ tree yet (a fresh
-        cluster) — the legacy `docs/context.md` pointers in other sections
-        still apply until the Roadmap Author bootstraps context/."""
+        """Standard §3.5 (v25 hard_rule) — serialize the invariant PROJECT
+        CONTEXT block, prepended before the role on every spawn.
+
+        knowledge-tree-unified (KT5): when a unified knowledge manifest is
+        present (`context/_index.yaml`), the block is the KNOWLEDGE MAP +
+        pinned bodies (skeleton-loaded; the rest fetched on demand via
+        /knowledge/<id>). Otherwise it falls back to the legacy per-file
+        serialization (overview/product/stack/architecture/constraints/
+        glossary + decisions/ + criteria/). Returns "" for a fresh cluster
+        with neither — the legacy `docs/context.md` pointers still apply."""
         root = self.paths.context_dir
+        manifest = root / "_index.yaml"
+        if manifest.is_file():
+            block = self._knowledge_onboarding(manifest)
+            if block:
+                return block
         if not root.is_dir():
             return ""
 

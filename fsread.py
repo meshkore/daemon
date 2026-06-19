@@ -286,6 +286,206 @@ class FsReadMixin:
             "tree": tree,
         }
 
+    # ── knowledge-tree-unified KT4 — unified knowledge tree ──────────
+    def _knowledge_manifest(self):
+        """Parse `.meshkore/context/_index.yaml` → (version, [valid nodes]).
+
+        Returns (None, []) when no manifest is present so callers can fall
+        back to the empty state. Nodes missing id/title are dropped.
+        """
+        mf = self.paths.context_dir / "_index.yaml"
+        if not mf.is_file():
+            return None, []
+        try:
+            from yamlparse import parse_simple_yaml
+
+            data = parse_simple_yaml(mf.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return None, []
+        nodes = data.get("nodes")
+        if not isinstance(nodes, list):
+            return data.get("version"), []
+        valid = [
+            n for n in nodes if isinstance(n, dict) and n.get("id") and n.get("title")
+        ]
+        return data.get("version"), valid
+
+    def _knowledge_src_path(self, src: str) -> Optional["Path"]:
+        """Resolve a manifest `src` to a real file under `.meshkore/`, or
+        None if it escapes the root or does not exist. Path traversal
+        (`../`) can never leave `.meshkore/`."""
+        if not isinstance(src, str) or not src.strip():
+            return None
+        meshroot = self.paths.meshkore
+        fp = (meshroot / src.strip()).resolve()
+        try:
+            if not str(fp).startswith(str(meshroot.resolve())):
+                return None
+        except OSError:
+            return None
+        return fp if fp.is_file() else None
+
+    def knowledge_tree(self) -> Dict[str, Any]:
+        """knowledge-tree-unified KT4 — the unified knowledge tree (overlay).
+
+        Reads `.meshkore/context/_index.yaml` (a FLAT list of concept nodes,
+        each optionally pointing `src` at a real file under context/, docs/
+        or modules/), resolves each node's body metadata, and rebuilds the
+        hierarchy from id/parent. NO file is moved — this is a VIEW.
+
+        Per node: id, title, desc, load (pinned|skeleton|on-demand), src,
+        feeds, words, updated, has_body, children[]. Tree-level: spawn_tokens
+        (the skeleton map + pinned bodies the daemon injects at every spawn),
+        skeleton_tokens, pinned_tokens, budget_tokens, over_budget, warnings.
+
+        Falls back to `exists: False` when no manifest is present so the
+        cockpit can render its empty-state hint instead of an error.
+        """
+        version, raw = self._knowledge_manifest()
+        if version is None and not raw:
+            return {
+                "exists": False,
+                "root": ".meshkore/context/_index.yaml",
+                "spawn_tokens": 0,
+                "budget_tokens": self.CONTEXT_BUDGET_TOKENS,
+                "over_budget": False,
+                "warnings": [],
+                "tree": [],
+            }
+
+        warnings: List[str] = []
+        loads = ("pinned", "skeleton", "on-demand")
+        by_id: Dict[str, Dict[str, Any]] = {}
+        skeleton_words = 0
+        pinned_words = 0
+
+        for n in raw:
+            nid = str(n["id"]).strip()
+            title = str(n["title"]).strip()
+            desc = str(n.get("desc") or "").strip()
+            load = str(n.get("load") or "skeleton").strip()
+            if load not in loads:
+                warnings.append(f"{nid}: unknown load '{load}' → skeleton")
+                load = "skeleton"
+            words = 0
+            updated: Optional[str] = None
+            has_body = False
+            src = n.get("src")
+            if isinstance(src, str) and src.strip():
+                fp = self._knowledge_src_path(src)
+                if fp is None:
+                    warnings.append(
+                        f"{nid}: src '{src.strip()}' missing/escapes — dropped"
+                    )
+                    src = None
+                else:
+                    has_body = True
+                    try:
+                        text = fp.read_text(encoding="utf-8", errors="replace")
+                        fm = parse_frontmatter(text)
+                        if isinstance(fm.get("updated"), str):
+                            updated = fm["updated"].strip()
+                        _fm, body = _split_frontmatter(text)
+                        words = len(body.split())
+                    except OSError:
+                        pass
+            else:
+                src = None
+            # every node contributes its skeleton line (title + desc) to the
+            # spawn map; only pinned nodes contribute their body.
+            skeleton_words += len((title + " " + desc).split())
+            if load == "pinned" and has_body:
+                pinned_words += words
+            node: Dict[str, Any] = {
+                "id": nid,
+                "title": title,
+                "desc": desc,
+                "load": load,
+                "words": words,
+                "has_body": has_body,
+                "children": [],
+            }
+            if src:
+                node["src"] = src.strip()
+            if updated:
+                node["updated"] = updated
+            if n.get("feeds"):
+                node["feeds"] = str(n["feeds"]).strip()
+            node["_parent"] = str(n.get("parent")).strip() if n.get("parent") else None
+            by_id[nid] = node
+
+        # rebuild hierarchy preserving manifest order
+        roots: List[Dict[str, Any]] = []
+        for n in raw:
+            node = by_id.get(str(n["id"]).strip())
+            if not node:
+                continue
+            pid = node.pop("_parent", None)
+            if pid and pid in by_id:
+                by_id[pid]["children"].append(node)
+            else:
+                if pid:
+                    warnings.append(f"{node['id']}: parent '{pid}' not found → root")
+                roots.append(node)
+
+        skeleton_tokens = int(round(skeleton_words * 1.5))
+        pinned_tokens = int(round(pinned_words * 1.5))
+        spawn_tokens = skeleton_tokens + pinned_tokens
+        over_budget = spawn_tokens > self.CONTEXT_BUDGET_TOKENS
+        if over_budget:
+            warnings.append(
+                f"spawn payload {spawn_tokens} tok over the "
+                f"{self.CONTEXT_BUDGET_TOKENS}-token budget (§3.5)"
+            )
+        return {
+            "exists": True,
+            "root": ".meshkore/context/_index.yaml",
+            "version": version,
+            "spawn_tokens": spawn_tokens,
+            "skeleton_tokens": skeleton_tokens,
+            "pinned_tokens": pinned_tokens,
+            "budget_tokens": self.CONTEXT_BUDGET_TOKENS,
+            "over_budget": over_budget,
+            "warnings": warnings,
+            "tree": roots,
+        }
+
+    def knowledge_node(self, node_id: str) -> Dict[str, Any]:
+        """knowledge-tree-unified KT4 — a single node's processed body.
+
+        Serves `GET /knowledge/<id>`: the body markdown (frontmatter
+        stripped) of the file the manifest node points at. Pointer nodes
+        (no `src`) return `has_body: False` with their desc.
+        """
+        _version, raw = self._knowledge_manifest()
+        nid = (node_id or "").strip()
+        for n in raw:
+            if str(n.get("id")).strip() != nid:
+                continue
+            base = {
+                "id": nid,
+                "title": str(n.get("title") or "").strip(),
+                "desc": str(n.get("desc") or "").strip(),
+            }
+            src = n.get("src")
+            fp = self._knowledge_src_path(src) if isinstance(src, str) else None
+            if fp is None:
+                base["has_body"] = False
+                base["body"] = None
+                return base
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                base["has_body"] = False
+                base["error"] = "unreadable"
+                return base
+            _fm, body = _split_frontmatter(text)
+            base["src"] = src.strip()
+            base["has_body"] = True
+            base["body"] = body.strip()
+            return base
+        return {"id": nid, "has_body": False, "error": "unknown node"}
+
     def log_listing(self) -> List[Dict[str, Any]]:
         """py-1.9.0 — Descending-by-date list of `.meshkore/log/*.md`
         narrative day-files. Just metadata (name, date, size, mtime);
