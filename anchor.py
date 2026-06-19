@@ -10,6 +10,8 @@ broadcast.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from utils import _debug_emit, _iso_now, _log
@@ -29,6 +31,85 @@ class AnchorMixin:
         prompt (prompts.py) handles it by telling the agent to emit the slug."""
         return str(raw or "").strip().lstrip("#").lower()
 
+    def _resolve_init_path(self, init_id: str) -> Optional[Path]:
+        """py-1.24.2 (AS2) — find an initiative `.md` by slug across BOTH the
+        live folder AND the archive (`initiatives/log/`, where superseded /
+        closed work-streams are moved by the split/close protocol). Returns
+        the live path first, then the archived path, else None.
+
+        Searching the archive is what lets an agent REUSE-and-extend an old
+        story (e.g. re-opening a `web-redesign`) instead of being forced to
+        mint a near-duplicate when the original is archived. The reuse vs.
+        new-story JUDGEMENT stays the agent's (prompts.py decision chain);
+        this only makes the archived slug resolvable so the decision is
+        possible at all."""
+        live = self.paths.initiatives / f"{init_id}.md"
+        if live.exists():
+            return live
+        archived = self.paths.initiatives / "log" / f"{init_id}.md"
+        if archived.exists():
+            return archived
+        return None
+
+    def _reactivate_init(self, path: Path, init_id: str) -> Tuple[Path, bool]:
+        """py-1.24.2 (AS2) — an agent anchored real work to an ARCHIVED
+        initiative (sitting in `initiatives/log/`) or one marked
+        done/superseded. Reuse-and-extend: bring it back into the live
+        roadmap so the resumed work shows up where the operator looks. Moves
+        the file out of `log/` into the live folder and flips a closed status
+        back to `active`. Returns (resolved_path, changed); changed=False (a
+        true no-op) for an initiative that's already live and not closed."""
+        text = path.read_text()
+        in_log = (
+            path.parent.name == "log" and path.parent.parent == self.paths.initiatives
+        )
+        m = re.search(r"^status:\s*(\S+)\s*$", text, flags=re.M)
+        cur = (m.group(1) if m else "").strip().lower()
+        closed = cur in {"done", "superseded", "archived"}
+        if not in_log and not closed:
+            return path, False
+        today = _iso_now()[:10]
+        new = text
+        if closed:
+            new = re.sub(
+                r"^status:\s*\S+\s*$", "status: active", new, count=1, flags=re.M
+            )
+            if new == text:
+                new = re.sub(
+                    r"^---\s*$\n", "---\nstatus: active\n", new, count=1, flags=re.M
+                )
+        if re.search(r"^updated:\s*\S+\s*$", new, flags=re.M):
+            new = re.sub(
+                r"^updated:\s*\S+\s*$", f"updated: {today}", new, count=1, flags=re.M
+            )
+        if re.search(r"^reactivated:", new, flags=re.M):
+            new = re.sub(
+                r"^reactivated:\s*\S+\s*$",
+                f"reactivated: {today}",
+                new,
+                count=1,
+                flags=re.M,
+            )
+        else:
+            new = re.sub(
+                r"^---\s*$\n", f"---\nreactivated: {today}\n", new, count=1, flags=re.M
+            )
+        target = self.paths.initiatives / f"{init_id}.md"
+        if in_log:
+            self.paths.initiatives.mkdir(parents=True, exist_ok=True)
+            target.write_text(new)
+            try:
+                path.unlink()
+            except Exception as e:
+                _log(f"anchor: failed to remove archived {path}: {e}")
+        else:
+            path.write_text(new)
+        _log(
+            f"anchor: reactivated initiative #{init_id} "
+            f"(was status={cur or '?'}{', archived in log/' if in_log else ''})"
+        )
+        return target, True
+
     def _handle_anchor(self, conv: str, payload: Dict[str, Any], *, raw: str) -> None:
         """Resolve the anchor payload to (init_id, task_id), creating
         files on disk if `new_i` / `new_t` was specified, persist
@@ -46,6 +127,7 @@ class AnchorMixin:
 
         is_new_init = False
         is_new_task = False
+        init_path: Optional[Path] = None
         init_frontmatter: Optional[Dict[str, Any]] = None
         task_frontmatter: Optional[Dict[str, Any]] = None
 
@@ -65,7 +147,10 @@ class AnchorMixin:
                     conv, f"invalid initiative slug: {init_id!r}", raw=raw
                 )
                 return
-            if not (self.paths.initiatives / f"{init_id}.md").exists():
+            # py-1.24.2 (AS2) — resolve across live + archive (initiatives/log/)
+            # so an archived story can be reused-and-extended, not just active ones.
+            init_path = self._resolve_init_path(init_id)
+            if init_path is None:
                 self._handle_anchor_rejected(
                     conv, f"initiative #{init_id} not found on disk", raw=raw
                 )
@@ -82,7 +167,9 @@ class AnchorMixin:
                     raw=raw,
                 )
                 return
-            if not (self.paths.initiatives / f"{init_id}.md").exists():
+            # py-1.24.2 (AS2) — same live + archive resolution as the `i` branch.
+            init_path = self._resolve_init_path(init_id)
+            if init_path is None:
                 self._handle_anchor_rejected(
                     conv,
                     f"initiative #{init_id} (from new_t.initiative) not found",
@@ -118,6 +205,16 @@ class AnchorMixin:
             )
             return
 
+        # --- Reuse-and-extend: if the agent anchored real work to an
+        #     ARCHIVED / superseded initiative, bring it back into the live
+        #     roadmap (move out of log/ + flip status to active). py-1.24.2. ---
+        init_reactivated = False
+        if not is_new_init and init_path is not None:
+            try:
+                _, init_reactivated = self._reactivate_init(init_path, init_id)
+            except Exception as e:
+                _log(f"anchor: reactivate failed for #{init_id}: {e}")
+
         # --- Persist conv_meta + broadcast ---
         existing_meta = self._conv_meta_load().get(conv) or {}
         agent_type = existing_meta.get("agent_type") or "custom"
@@ -139,6 +236,7 @@ class AnchorMixin:
             "task_id": task_id,
             "is_new_init": is_new_init,
             "is_new_task": is_new_task,
+            "reactivated": init_reactivated,
             "ts": _iso_now(),
         }
         if init_frontmatter is not None:
@@ -150,7 +248,7 @@ class AnchorMixin:
         except Exception as e:
             _log(f"conv.anchored broadcast failed for {conv}: {e}")
 
-        if is_new_init or is_new_task:
+        if is_new_init or is_new_task or init_reactivated:
             try:
                 self.state_manager.rebuild(broadcast=True)
             except Exception as e:
