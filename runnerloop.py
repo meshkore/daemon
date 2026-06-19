@@ -268,6 +268,19 @@ class RunnerLoopMixin:
                 )
             except Exception as e:
                 _log(f"architect wake hook failed for {self.conv}: {e}")
+            # Standard v26 — persist the task's resolution record (frontmatter
+            # pointers + `## Resolution` body) when this turn finished a task.
+            # Fires for EVERY conv, not just architect children, so a task
+            # closed by any agent gets a durable summary.
+            try:
+                self.daemon._persist_task_resolution(
+                    conv=self.conv,
+                    agent_id=self.agent_id,
+                    final_text=cleaned_text,
+                    exit_code=exit_code,
+                )
+            except Exception as e:
+                _log(f"task-resolution persist failed for {self.conv}: {e}")
             # py-1.11.0 — Broadcast conv.activity for this conv with
             # live=false override. Fires before ChatSessions._wait pops
             # us from `_s`; the override ensures the cockpit sees the

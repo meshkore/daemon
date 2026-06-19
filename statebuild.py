@@ -70,6 +70,17 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                         else [],
                         "initiative": str(fm.get("initiative") or "") or None,
                         "path": str(md.relative_to(paths.root)),
+                        # Standard v26 — resolution record pointers. The rich
+                        # `## Resolution` body stays out of /state (fetched on
+                        # demand); these let the cockpit paint the collapsed
+                        # "ejecutado · fecha · agente" line without a body read.
+                        "completed_at": str(fm.get("completed_at") or "") or None,
+                        "resolved_by": str(fm.get("resolved_by") or "") or None,
+                        "resolved_by_conv": str(fm.get("resolved_by_conv") or "")
+                        or None,
+                        "commit_shas": fm.get("commit_shas")
+                        if isinstance(fm.get("commit_shas"), list)
+                        else [],
                     }
                     tasks.append(t)
                     by_module[t["category"]] = by_module.get(t["category"], []) + [
