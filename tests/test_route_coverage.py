@@ -100,6 +100,7 @@ EXERCISE = [
     ("GET", "/credentials", True, {("==", "/credentials")}),
     ("GET", "/log", True, {("==", "/log")}),
     ("GET", "/context", True, {("==", "/context")}),
+    ("GET", "/knowledge", True, {("==", "/knowledge")}),
     ("GET", "/links", True, {("==", "/links")}),
     ("GET", "/protocols", True, {("==", "/protocols")}),
     ("GET", "/cron/list", True, {("==", "/cron/list")}),
@@ -113,6 +114,7 @@ EXERCISE = [
     ("GET", "/tasks/T1.md", True, {("startswith", "/tasks/")}),
     ("GET", "/log/2099-01-01.md", True, {("startswith", "/log/")}),
     ("GET", "/context/overview.md", True, {("startswith", "/context/")}),
+    ("GET", "/knowledge/overview", True, {("startswith", "/knowledge/")}),
     (
         "GET",
         "/initiative/alpha/activity",

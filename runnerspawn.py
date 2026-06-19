@@ -102,6 +102,22 @@ class RunnerSpawnMixin:
         # force-cancelled). Set BEFORE Popen so even a subprocess that
         # hangs in the OS spawn path gets the timestamp.
         self._started_at = time.time()
+        # QX5 — record HEAD at turn start so the resolution can diff
+        # exactly what this turn changed (files + commits). Quiet on any
+        # failure; resolution just records nothing then.
+        try:
+            _head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self.paths.root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self._turn_start_sha = (
+                _head.stdout.strip() if _head.returncode == 0 else None
+            )
+        except Exception:  # best-effort telemetry — never break the spawn
+            self._turn_start_sha = None
         self.proc = subprocess.Popen(
             args,
             cwd=str(self.paths.root),

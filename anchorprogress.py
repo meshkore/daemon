@@ -6,7 +6,8 @@ every self.* resolves on the combined instance -> byte-identical."""
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
 
 from cluster import _patch_frontmatter
 from prompts import _agent_type_from_conv_slug, _agent_type_normalised
@@ -15,6 +16,46 @@ from utils import _iso_now, _log, parse_frontmatter
 # Standard v26 — cap the persisted resolution so a runaway final can't
 # bloat the task file. The Output Contract keeps summaries small anyway.
 _RESOLUTION_MAX_CHARS = 4000
+
+# QX5 — bound the files/commits we record per task so an outsized turn
+# (or a noisy parallel window) can't bloat the task file.
+_MAX_FILES = 60
+_MAX_COMMITS = 25
+
+
+def _git_lines(root: Any, args: List[str]) -> List[str]:
+    """Run a git command under `root`, return non-empty stdout lines.
+    Quiet on any failure (no git, detached, bad range) — returns []."""
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if proc.returncode != 0:
+            return []
+        return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def _changes_since(root: Any, start_sha: Optional[str]) -> Tuple[List[str], List[str]]:
+    """Files changed + commit SHAs between `start_sha` and HEAD. Returns
+    (files, commit_shas), each capped. Empty when start_sha is missing or
+    nothing changed (a turn that committed nothing → no registry noise)."""
+    if not start_sha:
+        return [], []
+    rng = f"{start_sha}..HEAD"
+    commits = _git_lines(root, ["log", rng, "--format=%H"])
+    if not commits:
+        return [], []  # nothing was committed this turn
+    files = _git_lines(root, ["diff", "--name-only", rng])
+    # Stable order, deduped (diff already unique, but be safe).
+    seen: set = set()
+    uniq_files = [f for f in files if not (f in seen or seen.add(f))]
+    return uniq_files[:_MAX_FILES], commits[:_MAX_COMMITS]
 
 
 def _upsert_body_section(text: str, heading: str, content: str) -> str:
@@ -95,6 +136,7 @@ class AnchorProgressMixin:
         agent_id: Optional[str],
         final_text: str,
         exit_code: Optional[int],
+        start_sha: Optional[str] = None,
     ) -> None:
         """Standard v26 — durable per-task resolution record.
 
@@ -127,19 +169,29 @@ class AnchorProgressMixin:
             if str(fm.get("status") or "").strip().lower() != "done":
                 return  # only completed tasks carry a resolution
             now = _iso_now()
-            _patch_frontmatter(
-                path,
-                {
-                    "completed_at": now,
-                    "resolved_by": agent_id or conv,
-                    "resolved_by_conv": conv,
-                },
-            )
+            # QX5 — what this turn actually changed (files + commits),
+            # diffed from the HEAD captured at spawn. Empty when the turn
+            # committed nothing.
+            files, commits = _changes_since(self.paths.root, start_sha)
+            fm_patch: Dict[str, Any] = {
+                "completed_at": now,
+                "resolved_by": agent_id or conv,
+                "resolved_by_conv": conv,
+            }
+            if commits:
+                fm_patch["commit_shas"] = commits  # documented v26 field
+            _patch_frontmatter(path, fm_patch)
             if len(summary) > _RESOLUTION_MAX_CHARS:
                 summary = summary[:_RESOLUTION_MAX_CHARS].rstrip() + "\n\n…(truncated)"
             body = (
                 f"_Resolved by {agent_id or conv} via `{conv}` at {now}._\n\n{summary}"
             )
+            # The modified-files list lives in the body (no frontmatter
+            # schema change → no Standard bump). The cockpit renders the
+            # resolution body, so this surfaces in the archived registry.
+            if files:
+                listed = "\n".join(f"- `{f}`" for f in files)
+                body += f"\n\n**Ficheros modificados ({len(files)}):**\n{listed}"
             text2 = path.read_text(errors="replace")  # re-read after fm patch
             path.write_text(_upsert_body_section(text2, "Resolution", body))
             self.state_manager.rebuild(broadcast=True)

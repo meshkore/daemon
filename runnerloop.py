@@ -278,6 +278,7 @@ class RunnerLoopMixin:
                     agent_id=self.agent_id,
                     final_text=cleaned_text,
                     exit_code=exit_code,
+                    start_sha=getattr(self, "_turn_start_sha", None),
                 )
             except Exception as e:
                 _log(f"task-resolution persist failed for {self.conv}: {e}")
