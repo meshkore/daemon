@@ -65,6 +65,9 @@ class VerifyMixin:
             spec["viewports"] = cfg["default_viewports"]
         if cfg.get("inline_b64"):
             spec.setdefault("inline_b64", True)
+        # Keep a downloaded Chromium INSIDE the cluster, with the daemon — not
+        # in the per-user OS cache. ~150 MB, gitignored runtime, reusable.
+        spec.setdefault("browser_dir", str(self.paths.runtime / "browser"))
 
         try:
             result = verify(spec, out_dir=str(out_dir), log=_log)

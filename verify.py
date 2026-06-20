@@ -57,8 +57,16 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _cache_root() -> Path:
-    """OS cache dir for a downloaded browser — never inside the project."""
+def _cache_root(browser_dir: Optional[Path] = None) -> Path:
+    """Where a downloaded browser is unpacked. The daemon passes an explicit
+    dir INSIDE the cluster (`.meshkore/.runtime/browser`) so the binary lives
+    with the project, not the OS cache — `$MESHKORE_BROWSER_DIR` overrides, and
+    only the standalone CLI (no dir given) falls back to the per-user OS cache."""
+    if browser_dir is not None:
+        return Path(browser_dir)
+    env = os.environ.get("MESHKORE_BROWSER_DIR")
+    if env:
+        return Path(env)
     sysname = sys.platform
     if sysname == "darwin":
         base = Path.home() / "Library" / "Caches"
@@ -114,7 +122,7 @@ _LINUX_NAMES: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def discover_browser() -> Optional[Tuple[str, str]]:
+def discover_browser(browser_dir: Optional[Path] = None) -> Optional[Tuple[str, str]]:
     """Return (executable_path, channel) for a host-installed Chromium-family
     browser, or None. Honours $MESHKORE_CHROME / $CHROME overrides first."""
     override = os.environ.get("MESHKORE_CHROME") or os.environ.get("CHROME")
@@ -142,7 +150,7 @@ def discover_browser() -> Optional[Tuple[str, str]]:
             if found:
                 return (found, channel)
     # last resort: a previously-downloaded portable Chrome in our cache
-    cached = _cached_chrome_path()
+    cached = _cached_chrome_path(browser_dir)
     if cached and cached.exists():
         return (str(cached), "chrome-for-testing")
     return None
@@ -175,9 +183,9 @@ def _cft_platform_key() -> Optional[str]:
     )
 
 
-def _cached_chrome_path() -> Optional[Path]:
+def _cached_chrome_path(browser_dir: Optional[Path] = None) -> Optional[Path]:
     """Where a downloaded Chrome-for-Testing binary lives, if present."""
-    root = _cache_root()
+    root = _cache_root(browser_dir)
     if not root.exists():
         return None
     # the unzip leaves a chrome-<platform>/ dir holding the executable
@@ -196,11 +204,13 @@ def _cached_chrome_path() -> Optional[Path]:
     return None
 
 
-def ensure_browser(allow_download: bool = True, log=print) -> Tuple[str, str]:
+def ensure_browser(
+    allow_download: bool = True, log=print, browser_dir: Optional[Path] = None
+) -> Tuple[str, str]:
     """Return (path, channel) of a usable browser, downloading a portable
-    Chrome-for-Testing build (no installer, OS cache, outside the project) if
-    none is installed. Raises RuntimeError if unavailable and download is off."""
-    found = discover_browser()
+    Chrome-for-Testing build (no installer, no admin) into `browser_dir` if none
+    is installed. Raises RuntimeError if unavailable and download is off."""
+    found = discover_browser(browser_dir)
     if found:
         return found
     if not allow_download:
@@ -208,25 +218,34 @@ def ensure_browser(allow_download: bool = True, log=print) -> Tuple[str, str]:
             "no Chromium-family browser found and download disabled "
             "(set MESHKORE_CHROME or install Chrome/Edge/Chromium)"
         )
-    path = _download_chrome_for_testing(log=log)
+    path = _download_chrome_for_testing(log=log, browser_dir=browser_dir)
     return (str(path), "chrome-for-testing")
 
 
-def _download_chrome_for_testing(log=print) -> Path:
-    """Fetch a portable Chrome-for-Testing .zip and unpack into the OS cache.
-    No installer, no admin, no PATH change — a self-contained directory we run
-    directly. Returns the executable path."""
+def _download_chrome_for_testing(log=print, browser_dir: Optional[Path] = None) -> Path:
+    """Fetch a portable Chrome-for-Testing .zip and unpack into `browser_dir`
+    (the daemon passes a dir inside `.meshkore/`). No installer, no admin, no
+    PATH change — a self-contained directory we run directly. Returns the exe."""
     pkey = _cft_platform_key()
     if not pkey:
         raise RuntimeError(
             f"no Chrome-for-Testing build for {sys.platform}/{platform.machine()}"
         )
-    log(f"verify: no host browser — downloading Chrome-for-Testing ({pkey})…")
+    # NOTE: the binary downloads + lands fine, but DRIVING headless
+    # Chrome-for-Testing over the stdlib CDP-WebSocket is not yet reliable
+    # (CfT 150's browser ws resets on Target.attachToTarget) — the robust
+    # `--remote-debugging-pipe` transport is tracked as VRF8. Prefer a host
+    # browser: Windows already ships Edge; on macOS/Linux install Chrome or
+    # set MESHKORE_CHROME=/path/to/chrome.
+    log(
+        f"verify: no host browser — downloading Chrome-for-Testing ({pkey}); "
+        "NOTE driving it headless is experimental (VRF8) — prefer a host browser"
+    )
     with urllib.request.urlopen(_CFT_LATEST, timeout=30) as r:
         meta = json.loads(r.read().decode("utf-8"))
     downloads = meta["channels"]["Stable"]["downloads"]["chrome"]
     url = next(d["url"] for d in downloads if d["platform"] == pkey)
-    root = _cache_root()
+    root = _cache_root(browser_dir)
     root.mkdir(parents=True, exist_ok=True)
     zip_path = root / f"chrome-{pkey}.zip"
     with urllib.request.urlopen(url, timeout=300) as r, open(zip_path, "wb") as f:
@@ -234,7 +253,7 @@ def _download_chrome_for_testing(log=print) -> Path:
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(root)
     zip_path.unlink(missing_ok=True)
-    exe = _cached_chrome_path()
+    exe = _cached_chrome_path(browser_dir)
     if not exe:
         raise RuntimeError("Chrome-for-Testing unpacked but no executable found")
     if sys.platform != "win32":
@@ -395,12 +414,7 @@ class Chrome:
         self.proc = subprocess.Popen(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        port = self._read_devtools_port()
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/json/version", timeout=10
-        ) as r:
-            ws_url = json.loads(r.read())["webSocketDebuggerUrl"]
-        self._ws = self._connect(ws_url)
+        self._ws = self._open_browser_ws()
         # open a page target and attach to it (flatten → one socket, sessionId)
         target = self._cmd("Target.createTarget", {"url": "about:blank"})
         self.target_id = target["targetId"]
@@ -412,27 +426,36 @@ class Chrome:
         for domain in ("Page", "Runtime", "Network", "Log"):
             self._cmd(f"{domain}.enable", session=self.session_id)
 
-    def _read_devtools_port(self, deadline: float = 20.0) -> int:
-        """Chrome writes the chosen port to DevToolsActivePort in the profile."""
+    def _open_browser_ws(self, deadline: float = 25.0) -> _WS:
+        """Connect the browser-level CDP WebSocket as soon as the browser is
+        ready, and HOLD it open.
+
+        Chrome writes ``DevToolsActivePort`` (two lines: ``<port>`` then the
+        browser ws path ``/devtools/browser/<id>``) once the endpoint is up. We
+        connect using THOSE values directly and skip the ``/json/version`` HTTP
+        round-trip — that extra step races a freshly-downloaded
+        ``--headless=new`` browser, whose initial DevTools server is live for
+        only ~100 ms during a process handoff; the lingering open WS keeps the
+        session alive. Poll-and-connect in one tight loop so we land inside that
+        window (host browsers are warm and connect on the first read)."""
         f = self.profile / "DevToolsActivePort"
         end = time.time() + deadline
+        last: Optional[Exception] = None
         while time.time() < end:
             if self.proc and self.proc.poll() is not None:
                 raise CDPError(f"browser exited early (code {self.proc.returncode})")
-            if f.exists():
-                txt = f.read_text().splitlines()
-                if txt and txt[0].strip().isdigit():
-                    return int(txt[0].strip())
-            time.sleep(0.05)
-        raise CDPError("timed out waiting for DevToolsActivePort")
-
-    @staticmethod
-    def _connect(ws_url: str) -> _WS:
-        # ws://127.0.0.1:<port>/devtools/...
-        rest = ws_url.split("://", 1)[1]
-        hostport, _, path = rest.partition("/")
-        host, _, port = hostport.partition(":")
-        return _WS(host, int(port or 80), "/" + path)
+            try:
+                lines = f.read_text().splitlines()
+            except OSError:
+                lines = []
+            if len(lines) >= 2 and lines[0].strip().isdigit():
+                port, path = int(lines[0].strip()), lines[1].strip()
+                try:
+                    return _WS("127.0.0.1", port, path)
+                except (CDPError, OSError) as e:
+                    last = e  # window may have closed mid-handoff — re-read + retry
+            time.sleep(0.02)
+        raise CDPError(f"timed out opening CDP WebSocket — {last}")
 
     def close(self) -> None:
         for ws in (self._ws,):
@@ -552,8 +575,30 @@ class Chrome:
         res = self.cmd("Page.captureScreenshot", params)
         return base64.b64decode(res["data"])
 
+    def apply_credentials(self, state: Dict[str, Any]) -> None:
+        """Authenticate BEFORE navigation so credentialed pages are reachable.
+        Three mechanisms (combine as needed) — no document required:
+          state.headers      {name: value}        → Network.setExtraHTTPHeaders
+          state.basic_auth   {username, password} → an Authorization: Basic … header
+          state.cookies      [{name,value,domain|url,path,...}] → Network.setCookies
+        Without these, a login-walled URL just renders the login page — Verify
+        reports that honestly (it never bypasses auth)."""
+        headers = dict(state.get("headers") or {})
+        ba = state.get("basic_auth")
+        if ba and ba.get("username") is not None:
+            token = base64.b64encode(
+                f"{ba.get('username', '')}:{ba.get('password', '')}".encode()
+            ).decode()
+            headers["Authorization"] = f"Basic {token}"
+        if headers:
+            self.cmd("Network.setExtraHTTPHeaders", {"headers": headers})
+        cookies = state.get("cookies")
+        if cookies:
+            self.cmd("Network.setCookies", {"cookies": cookies})
+
     def set_state(self, state: Dict[str, Any]) -> None:
-        """Seed localStorage before navigation-dependent assertions."""
+        """Seed localStorage before navigation-dependent assertions (needs a
+        document — call AFTER an initial navigate to the target origin)."""
         ls = state.get("localStorage") or {}
         for k, v in ls.items():
             self.evaluate(f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})")
@@ -592,8 +637,10 @@ def verify(
     spec = {
       url, viewports?, steps?, capture?, state?,
       checks?: { visual?, functional?, api? }, settle_ms?, full_page?,
-      allow_download?, inline_b64?
+      allow_download?, inline_b64?, browser_dir?
     }
+    state may carry localStorage / cookies / headers / basic_auth for
+    credentialed pages (see Chrome.apply_credentials / set_state).
     """
     started = _now_ms()
     url = spec.get("url")
@@ -603,11 +650,14 @@ def verify(
     settle_ms = int(spec.get("settle_ms", 2500))
     full_page = bool(spec.get("full_page", True))
     inline_b64 = bool(spec.get("inline_b64", False))
+    browser_dir = spec.get("browser_dir")
     out = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="mkv-out-"))
     out.mkdir(parents=True, exist_ok=True)
 
     exe, channel = ensure_browser(
-        allow_download=bool(spec.get("allow_download", True)), log=log
+        allow_download=bool(spec.get("allow_download", True)),
+        log=log,
+        browser_dir=Path(browser_dir) if browser_dir else None,
     )
     log(f"verify: using {channel} at {exe}")
 
@@ -620,10 +670,16 @@ def verify(
     busted = _cache_bust(url)
 
     with Chrome(exe, log=log) as browser:
-        if spec.get("state"):
-            # set_state needs a document; navigate once first, then re-nav.
-            browser.navigate(busted, settle_ms=300)
-            browser.set_state(spec["state"])
+        state = spec.get("state") or {}
+        if state:
+            # Credentials (cookies/headers/basic_auth) must be set BEFORE any
+            # navigation so a login-walled URL loads authenticated.
+            browser.apply_credentials(state)
+            if state.get("localStorage"):
+                # localStorage needs a document: navigate once, seed, then the
+                # viewport loop re-navigates with the seed in place.
+                browser.navigate(busted, settle_ms=300)
+                browser.set_state(state)
 
         for vp in viewports:
             name = vp.get("name", f"{vp['w']}x{vp['h']}")
