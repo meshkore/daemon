@@ -231,16 +231,7 @@ def _download_chrome_for_testing(log=print, browser_dir: Optional[Path] = None) 
         raise RuntimeError(
             f"no Chrome-for-Testing build for {sys.platform}/{platform.machine()}"
         )
-    # NOTE: the binary downloads + lands fine, but DRIVING headless
-    # Chrome-for-Testing over the stdlib CDP-WebSocket is not yet reliable
-    # (CfT 150's browser ws resets on Target.attachToTarget) — the robust
-    # `--remote-debugging-pipe` transport is tracked as VRF8. Prefer a host
-    # browser: Windows already ships Edge; on macOS/Linux install Chrome or
-    # set MESHKORE_CHROME=/path/to/chrome.
-    log(
-        f"verify: no host browser — downloading Chrome-for-Testing ({pkey}); "
-        "NOTE driving it headless is experimental (VRF8) — prefer a host browser"
-    )
+    log(f"verify: no host browser — downloading Chrome-for-Testing ({pkey})…")
     with urllib.request.urlopen(_CFT_LATEST, timeout=30) as r:
         meta = json.loads(r.read().decode("utf-8"))
     downloads = meta["channels"]["Stable"]["downloads"]["chrome"]
@@ -250,8 +241,22 @@ def _download_chrome_for_testing(log=print, browser_dir: Optional[Path] = None) 
     zip_path = root / f"chrome-{pkey}.zip"
     with urllib.request.urlopen(url, timeout=300) as r, open(zip_path, "wb") as f:
         shutil.copyfileobj(r, f)
+    # CRITICAL: zipfile.extractall DROPS unix permission bits, so every binary
+    # comes out non-executable. For a host browser that's invisible (we only
+    # chmod the main exe), but Chrome-for-Testing ships HELPER binaries
+    # (chrome_crashpad_handler, the Framework helpers) that MUST be executable —
+    # otherwise Chrome hits `FATAL chrome_crashpad_handler: Permission denied`
+    # and its DevTools endpoint becomes unstable (resets the CDP socket on
+    # attach). Restore each entry's recorded mode from the zip's external_attr.
     with zipfile.ZipFile(zip_path) as z:
-        z.extractall(root)
+        for zi in z.infolist():
+            z.extract(zi, root)
+            mode = (zi.external_attr >> 16) & 0xFFFF
+            if mode and sys.platform != "win32":
+                try:
+                    os.chmod(root / zi.filename, mode)
+                except OSError:
+                    pass
     zip_path.unlink(missing_ok=True)
     exe = _cached_chrome_path(browser_dir)
     if not exe:
