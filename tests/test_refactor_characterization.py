@@ -50,6 +50,9 @@ import daemon as d  # type: ignore[import-not-found]  # noqa: E402
 # prefer reusing an archived story over a near-duplicate. That block is in the
 # universal core rules → every agent type's briefing shifts, on BOTH the empty
 # and populated fixtures.
+# py-1.25.3 (AOF1 autonomous-output-feed): ONLY the roadmap-architect "focus"
+# changed (terse continuous EVENT FEED + "don't echo the wake plumbing" + 2-3
+# line finish summary), so only that one agent type's hash shifts here.
 BRIEFING_GOLDEN_EMPTY = {
     "audit": "19c6da151d595b8c691d5eda380498eb956c1bc1a2f4a7dc996dd67990d08738",
     "custom": "0540a53fee8156e0a6bdfb529f3d04108b1ecc5008166937c27e0eb15396b17a",
@@ -57,7 +60,7 @@ BRIEFING_GOLDEN_EMPTY = {
     "deploy": "195602a77604276713d4ac0ad2bab8352d461ee066fa9419c8cec9ad8e327e4c",
     "docs": "051d5d57192ac9ad07a309ed87a04cb4db7092c0b67beb7ba9c0337dde1c8e1c",
     "review": "62b072048b78525d957ec1025d04cb32a366114f28ff820b1fbfe30b80f2d163",
-    "roadmap-architect": "daf71cfb2661067f0d3dd489e53649a6d3b0b329dced5b453fb167f2a9f556e8",
+    "roadmap-architect": "4c015e7977158babbac5cb1bcfa35f715805a4abfdeefaac89bd944a9ce137dc",
     "testing": "7747973aa1e8e71b5086efdc342b8d48c6047514eb009f4f5037e7fd2437641f",
 }
 
@@ -68,7 +71,7 @@ BRIEFING_GOLDEN_POPULATED = {
     "deploy": "6a0ad9f4a96ebe5e6606a0ade2a56429514c494322e7debb896a7a0444a44f5e",
     "docs": "d632f30703fb31b1d60fc7d4928a7e0536a0c4477c07e40b82c94e8da6ed9166",
     "review": "4d101e3a271bbc14fa189e3c591cab748981728d68ee6dab45beb15285b6b928",
-    "roadmap-architect": "27ff91d351518e4fbf403af251a65481ec25d081489c2cc62a7bec55221de0a6",
+    "roadmap-architect": "4aa15762ecb9e53bfc7302fb8ed3918eb41a3e1ac0cb289501c5a2cac75a8af5",
     "testing": "b2467d6099c0c99d3ed209f07c03c43a36879fb5784b9341c3d09635356a7d92",
 }
 
