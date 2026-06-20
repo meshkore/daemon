@@ -55,6 +55,7 @@ MODULES = [
     "statebuild.py",
     "state.py",
     "render.py",
+    "verify.py",
     "runs.py",
     "runrotator.py",
     "storage.py",
@@ -98,6 +99,7 @@ MODULES = [
     "routes_post.py",
     "routes.py",
     "selfupdatesvc.py",
+    "verifysvc.py",
     "lifecycle.py",
 ]
 
@@ -141,6 +143,33 @@ SIBLING_PREFIXES = (
     + tuple(f"from {_mod_name(m)}." for m in MODULES)
     + ("from daemon import ",)
 )
+
+
+def _strip_main_block(text: str) -> str:
+    """Drop a module's ``if __name__ == "__main__":`` block. Only daemon.py
+    (the LAST inlined module, handled separately) keeps its entrypoint. A
+    sibling's __main__ would otherwise execute FIRST in the bundle (it inlines
+    earlier) and hijack the process — e.g. verify.py's argparse CLI would
+    consume the daemon's ``--port/--root`` argv and exit. Indent-based block
+    strip, same shape as the TYPE_CHECKING handling above."""
+    out: list[str] = []
+    skip_indent: int | None = None
+    for line in text.splitlines(keepends=True):
+        if skip_indent is not None:
+            if line.strip() == "":
+                continue
+            if len(line) - len(line.lstrip()) > skip_indent:
+                continue  # block body
+            skip_indent = None  # dedented out
+        stripped = line.lstrip()
+        if stripped.split("#", 1)[0].rstrip() in (
+            'if __name__ == "__main__":',
+            "if __name__ == '__main__':",
+        ):
+            skip_indent = len(line) - len(stripped)
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def _git_rev() -> str:
@@ -281,7 +310,9 @@ def bundle() -> Path:
             parts.append(
                 f"\n\n# ── inlined from daemon/{rel} (DM3+ bundle) ─────────────────────────\n"
             )
-            parts.append(_strip_sibling_imports(_strip_shebang(body)))
+            parts.append(
+                _strip_sibling_imports(_strip_main_block(_strip_shebang(body)))
+            )
     parts.append(
         "\n\n# ── inlined from daemon/daemon.py — main module ──────────────────────\n"
     )

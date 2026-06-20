@@ -126,6 +126,8 @@ EXERCISE = [
     ("GET", "/credentials/portal-token", True, {("startswith", "/credentials/")}),
     ("GET", "/chat/conv/general/meta", True, {("startswith", "/chat/conv/")}),
     ("GET", "/chat/uploads/2099-01-01/x.png", True, {("startswith", "/chat/uploads/")}),
+    # /verify/shot with no ?path → 400 (proves wired without serving a file)
+    ("GET", "/verify/shot", True, {("==", "/verify/shot")}),
     ("GET", "/links/__probe__", True, {("startswith", "/links/")}),
     ("GET", "/protocols/__probe__", True, {("startswith", "/protocols/")}),
     # ── POST, exact (auth → reaches the route table past the global gate) ──
@@ -141,6 +143,8 @@ EXERCISE = [
     ("POST", "/workers", True, {("==", "/workers")}),
     ("POST", "/version/next", True, {("==", "/version/next")}),
     ("POST", "/initiative/reorder", True, {("==", "/initiative/reorder")}),
+    # /verify with no spec.url → 400 (proves wired without launching a browser)
+    ("POST", "/verify", True, {("==", "/verify")}),
     # ── POST, prefix / suffix ──
     (
         "POST",

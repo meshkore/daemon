@@ -67,6 +67,7 @@ from readapi import QueryMixin  # noqa: E402
 from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
+from verifysvc import VerifyMixin  # noqa: E402
 from state import StateManager  # noqa: E402
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
@@ -223,6 +224,7 @@ class Daemon(
     LifecycleMixin,
     QueryMixin,
     SelfUpdateMixin,
+    VerifyMixin,
     WallsMixin,
 ):
     def __init__(

@@ -348,6 +348,34 @@ def route_get(self, daemon):  # noqa: N802
         except Exception:
             pass
         return
+    # MeshKore Verify (VRF2) — serve a screenshot the verifier wrote under
+    # .meshkore/.runtime/verify/. Strictly confined to that dir (the resolved
+    # path must live inside it) so `?path=` can't traverse out. Loopback/TLS
+    # only; the cockpit's <img src> and a local agent both read it the same way.
+    if p == "/verify/shot":
+        raw = q.get("path", "")
+        if not raw:
+            return self._json(400, {"error": "path required"})
+        from pathlib import Path as _Path
+
+        root = (daemon.paths.runtime / "verify").resolve()
+        try:
+            target = _Path(urllib.parse.unquote(raw)).resolve()
+            target.relative_to(root)  # raises if outside the verify dir
+            body_bytes = target.read_bytes()
+        except (ValueError, OSError):
+            return self._json(404, {"error": "not found"})
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("Cache-Control", "private, max-age=60")
+        self.end_headers()
+        try:
+            self.wfile.write(body_bytes)
+        except Exception:
+            pass
+        return
     # D-CRON-02..05: scheduler introspection.
     if p == "/cron/list":
         if self._need_auth():

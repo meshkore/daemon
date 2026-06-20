@@ -310,4 +310,10 @@ def route_post(self, daemon):  # noqa: N802
         )
         return self._json(code, resp)
 
+    # MeshKore Verify (VRF2) — run the local visual+functional verifier
+    # against a public/preview URL and return evidence (shots + flows +
+    # console/network + verdict). Body is a verify spec.
+    if p == "/verify":
+        return self._json(*daemon.verify_request(self._read_json_body()))
+
     return self._json(404, {"error": "unknown route", "path": p})
