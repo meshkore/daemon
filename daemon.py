@@ -101,7 +101,7 @@ from prompts import (  # noqa: E402,F401 — F401: re-exported for callers/tests
     _agent_type_normalised,
 )
 from quota import QuotaState  # noqa: E402
-from protocols import ProtocolsRegistry  # noqa: E402
+from workflows import WorkflowsRegistry  # noqa: E402
 from registries import (  # noqa: E402,F401 — F401: _split_frontmatter re-exported
     LinksRegistry,
     _split_frontmatter,
@@ -306,9 +306,12 @@ class Daemon(
         # Standard §13 — deployment links registry. Quiet no-op when
         # .meshkore/public/links.yaml is absent.
         self.links_registry = LinksRegistry(paths, self.hub)
-        # Standard §14 — protocols registry. Quiet no-op when
-        # .meshkore/protocols/ is absent.
-        self.protocols_registry = ProtocolsRegistry(paths, self.hub)
+        # Standard §14 — workflows registry (renamed from protocols 2026-06-21).
+        # Quiet no-op when neither .meshkore/workflows/ nor the legacy
+        # .meshkore/protocols/ is present.
+        self.workflows_registry = WorkflowsRegistry(paths, self.hub)
+        # Back-compat alias for any internal caller still using the old name.
+        self.protocols_registry = self.workflows_registry
         # Standard §17 (ADI-01, py-1.14.7) — renders AGENT_INSTRUCTIONS.md
         # into CLAUDE.md/AGENTS.md/GEMINI.md (+ v19 Cursor/Cline targets).
         # Boot-syncs the per-CLI files + watches the source for edits; the

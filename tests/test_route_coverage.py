@@ -102,6 +102,7 @@ EXERCISE = [
     ("GET", "/context", True, {("==", "/context")}),
     ("GET", "/knowledge", True, {("==", "/knowledge")}),
     ("GET", "/links", True, {("==", "/links")}),
+    ("GET", "/workflows", True, {("==", "/workflows")}),
     ("GET", "/protocols", True, {("==", "/protocols")}),
     ("GET", "/cron/list", True, {("==", "/cron/list")}),
     ("GET", "/debug/tail", True, {("==", "/debug/tail")}),
@@ -129,6 +130,7 @@ EXERCISE = [
     # /verify/shot with no ?path → 400 (proves wired without serving a file)
     ("GET", "/verify/shot", True, {("==", "/verify/shot")}),
     ("GET", "/links/__probe__", True, {("startswith", "/links/")}),
+    ("GET", "/workflows/__probe__", True, {("startswith", "/workflows/")}),
     ("GET", "/protocols/__probe__", True, {("startswith", "/protocols/")}),
     # ── POST, exact (auth → reaches the route table past the global gate) ──
     ("POST", "/chat/dispatch", True, {("==", "/chat/dispatch")}),

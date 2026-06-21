@@ -3,11 +3,12 @@
 DM-modularize-3 (py-1.14.5): two self-contained registry classes lifted
 verbatim from daemon.py. ``LinksRegistry`` parses/validates/serves
 ``.meshkore/public/links.yaml`` (module → local/prod/version);
-``ProtocolsRegistry`` indexes ``.meshkore/protocols/`` (reusable runbooks)
+``WorkflowsRegistry`` (in workflows.py, renamed from ProtocolsRegistry
+2026-06-21) indexes ``.meshkore/workflows/`` (reusable ordered runbooks)
 + their per-day logs. Zero daemon coupling — pure FS + parsing, fed only
 a ``Paths``. The YAML emitter (``_emit_links_yaml`` / ``_emit_scalar``)
 and ``_split_frontmatter`` travel with them; daemon.py re-imports
-``LinksRegistry`` / ``ProtocolsRegistry`` / ``_split_frontmatter``.
+``LinksRegistry`` / ``WorkflowsRegistry`` / ``_split_frontmatter``.
 
 Bundler note: imports shared helpers from utils/paths (stripped; resolved
 via the flat namespace)."""
@@ -246,13 +247,14 @@ def _emit_scalar(v: Any) -> str:
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Protocols registry — standard §14
+# Workflows registry — standard §14 (the class lives in workflows.py)
 #
-# `.meshkore/protocols/P<N>-<slug>.md` files are reusable runbooks for
-# multi-step work. The daemon parses frontmatter on boot and on file
-# change, serves the list at /protocols, individual bodies at
-# /protocols/<id>, recent run logs at /protocols/<id>/runs, and
-# broadcasts `protocols.updated` on the WS.
+# `.meshkore/workflows/W<N>-<slug>.md` files are reusable ordered runbooks for
+# multi-step work (legacy `protocols/P<N>-` still read). The daemon parses
+# frontmatter on boot and on file change, serves the list at /workflows,
+# individual bodies at /workflows/<id>, recent run logs at /workflows/<id>/runs,
+# and broadcasts `workflows.updated` on the WS (`/protocols*` + `protocols.updated`
+# kept as deprecated aliases).
 
 
 def _split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:

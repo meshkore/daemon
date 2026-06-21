@@ -51,7 +51,7 @@ MODULES = [
     "cluster.py",
     "hub.py",
     "registries.py",
-    "protocols.py",
+    "workflows.py",
     "statebuild.py",
     "state.py",
     "render.py",

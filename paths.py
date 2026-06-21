@@ -27,7 +27,12 @@ class Paths:
         # Standard §13 — deployment links registry. Optional file; the
         # registry treats a missing file as { version: 1, modules: [] }.
         self.links_yaml = self.public / "links.yaml"
-        # Standard §14 — protocols (reusable multi-scope runbooks).
+        # Standard §14 — workflows (reusable multi-scope ordered runbooks;
+        # renamed from "protocols" 2026-06-21 — "protocol" is reserved for
+        # agent-comms standards A2A/MCP). Legacy `protocols_*` kept for the
+        # back-compat read in WorkflowsRegistry until every cluster migrates.
+        self.workflows_dir = self.meshkore / "workflows"
+        self.workflows_log = self.workflows_dir / "log"
         self.protocols_dir = self.meshkore / "protocols"
         self.protocols_log = self.protocols_dir / "log"
         self.credentials = self.meshkore / "credentials"

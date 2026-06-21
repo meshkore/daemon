@@ -403,19 +403,25 @@ def route_get(self, daemon):  # noqa: N802
         if entry is None:
             return self._json(404, {"error": "module not in links.yaml", "id": mid})
         return self._json(200, entry)
-    # Standard §14 — protocols registry.
-    if p == "/protocols":
-        daemon.protocols_registry.reload()
-        return self._json(200, {"protocols": daemon.protocols_registry.list()})
-    if p.startswith("/protocols/"):
-        rest = urllib.parse.unquote(p[len("/protocols/") :]).strip("/")
+    # Standard §14 — workflows registry (renamed from "protocols" 2026-06-21).
+    # `/workflows*` is canonical; `/protocols*` is kept as a deprecated alias so
+    # an un-updated cockpit keeps working during the rename. Both return the
+    # same payload; the list key is duplicated ("workflows" + "protocols") for
+    # the same reason.
+    if p == "/workflows" or p == "/protocols":
+        daemon.workflows_registry.reload()
+        items = daemon.workflows_registry.list()
+        return self._json(200, {"workflows": items, "protocols": items})
+    if p.startswith("/workflows/") or p.startswith("/protocols/"):
+        prefix = "/workflows/" if p.startswith("/workflows/") else "/protocols/"
+        rest = urllib.parse.unquote(p[len(prefix) :]).strip("/")
         if not rest:
-            return self._json(400, {"error": "protocol id required"})
+            return self._json(400, {"error": "workflow id required"})
         if rest.endswith("/runs"):
-            pid = rest[: -len("/runs")]
-            return self._json(200, {"runs": daemon.protocols_registry.runs(pid)})
-        proto = daemon.protocols_registry.get(rest)
-        if proto is None:
-            return self._json(404, {"error": "protocol not found", "id": rest})
-        return self._json(200, proto)
+            wid = rest[: -len("/runs")]
+            return self._json(200, {"runs": daemon.workflows_registry.runs(wid)})
+        wf = daemon.workflows_registry.get(rest)
+        if wf is None:
+            return self._json(404, {"error": "workflow not found", "id": rest})
+        return self._json(200, wf)
     return self._json(404, {"error": "unknown route", "path": p})
