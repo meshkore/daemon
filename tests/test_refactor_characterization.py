@@ -54,25 +54,25 @@ import daemon as d  # type: ignore[import-not-found]  # noqa: E402
 # changed (terse continuous EVENT FEED + "don't echo the wake plumbing" + 2-3
 # line finish summary), so only that one agent type's hash shifts here.
 BRIEFING_GOLDEN_EMPTY = {
-    "audit": "19c6da151d595b8c691d5eda380498eb956c1bc1a2f4a7dc996dd67990d08738",
-    "custom": "0540a53fee8156e0a6bdfb529f3d04108b1ecc5008166937c27e0eb15396b17a",
-    "db": "f813ec5dfec9d620b2c78087bc18bf229250118d120dee9e0b2fccfc79e8ffe5",
-    "deploy": "195602a77604276713d4ac0ad2bab8352d461ee066fa9419c8cec9ad8e327e4c",
-    "docs": "051d5d57192ac9ad07a309ed87a04cb4db7092c0b67beb7ba9c0337dde1c8e1c",
-    "review": "62b072048b78525d957ec1025d04cb32a366114f28ff820b1fbfe30b80f2d163",
-    "roadmap-architect": "4c015e7977158babbac5cb1bcfa35f715805a4abfdeefaac89bd944a9ce137dc",
-    "testing": "7747973aa1e8e71b5086efdc342b8d48c6047514eb009f4f5037e7fd2437641f",
+    "audit": "51bba2736e6840b99cf6b3abcb9a74befeff1088ad3851972c627ffd5274ce24",
+    "custom": "640dd4850daadbf7ab72fa99816b86127451efdc3ad286e0f8b6647fa8130128",
+    "db": "e0ff0cf23573e5364880511a009bc9fcb5b42eff2b936155a57b00c8bafe75fc",
+    "deploy": "fede154684b37f59c1f78cc0fef7459fd0a79ad46878772114521fc0ce20f62f",
+    "docs": "bc44f0f02e026e63bea112ea3785c0cd16ba07e5bdb534854b1a1f91f429ef01",
+    "review": "8d72692660d40fdc4963a4d9d9b79ebd931eecaea082ce29372b87cd32815e0f",
+    "roadmap-architect": "f9543661205be28418ab44da7b45d14991298a95c34c8cb05e5afa46ab2837bb",
+    "testing": "0f2000a0486303a0fa78d8aa713ac52c81444aafc219d7e83267b03884658fe2",
 }
 
 BRIEFING_GOLDEN_POPULATED = {
-    "audit": "af24747067e5c22bf9dbd628652be81806983e25d96f88be36d2e09004a0798a",
-    "custom": "78d87f558e4787f2f0dee4925eeb4259ebd4a9bf5d5fd00675608e805d2410a5",
-    "db": "d7b9cd45935986e4f25a7a630bcbf30962a18dff85fecb0121754c9c52c5a9b8",
-    "deploy": "6a0ad9f4a96ebe5e6606a0ade2a56429514c494322e7debb896a7a0444a44f5e",
-    "docs": "d632f30703fb31b1d60fc7d4928a7e0536a0c4477c07e40b82c94e8da6ed9166",
-    "review": "4d101e3a271bbc14fa189e3c591cab748981728d68ee6dab45beb15285b6b928",
-    "roadmap-architect": "4aa15762ecb9e53bfc7302fb8ed3918eb41a3e1ac0cb289501c5a2cac75a8af5",
-    "testing": "b2467d6099c0c99d3ed209f07c03c43a36879fb5784b9341c3d09635356a7d92",
+    "audit": "59716a27058fab6aab8fe5458feb1a5f0803005e9ba02eeed3e8860efc8ec425",
+    "custom": "8610769be359ab5ce4724c716d688140aa4aab11a71c1b3f89d2847fb598b2b0",
+    "db": "d297e8e3393ae7fee92c7871c5c6641ed65d18e58233112325f8233f2fbda207",
+    "deploy": "a3f396501315cbc0d1585e1fa5c560f069d9b8189bb376953d49865d1a4e07cf",
+    "docs": "754e345aa69e0c4df65074b9044e4c7035678a8b01ccb958b0458e60dd80c451",
+    "review": "98a415ab2cb38b1ee0d614b0b6f3f3664b6b520254f0224432e60b53cb47778a",
+    "roadmap-architect": "dd002ba337577a1458b8f8b72fd418f827da3c60c2ec588b0c8fd640706a8ea0",
+    "testing": "7a8af13b276bac9c9cf4a80aa9292b91868c2ceea609da8627a615af1680e442",
 }
 
 AGENT_KEYS_GOLDEN = [
