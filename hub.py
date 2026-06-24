@@ -144,3 +144,30 @@ class Hub:
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(HEARTBEAT_SEC):
             self.broadcast({"type": "heartbeat", "ts": _iso_now()})
+
+
+class ProjectHub:
+    """A per-project view of the one global Hub (DC-6, daemon-centralized).
+
+    Each per-project component (state_manager, runs, cron, the registries, the
+    ChatRunner …) broadcasts through one of these instead of the raw Hub, so
+    every event is auto-tagged with its ``project_id``. The single WS
+    connection then carries events for all projects and the cockpit routes them
+    (its event-bus already filters by cluster). Any non-broadcast attribute
+    (add / remove / shutdown / _clients …) delegates straight to the real Hub.
+    """
+
+    __slots__ = ("_hub", "_project_id")
+
+    def __init__(self, hub: "Hub", project_id: str) -> None:
+        self._hub = hub
+        self._project_id = project_id
+
+    def broadcast(self, event: Dict[str, Any]) -> None:
+        if isinstance(event, dict) and event.get("project_id") is None:
+            event = {**event, "project_id": self._project_id}
+        self._hub.broadcast(event)
+
+    def __getattr__(self, name: str) -> Any:
+        # Everything that isn't an explicit slot/method here → the real Hub.
+        return getattr(self._hub, name)

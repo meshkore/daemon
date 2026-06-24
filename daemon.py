@@ -266,7 +266,10 @@ class Daemon(
         self._req_local = threading.local()
 
         # ── GLOBAL services (one per machine; NOT per-project) ──────────
-        self.hub = Hub()
+        # DC-6 — the ONE real Hub. `daemon.hub` (property below) returns a
+        # per-project stamping view of it, so every broadcast is tagged with
+        # the current request's project_id.
+        self._global_hub = Hub()
         self.identity = identity or _detect_identity(paths) or _hostname_default()
         self.token = _ensure_token(paths)
         # DC-3 — machine-global ledger (ideas, projects.json, external creds /
@@ -282,10 +285,10 @@ class Daemon(
         # capable (DC-5 registers more; DC-4 resolves per request). The
         # aliases below keep every mixin reading `self.<attr>` unchanged.
         self._registry = ProjectRegistry(
-            hub=self.hub, identity=self.identity, daemon=self
+            hub=self._global_hub, identity=self.identity, daemon=self
         )
         boot_ctx = ProjectContext(
-            paths, hub=self.hub, identity=self.identity, daemon=self
+            paths, hub=self._global_hub, identity=self.identity, daemon=self
         )
         # Key the boot project by its cluster id (its stable project_id).
         self._registry.add_built(boot_ctx.cluster.id, boot_ctx, default=True)
@@ -332,6 +335,14 @@ class Daemon(
         pid = getattr(self._req_local, "project_id", None)
         ctx = self._registry.get(pid)
         return ctx if ctx is not None else self._ctx
+
+    @property
+    def hub(self):
+        # DC-6 — a per-project stamping view of the one real Hub (self._global_hub).
+        # Daemon-level broadcasts + the ChatRunner (which captures daemon.hub at
+        # spawn) get tagged with the current request's project_id; add/remove/
+        # shutdown delegate to the real Hub via ProjectHub.__getattr__.
+        return self._resolve_ctx().project_hub
 
     @property
     def paths(self):

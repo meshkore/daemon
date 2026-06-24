@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 from cluster import Cluster
+from hub import ProjectHub
 from state import StateManager
 from chat import ChatSessions
 from chatqueue import ChatQueueManager
@@ -65,16 +66,23 @@ class ProjectContext:
         except Exception as e:  # noqa: BLE001 — migration is best-effort
             _log(f"daemon-block migration skipped: {e}")
 
-        self.state_manager = StateManager(paths, self.cluster, hub)
+        # DC-6 — every per-project component broadcasts through this proxy, so
+        # each event it emits is tagged with this project's id. The cockpit's
+        # single WS connection then carries (and routes) events for all
+        # projects. project_id = cluster.id (stable, portable).
+        self.project_hub = ProjectHub(hub, self.cluster.id)
+        phub = self.project_hub
+
+        self.state_manager = StateManager(paths, self.cluster, phub)
         # Backref for future cross-system reads (bound after both exist).
         self.state_manager.bind_daemon(daemon)
 
         self.chat_sessions = ChatSessions()
-        self.chat_queue_manager = ChatQueueManager(paths, hub)
+        self.chat_queue_manager = ChatQueueManager(paths, phub)
         self.upload_store = UploadStore(paths, self.cluster)
         self.storage_report = StorageReport(paths, self.cluster)
         self.quota = QuotaState(paths.runtime / "quota-state.json")
-        self.runs = RunStore(paths, hub)
+        self.runs = RunStore(paths, phub)
         self.chat_archive = ChatArchive(paths)
 
         # Archive retention: cluster.yaml `storage.retention_days` (0/absent
@@ -90,9 +98,9 @@ class ProjectContext:
             _retention_days = 0
         self.timeline_rotator = TimelineRotator(paths, delete_days=_retention_days)
 
-        self.links_registry = LinksRegistry(paths, hub)
-        self.workflows_registry = WorkflowsRegistry(paths, hub)
+        self.links_registry = LinksRegistry(paths, phub)
+        self.workflows_registry = WorkflowsRegistry(paths, phub)
         # Back-compat alias for callers still using the pre-2026-06-21 name.
         self.protocols_registry = self.workflows_registry
-        self.instructions_renderer = AgentInstructionsRenderer(paths, hub)
-        self.cron_scheduler = CronScheduler(paths, self.cluster, hub, identity)
+        self.instructions_renderer = AgentInstructionsRenderer(paths, phub)
+        self.cron_scheduler = CronScheduler(paths, self.cluster, phub, identity)
