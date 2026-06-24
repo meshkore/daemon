@@ -210,6 +210,15 @@ def make_handler(daemon: Any):
             # response → the cockpit sees a bare connection reset (000),
             # indistinguishable from "daemon dead". A client abort is
             # normal and stays quiet.
+            #
+            # DC-4 (daemon-centralized) — resolve the request's project from the
+            # `X-MeshKore-Project` header BEFORE dispatch so the per-project
+            # property accessors (daemon.paths/cluster/runs/…) hit the right
+            # ProjectContext, and clear it after. The same try/except is the
+            # per-request isolation boundary: one project's handler error is a
+            # 500 for that request, never a crash of the shared daemon or the
+            # other projects.
+            daemon._set_req_project(self.headers.get("X-MeshKore-Project"))
             try:
                 fn()
             except (BrokenPipeError, ConnectionResetError):
@@ -220,6 +229,8 @@ def make_handler(daemon: Any):
                     self._json(500, {"error": "internal daemon error", "verb": verb})
                 except Exception:
                     pass  # response already (partly) sent — nothing safe to do
+            finally:
+                daemon._clear_req_project()
 
         def do_GET(self):  # noqa: N802
             self._guard(self._do_GET, "GET")
@@ -272,6 +283,9 @@ def make_handler(daemon: Any):
             return route_post(self, daemon)
 
         def do_PUT(self):  # noqa: N802
+            self._guard(self._do_PUT, "PUT")
+
+        def _do_PUT(self):  # noqa: N802
             p, _ = self._path()
             if self._need_auth():
                 return
@@ -286,6 +300,9 @@ def make_handler(daemon: Any):
             return self._json(404, {"error": "not found", "path": p})
 
         def do_DELETE(self):  # noqa: N802
+            self._guard(self._do_DELETE, "DELETE")
+
+        def _do_DELETE(self):  # noqa: N802
             p, _ = self._path()
             if self._need_auth():
                 return

@@ -256,6 +256,12 @@ class Daemon(
         # the module-level DAEMON_VERSION (which in source-tree dev only
         # exists in daemon.py's namespace, not the sibling module's).
         self.daemon_version = DAEMON_VERSION
+        # DC-4 — per-request project selector. The HTTP dispatcher sets this
+        # from the `X-MeshKore-Project` header (per worker thread); the
+        # per-project @property accessors read it to resolve the right
+        # ProjectContext. Unset → the default/boot project (background threads,
+        # tests, single-project clusters).
+        self._req_local = threading.local()
 
         # ── GLOBAL services (one per machine; NOT per-project) ──────────
         self.hub = Hub()
@@ -291,25 +297,11 @@ class Daemon(
             yaml_port=self._ctx.cluster.architect_port,
         )
 
-        # Aliases → ProjectContext (temporary bridge; DC-4 switches handlers
-        # to `ctx.<attr>` and drops these).
-        ctx = self._ctx
-        self.paths = ctx.paths
-        self.cluster = ctx.cluster
-        self.state_manager = ctx.state_manager
-        self.chat_sessions = ctx.chat_sessions
-        self.chat_queue_manager = ctx.chat_queue_manager
-        self.upload_store = ctx.upload_store
-        self.storage_report = ctx.storage_report
-        self.quota = ctx.quota
-        self.runs = ctx.runs
-        self.chat_archive = ctx.chat_archive
-        self.timeline_rotator = ctx.timeline_rotator
-        self.links_registry = ctx.links_registry
-        self.workflows_registry = ctx.workflows_registry
-        self.protocols_registry = ctx.protocols_registry
-        self.instructions_renderer = ctx.instructions_renderer
-        self.cron_scheduler = ctx.cron_scheduler
+        # DC-4 — the per-project attributes (paths, cluster, runs, chat_sessions,
+        # …) are now @property on the class; each resolves the ProjectContext
+        # for the CURRENT request (set from the X-MeshKore-Project header), or
+        # the default/boot project when unset. No alias assignments here — see
+        # the property block below __init__.
 
         # ── runtime (global) ────────────────────────────────────────────
         self.stopping = threading.Event()
@@ -317,6 +309,88 @@ class Daemon(
         # D-TLS-01 — set by serve_forever once it knows whether the
         # bundle loaded. /health reports this; cockpit decides URL scheme.
         self.tls_enabled: bool = False
+
+    # ── DC-4: per-request project resolution ───────────────────────────
+    # The HTTP dispatcher calls _set_req_project() from the
+    # `X-MeshKore-Project` header before handling, and _clear_req_project()
+    # after. The per-project @property accessors below read the current
+    # context via _resolve_ctx(); unset / unknown id falls back to the
+    # default (boot) project, so single-project clusters, background threads
+    # and the existing test-suite behave exactly as before.
+    def _set_req_project(self, project_id: Optional[str]) -> None:
+        self._req_local.project_id = project_id
+
+    def _clear_req_project(self) -> None:
+        self._req_local.project_id = None
+
+    def _resolve_ctx(self) -> ProjectContext:
+        pid = getattr(self._req_local, "project_id", None)
+        ctx = self._registry.get(pid)
+        return ctx if ctx is not None else self._ctx
+
+    @property
+    def paths(self):
+        return self._resolve_ctx().paths
+
+    @property
+    def cluster(self):
+        return self._resolve_ctx().cluster
+
+    @property
+    def state_manager(self):
+        return self._resolve_ctx().state_manager
+
+    @property
+    def chat_sessions(self):
+        return self._resolve_ctx().chat_sessions
+
+    @property
+    def chat_queue_manager(self):
+        return self._resolve_ctx().chat_queue_manager
+
+    @property
+    def upload_store(self):
+        return self._resolve_ctx().upload_store
+
+    @property
+    def storage_report(self):
+        return self._resolve_ctx().storage_report
+
+    @property
+    def quota(self):
+        return self._resolve_ctx().quota
+
+    @property
+    def runs(self):
+        return self._resolve_ctx().runs
+
+    @property
+    def chat_archive(self):
+        return self._resolve_ctx().chat_archive
+
+    @property
+    def timeline_rotator(self):
+        return self._resolve_ctx().timeline_rotator
+
+    @property
+    def links_registry(self):
+        return self._resolve_ctx().links_registry
+
+    @property
+    def workflows_registry(self):
+        return self._resolve_ctx().workflows_registry
+
+    @property
+    def protocols_registry(self):
+        return self._resolve_ctx().protocols_registry
+
+    @property
+    def instructions_renderer(self):
+        return self._resolve_ctx().instructions_renderer
+
+    @property
+    def cron_scheduler(self):
+        return self._resolve_ctx().cron_scheduler
 
     # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
 
