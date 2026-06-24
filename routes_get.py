@@ -54,6 +54,43 @@ def route_get(self, daemon):  # noqa: N802
                 "ts": _iso_now(),
             },
         )
+    if p == "/auth/local-token":
+        # py-1.27.6 — LOCAL auto-unlock. Hands the daemon's bearer token to
+        # the SAME-ORIGIN cockpit page on this machine, so a local project
+        # never prompts the operator for a token (a token for your own
+        # machine is friction with no security value). Security: gated to
+        # EXACT cockpit origins (architect.meshkore.com / loopback) — NOT the
+        # broad CORS allowlist (no *.pages.dev). The daemon binds 127.0.0.1
+        # only, so the caller is already on this machine; a malicious WEBSITE
+        # gets a different Origin → refused + the browser can't read the
+        # response cross-origin anyway. Residual: on a SHARED multi-user host
+        # a non-browser process forging the Origin header could read it (same
+        # trust level as the mode-600 token file on a single-user box) — opt
+        # out with cluster.yaml `daemon.local_token_auto: false`. The future
+        # cloud daemon (different origin) never matches → the explicit token
+        # flow still applies there.
+        origin = self.headers.get("Origin") or ""
+        try:
+            host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+        except Exception:
+            host = ""
+        is_cockpit = host in (
+            "architect.meshkore.com",
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        )
+        dblock = (
+            daemon.cluster.data.get("daemon")
+            if isinstance(daemon.cluster.data, dict)
+            else None
+        )
+        disabled = isinstance(dblock, dict) and dblock.get("local_token_auto") is False
+        if not is_cockpit or disabled:
+            return self._json(
+                403, {"error": "local-token not available for this origin"}
+            )
+        return self._json(200, {"token": daemon.token})
     if p == "/state":
         return self._json(200, daemon.state_manager.state())
     # py-1.10.27 — Quota state read endpoint. Full per-key

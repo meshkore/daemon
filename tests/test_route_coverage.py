@@ -182,6 +182,10 @@ EXERCISE = [
 GUARD_ONLY = {
     ("==", "/shutdown"): "would stop the test daemon — auth gate proven separately",
     ("==", "/self-update"): "would fetch + swap the bundle over the network",
+    (
+        "==",
+        "/auth/local-token",
+    ): "origin-gated local auto-unlock — exercised in test_local_token.py",
 }
 
 _EXERCISED = set().union(*(c for _, _, _, c in EXERCISE)) if EXERCISE else set()
