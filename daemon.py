@@ -76,6 +76,7 @@ from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
 from verifysvc import VerifyMixin  # noqa: E402
 from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
+from registry import ProjectRegistry  # noqa: E402 — DC-2: project registry
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
     _ensure_token,
@@ -260,14 +261,22 @@ class Daemon(
         self.identity = identity or _detect_identity(paths) or _hostname_default()
         self.token = _ensure_token(paths)
 
-        # ── PER-PROJECT state (DC-1, initiative `daemon-centralized`) ───
-        # All the per-cluster stores now live in ProjectContext. The Daemon
-        # holds exactly ONE context today; DC-2 turns this into a registry
-        # keyed by project_id. The aliases below keep every mixin reading
-        # `self.<attr>` unchanged (bridge removed in DC-4).
-        self._ctx = ProjectContext(
+        # ── PER-PROJECT state (DC-1/DC-2, initiative `daemon-centralized`) ─
+        # Per-cluster stores live in ProjectContext; the Daemon keeps a
+        # ProjectRegistry of them keyed by project_id. Today exactly ONE
+        # project is registered (the boot cluster) and `self._ctx` points at
+        # it, so behaviour is identical — but the holder is multi-project
+        # capable (DC-5 registers more; DC-4 resolves per request). The
+        # aliases below keep every mixin reading `self.<attr>` unchanged.
+        self._registry = ProjectRegistry(
+            hub=self.hub, identity=self.identity, daemon=self
+        )
+        boot_ctx = ProjectContext(
             paths, hub=self.hub, identity=self.identity, daemon=self
         )
+        # Key the boot project by its cluster id (its stable project_id).
+        self._registry.add_built(boot_ctx.cluster.id, boot_ctx, default=True)
+        self._ctx = boot_ctx
 
         # Port depends on the (migrated + reloaded) cluster inside the ctx.
         self.port = _pick_port(

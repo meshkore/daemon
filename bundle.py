@@ -104,6 +104,7 @@ MODULES = [
     "verifysvc.py",
     "lifecycle.py",
     "projectctx.py",  # DC-1 — per-project state; after all its stores, before daemon.py
+    "registry.py",  # DC-2 — project registry; after projectctx, before daemon.py
 ]
 
 
