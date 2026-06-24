@@ -75,7 +75,7 @@ from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
 from verifysvc import VerifyMixin  # noqa: E402
-from state import StateManager  # noqa: E402
+from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
     _ensure_token,
@@ -87,8 +87,6 @@ from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + t
     _registry_read,
     _registry_write,
 )
-from chat import ChatSessions  # noqa: E402
-from cluster import Cluster  # noqa: E402
 from constants import (  # noqa: E402,F401 — leaf consts; re-exported for callers/tests
     DAEMON_VERSION,
     FS_POLL_SEC,
@@ -107,31 +105,44 @@ from prompts import (  # noqa: E402,F401 — F401: re-exported for callers/tests
     _agent_type_from_conv_slug,
     _agent_type_normalised,
 )
-from quota import QuotaState  # noqa: E402
-from workflows import WorkflowsRegistry  # noqa: E402
 from registries import (  # noqa: E402,F401 — F401: _split_frontmatter re-exported
-    LinksRegistry,
     _split_frontmatter,
 )
-from render import AgentInstructionsRenderer  # noqa: E402
 from runner import ChatRunner  # noqa: E402,F401 — re-exported as daemon.ChatRunner
 from runnerutil import (  # noqa: E402,F401 — _session_id_for_conv re-exported for tests
     _session_id_for_conv,
 )
-from runrotator import TimelineRotator  # noqa: E402
-from runs import RunStore  # noqa: E402
 from scaffold import ScaffoldError, scaffold_cluster  # noqa: E402
 from bootupdate import _boot_self_update_if_needed  # noqa: E402,F401
 from selfupdate import VersionWatcher  # noqa: E402,F401
-from chatqueue import ChatQueueManager  # noqa: E402
-from storage import ChatArchive, StorageReport  # noqa: E402
-from uploads import UploadStore  # noqa: E402
 from utils import (  # noqa: E402
     _iso_now,  # noqa: F401 — re-exported as daemon._iso_now for test_prompts
     _log,
     parse_frontmatter,  # noqa: F401 — re-exported for test_refactor_characterization
     parse_simple_yaml,  # noqa: F401 — re-exported for test_refactor_characterization
 )
+
+# DC-1 — these per-project classes are now CONSTRUCTED in projectctx.py, but
+# daemon.py keeps re-exporting them so `daemon.Cluster`, `daemon.RunStore`, …
+# stay valid attributes. Tests (`import daemon as d` → `d.Cluster`) and the
+# "re-exports keep call sites stable" rule (ARCHITECTURE.md) depend on this.
+from cluster import Cluster  # noqa: E402,F401 — re-exported (built in projectctx)
+from chat import ChatSessions  # noqa: E402,F401 — re-exported (built in projectctx)
+from state import StateManager  # noqa: E402,F401 — re-exported (built in projectctx)
+from quota import QuotaState  # noqa: E402,F401 — re-exported (built in projectctx)
+from runs import RunStore  # noqa: E402,F401 — re-exported (built in projectctx)
+from runrotator import TimelineRotator  # noqa: E402,F401 — re-exported (projectctx)
+from chatqueue import ChatQueueManager  # noqa: E402,F401 — re-exported (projectctx)
+from storage import (  # noqa: E402,F401 — re-exported (built in projectctx)
+    ChatArchive,
+    StorageReport,
+)
+from uploads import UploadStore  # noqa: E402,F401 — re-exported (built in projectctx)
+from workflows import WorkflowsRegistry  # noqa: E402,F401 — re-exported (projectctx)
+from render import (  # noqa: E402,F401 — re-exported (built in projectctx)
+    AgentInstructionsRenderer,
+)
+from registries import LinksRegistry  # noqa: E402,F401 — re-exported (projectctx)
 
 # ───────────────────────────────────────────────────────────────────────
 # Configuration
@@ -238,98 +249,55 @@ class Daemon(
     def __init__(
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
     ):
-        self.paths = paths
         # DM6 step 2 — instance-bound version so routes.py (and any other
         # extracted module) reads from `daemon.daemon_version` instead of
         # the module-level DAEMON_VERSION (which in source-tree dev only
         # exists in daemon.py's namespace, not the sibling module's).
         self.daemon_version = DAEMON_VERSION
-        self.cluster = Cluster(paths)
-        # py-1.2.0 — Standard v7 migration: write a default `daemon:`
-        # block into cluster.yaml if it's missing. Idempotent; quiet
-        # on success, no-op when the operator has already opted out
-        # by setting auto_update: false.
-        try:
-            _migrate_cluster_daemon_block(paths)
-            # Re-parse so self.cluster.data reflects the migration we
-            # just wrote.
-            self.cluster.reload()
-        except Exception as e:
-            _log(f"daemon-block migration skipped: {e}")
+
+        # ── GLOBAL services (one per machine; NOT per-project) ──────────
+        self.hub = Hub()
         self.identity = identity or _detect_identity(paths) or _hostname_default()
         self.token = _ensure_token(paths)
+
+        # ── PER-PROJECT state (DC-1, initiative `daemon-centralized`) ───
+        # All the per-cluster stores now live in ProjectContext. The Daemon
+        # holds exactly ONE context today; DC-2 turns this into a registry
+        # keyed by project_id. The aliases below keep every mixin reading
+        # `self.<attr>` unchanged (bridge removed in DC-4).
+        self._ctx = ProjectContext(
+            paths, hub=self.hub, identity=self.identity, daemon=self
+        )
+
+        # Port depends on the (migrated + reloaded) cluster inside the ctx.
         self.port = _pick_port(
             paths,
-            cluster_id=self.cluster.id,
+            cluster_id=self._ctx.cluster.id,
             cli_override=requested_port,
-            yaml_port=self.cluster.architect_port,
+            yaml_port=self._ctx.cluster.architect_port,
         )
-        self.hub = Hub()
-        self.state_manager = StateManager(paths, self.cluster, self.hub)
-        # StateManager keeps a daemon backref for future cross-system
-        # reads. Currently unused after the py-1.11.1 chat-state cleanup
-        # (chat data is no longer joined into /state). Bound here, after
-        # both objects exist.
-        self.state_manager.bind_daemon(self)
-        self.chat_sessions = ChatSessions()
-        # py-1.12.19 — Standard v16 chat-turn queue. Disk-backed FIFO
-        # per conv. Auto-flushed after each turn via
-        # `_maybe_flush_queue` invoked from ChatRunner's end-of-stream.
-        self.chat_queue_manager = ChatQueueManager(self.paths, self.hub)
-        # py-1.12.21 — chat attachment persistence + retention GC.
-        self.upload_store = UploadStore(self.paths, self.cluster)
-        # py-1.12.22 — Standard v22 storage reporting. Cached walk of
-        # the well-known .meshkore/ subtrees so the cockpit can render
-        # a capacity panel without re-`du`-ing on every poll.
-        self.storage_report = StorageReport(self.paths, self.cluster)
-        # py-1.10.27 — Persistent quota state. Replaces the in-memory
-        # `_agent_type_pauses` dict from py-1.10.26. State is keyed by
-        # `<platform>/<model>` (the "quota_key" from _agent_manifest)
-        # and survives daemon restart at .meshkore/.runtime/quota-state.json.
-        # Multiple agent_types that share platform+model share the pool.
-        self.quota = QuotaState(self.paths.runtime / "quota-state.json")
-        # py-1.10.0 — server-side story-run coordinator. Owns the
-        # initiative ↔ conv ↔ agent ↔ task-list binding so play/stop
-        # has unambiguous identity and survives cockpit reload.
-        self.runs = RunStore(paths, self.hub)
-        # py-1.5.0 — persistent archive state (was cockpit-localStorage-only).
-        self.chat_archive = ChatArchive(paths)
-        # py-1.5.0 — background gzipper for .meshkore/timeline/*.jsonl
-        # older than 90 days. Keeps disk footprint bounded on long-running
-        # clusters; transparent to readers (gzip-aware).
-        # py-1.16.1 (D-STORE-RETENTION-01) — opt-in archive retention.
-        # cluster.yaml `storage.retention_days` (int) deletes archived
-        # timeline .gz that many days after rotation; absent/0 = keep
-        # forever (no surprise history deletion).
-        _storage_cfg = (
-            self.cluster.data.get("storage")
-            if isinstance(self.cluster.data, dict)
-            else None
-        )
-        try:
-            _retention_days = int((_storage_cfg or {}).get("retention_days") or 0)
-        except (TypeError, ValueError):
-            _retention_days = 0
-        self.timeline_rotator = TimelineRotator(paths, delete_days=_retention_days)
-        # Standard §13 — deployment links registry. Quiet no-op when
-        # .meshkore/public/links.yaml is absent.
-        self.links_registry = LinksRegistry(paths, self.hub)
-        # Standard §14 — workflows registry (renamed from protocols 2026-06-21).
-        # Quiet no-op when neither .meshkore/workflows/ nor the legacy
-        # .meshkore/protocols/ is present.
-        self.workflows_registry = WorkflowsRegistry(paths, self.hub)
-        # Back-compat alias for any internal caller still using the old name.
-        self.protocols_registry = self.workflows_registry
-        # Standard §17 (ADI-01, py-1.14.7) — renders AGENT_INSTRUCTIONS.md
-        # into CLAUDE.md/AGENTS.md/GEMINI.md (+ v19 Cursor/Cline targets).
-        # Boot-syncs the per-CLI files + watches the source for edits; the
-        # preamble itself is refreshed from the standard on the
-        # VersionWatcher tick (see VersionWatcher._loop).
-        self.instructions_renderer = AgentInstructionsRenderer(paths, self.hub)
-        # D-CRON-02..05: tick loop + runner; started in serve_forever()
-        self.cron_scheduler = CronScheduler(
-            paths, self.cluster, self.hub, self.identity
-        )
+
+        # Aliases → ProjectContext (temporary bridge; DC-4 switches handlers
+        # to `ctx.<attr>` and drops these).
+        ctx = self._ctx
+        self.paths = ctx.paths
+        self.cluster = ctx.cluster
+        self.state_manager = ctx.state_manager
+        self.chat_sessions = ctx.chat_sessions
+        self.chat_queue_manager = ctx.chat_queue_manager
+        self.upload_store = ctx.upload_store
+        self.storage_report = ctx.storage_report
+        self.quota = ctx.quota
+        self.runs = ctx.runs
+        self.chat_archive = ctx.chat_archive
+        self.timeline_rotator = ctx.timeline_rotator
+        self.links_registry = ctx.links_registry
+        self.workflows_registry = ctx.workflows_registry
+        self.protocols_registry = ctx.protocols_registry
+        self.instructions_renderer = ctx.instructions_renderer
+        self.cron_scheduler = ctx.cron_scheduler
+
+        # ── runtime (global) ────────────────────────────────────────────
         self.stopping = threading.Event()
         self.server: Optional[ThreadingHTTPServer] = None
         # D-TLS-01 — set by serve_forever once it knows whether the

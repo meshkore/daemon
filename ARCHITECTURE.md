@@ -81,6 +81,7 @@ behaviour:
 | `SelfUpdateMixin` (`selfupdatesvc`) | `self_update` (download + validate + swap) |
 | `WallsMixin` (`walls`) | `/initiative/walls` + `/initiative/reorder` (roadmap wall ordering) |
 | `StateManager` (`state.py`) | the FS-poll loop (a held object, not a mixin) |
+| `ProjectContext` (`projectctx.py`) | all PER-PROJECT state (paths, cluster, state_manager, runs, chat_sessions, queue, uploads, quota, registries, cron…) — a held object, not a mixin. DC-1 of `daemon-centralized`: the seam for one-daemon-many-projects. The Daemon holds one today (+ aliases `self.<attr> = ctx.<attr>`); DC-2 turns it into a registry keyed by project_id. GLOBAL services (hub, identity, token, port, http server, VersionWatcher) stay on the Daemon. |
 
 ### Layer 3 — composition root
 | module | owns |
