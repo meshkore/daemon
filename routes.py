@@ -137,34 +137,52 @@ def make_handler(daemon: Any):
             self._json(401, {"error": "unauthorized"})
             return True
 
+        def _allowed_origin(self) -> Optional[str]:
+            """Reflect the request Origin only if it's a MeshKore cockpit
+            surface or a loopback dev server. Returns the origin to echo,
+            or None (→ omit Allow-Origin so the browser blocks the
+            cross-origin read). py-1.27.4 — replaces the blanket `*`."""
+            origin = self.headers.get("Origin")
+            if not origin:
+                return None
+            try:
+                host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+            except Exception:
+                return None
+            if (
+                host == "meshkore.com"
+                or host.endswith(".meshkore.com")  # architect., www., etc.
+                or host.endswith(".pages.dev")  # Cloudflare Pages previews
+                or host in ("localhost", "127.0.0.1", "::1")  # dev / diagnostic
+            ):
+                return origin
+            return None
+
         def _cors(self) -> None:
-            # The architect is served from architect.meshkore.com but
-            # talks to localhost. CORS-allow any origin since the bearer
-            # token gates the privileged routes.
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header(
-                "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
-            )
-            self.send_header(
-                "Access-Control-Allow-Headers", "Authorization, Content-Type"
-            )
-            # py-1.9.1 — Chrome's Local Network Access (LNA) preflight
-            # blocks any cross-origin request from a public-internet
-            # page (https://architect.meshkore.com) to a private
-            # address (localhost) unless this opt-in header is present.
-            # The canonical transport already routes around LNA via
-            # the daemon.meshkore.com TLS-loopback subdomain, but
-            # enabling it here lets the cockpit fall back to plain
-            # http://localhost:<port>/health as a diagnostic probe
-            # when the TLS handshake fails — that lets us distinguish
-            # "daemon dead" from "daemon alive but no TLS bundle".
-            self.send_header("Access-Control-Allow-Private-Network", "true")
-            # py-1.2.0 — Wire-version contract. The architect reads
-            # this header on every response so a stale daemon is
-            # detected without a separate /health round-trip. The
-            # Expose-Headers entry is required because Allow-Origin
-            # is `*` — without it, browser JS sees the response but
-            # cannot read this custom header.
+            # py-1.27.4 — reflect an ALLOWLISTED origin instead of `*`. The
+            # bearer token gates writes, but the OPEN read routes (/state,
+            # /agents, /info, /storage/usage) would otherwise be cross-origin
+            # readable by ANY website the operator visits while the daemon
+            # runs (project state / agent roster / storage leak). We now
+            # reflect only the cockpit origins (*.meshkore.com + CF previews)
+            # and loopback; everything else gets NO Allow-Origin, so the
+            # browser blocks the read. Same-origin / non-browser callers
+            # (no Origin header) are unaffected — local CLI tools still work.
+            allowed = self._allowed_origin()
+            if allowed:
+                self.send_header("Access-Control-Allow-Origin", allowed)
+                self.send_header("Vary", "Origin")
+                self.send_header(
+                    "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+                )
+                self.send_header(
+                    "Access-Control-Allow-Headers", "Authorization, Content-Type"
+                )
+                # py-1.9.1 — Chrome Local Network Access preflight opt-in, so
+                # the cockpit's plain-http://localhost diagnostic probe works.
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+            # Wire-version contract (py-1.2.0) — always present so a stale
+            # daemon is detected without a separate /health round-trip.
             self.send_header("X-MeshKore-Daemon-Version", daemon.daemon_version)
             self.send_header(
                 "Access-Control-Expose-Headers", "X-MeshKore-Daemon-Version"

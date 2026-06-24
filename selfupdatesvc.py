@@ -9,6 +9,7 @@ import os
 import threading
 from typing import Any, Dict, Tuple
 
+from bootupdate import verify_release_bundle
 from constants import DAEMON_VERSION
 from utils import _iso_now, _log
 
@@ -104,6 +105,27 @@ class SelfUpdateMixin:
                 pass
             return 500, {
                 "error": "download does not look like a MeshKore daemon (no DAEMON_VERSION marker)",
+                "url": url,
+            }
+        # 4.5. Cryptographic gate (py-1.27.5) — verify the detached Ed25519
+        #      signature against the pinned release key before swapping. A
+        #      CDN compromise / MITM that can't sign with the operator's
+        #      off-CDN private key is refused here; the running daemon is
+        #      left untouched.
+        sig_err = verify_release_bundle(
+            payload,
+            url,
+            timeout=10,
+            ua=f"meshcore-py/{DAEMON_VERSION} self-update-sig",
+        )
+        if sig_err:
+            try:
+                new_path.unlink()
+            except Exception:
+                pass
+            return 500, {
+                "error": "release signature verification failed — running daemon untouched",
+                "detail": sig_err,
                 "url": url,
             }
         # 5. Backup current binary so the operator can roll back.

@@ -12,6 +12,12 @@
 *.log
 logs/
 
+# Release signing — the Ed25519 PRIVATE seed used to sign daemon bundles.
+# NEVER commit, NEVER serve from the CDN (the daemon pins only the PUBLIC
+# key in constants.RELEASE_PUBKEY_HEX). Losing this = mint a new keypair +
+# re-pin the pubkey; leaking it = an attacker can sign malicious updates.
+.release-signing-key
+
 # Python
 __pycache__/
 *.pyc

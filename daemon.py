@@ -12,6 +12,13 @@ No pip, no venv, no Node. Designed for any Python ≥ 3.8 on macOS / Linux
 
     python3 .meshkore/scripts/daemon.py
 
+To scaffold a brand-new cluster authoritatively (folder layout +
+cluster.yaml + AGENT_INSTRUCTIONS + per-CLI files + starter task +
+.gitignore, all matching the standard version this daemon targets), run
+once before the first launch:
+
+    python3 .meshkore/scripts/daemon.py init --name "My Project" [--desc "…"] [--id slug] [--force]
+
 Distinguishing properties (vs the legacy meshcore binary):
 
 - Stdlib only — works on locked-down corporate machines that block
@@ -113,6 +120,7 @@ from runnerutil import (  # noqa: E402,F401 — _session_id_for_conv re-exported
 )
 from runrotator import TimelineRotator  # noqa: E402
 from runs import RunStore  # noqa: E402
+from scaffold import ScaffoldError, scaffold_cluster  # noqa: E402
 from bootupdate import _boot_self_update_if_needed  # noqa: E402,F401
 from selfupdate import VersionWatcher  # noqa: E402,F401
 from chatqueue import ChatQueueManager  # noqa: E402
@@ -411,7 +419,20 @@ class Daemon(
 
 
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"identity": None, "port": None, "root": None}
+    out: Dict[str, Any] = {
+        "cmd": "serve",
+        "identity": None,
+        "port": None,
+        "root": None,
+        "name": None,
+        "id": None,
+        "desc": None,
+        "force": False,
+    }
+    # Leading `init` subcommand — authoritative first-boot scaffolder.
+    if argv and argv[0] == "init":
+        out["cmd"] = "init"
+        argv = argv[1:]
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -433,6 +454,23 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
             out["root"] = Path(argv[i + 1])
             i += 2
             continue
+        # `init`-only flags
+        if a == "--name":
+            out["name"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--id":
+            out["id"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--desc":
+            out["desc"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--force":
+            out["force"] = True
+            i += 1
+            continue
         # Positional default = root
         if not out["root"]:
             out["root"] = Path(a)
@@ -447,14 +485,59 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
 
 def main() -> None:
     args = _parse_args(sys.argv[1:])
-    paths = Paths(args["root"])
-    if not paths.meshkore.exists():
-        raise SystemExit(
-            f"\n .meshkore/ not found at {paths.meshkore}."
-            "\n   Run this script from a repo that already has a .meshkore/ tree,"
-            "\n   or pass --root <path>. See https://meshkore.com/standard for"
-            "\n   the canonical layout.\n"
+
+    # `init` — authoritative first-boot scaffolder. Runs BEFORE the
+    # `.meshkore/` existence guard (the whole point is the tree may not
+    # exist yet) and exits without starting the listener. The operator's
+    # launch command boots the daemon normally afterwards.
+    if args["cmd"] == "init":
+        name = args["name"] or args["root"].resolve().name
+        try:
+            paths = scaffold_cluster(
+                args["root"],
+                name,
+                description=args["desc"],
+                cluster_id=args["id"],
+                force=args["force"],
+            )
+        except ScaffoldError as e:
+            # Already scaffolded + no --force → GRACEFUL no-op (exit 0), so the
+            # operator's "init … ; launch" one-liner is safe to paste twice and
+            # a chained `&&` launch isn't broken by a non-zero exit. This is
+            # what kills the old "do you want --force?" question.
+            print(f"\n✓ Cluster already scaffolded — skipping init ({e}).\n")
+            raise SystemExit(0)
+        print(
+            f"\n✓ MeshKore cluster scaffolded at {paths.meshkore}"
+            f"\n  Launch the daemon from the repo root:"
+            f"\n    python3 .meshkore/scripts/daemon.py\n"
         )
+        raise SystemExit(0)
+
+    paths = Paths(args["root"])
+    # Auto-scaffold on first boot (py-1.27.2). A project where the coding
+    # agent DOWNLOADED the daemon (`.meshkore/scripts/`) but never ran `init`
+    # has a `.meshkore/` dir yet no `cluster.yaml`. Rather than error, finish
+    # the scaffold here so the operator's SINGLE launch command bootstraps
+    # everything — the agent only ever runs `curl` (no executing downloaded
+    # code → no agent safety prompt). The display name defaults to the folder
+    # name; the operator can refine it in cluster.yaml. If `.meshkore/` does
+    # not exist AT ALL, we're being run from the wrong directory → refuse
+    # (don't scatter a cluster into a random folder).
+    if not paths.cluster_yaml.exists():
+        if paths.meshkore.exists():
+            _log("first boot: cluster.yaml absent — auto-scaffolding cluster")
+            try:
+                scaffold_cluster(args["root"], args["root"].resolve().name)
+            except ScaffoldError:
+                pass  # raced with another writer; cluster.yaml now present
+        else:
+            raise SystemExit(
+                f"\n .meshkore/ not found at {paths.meshkore}."
+                "\n   Run this script from a repo that already has a .meshkore/ tree"
+                "\n   (or where the daemon was downloaded to .meshkore/scripts/),"
+                "\n   or pass --root <path>. See https://meshkore.com/standard.\n"
+            )
     # py-1.10.22 — Boot self-update. Pulls auto_update_source from the
     # CDN before the listener opens; if the CDN serves a newer
     # DAEMON_VERSION, atomic-swaps daemon.py and re-execs us. This is

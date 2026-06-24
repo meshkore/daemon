@@ -13,11 +13,51 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from constants import DAEMON_VERSION
+from constants import DAEMON_VERSION, RELEASE_PUBKEY_HEX
+from crypto_ed25519 import ed25519_verify
 from paths import Paths
 from utils import _iso_now, _log, parse_simple_yaml
 
 _BOOT_PROBE_THROTTLE_SECS = 60  # don't hit the CDN more than 1×/min
+
+
+def verify_release_bundle(
+    payload: bytes, daemon_url: str, *, timeout: float, ua: str
+) -> Optional[str]:
+    """Verify a downloaded daemon bundle's detached Ed25519 signature against
+    the pinned ``constants.RELEASE_PUBKEY_HEX`` (py-1.27.5). The signature is
+    fetched from ``<daemon_url>.sig`` (base64). Returns None when the update
+    may proceed (signature valid, OR enforcement disabled by an empty pinned
+    key); returns a short reason string when the update MUST be refused
+    (signature missing / malformed / not matching). This is what makes
+    auto-update safe against a CDN compromise or MITM: an attacker who can't
+    sign with the operator's off-CDN private key cannot get a build swapped in.
+
+    Both update paths (boot + HTTP /self-update) call this BEFORE the swap, so
+    a refusal simply keeps the current, already-trusted daemon running."""
+    pub_hex = (RELEASE_PUBKEY_HEX or "").strip()
+    if not pub_hex:
+        return None  # enforcement disabled (empty pinned key)
+    import base64
+    import urllib.request
+
+    sig_url = daemon_url + ".sig"
+    try:
+        req = urllib.request.Request(sig_url, headers={"User-Agent": ua})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            sig_raw = r.read(4096).decode("ascii", "replace").strip()
+    except Exception as e:
+        return f"signature unavailable at {sig_url} ({e})"
+    try:
+        sig = base64.b64decode(sig_raw)
+        pub = bytes.fromhex(pub_hex)
+    except Exception as e:
+        return f"signature/pubkey decode failed ({e})"
+    if not ed25519_verify(pub, payload, sig):
+        return "signature does not verify against the pinned release key"
+    return None
+
+
 _BOOT_PROBE_TIMEOUT_SECS = 4  # boot must never hang waiting on CDN
 _BOOT_BACKUPS_TO_KEEP = 3  # daemon.py.bak, .bak.1, .bak.2
 
@@ -150,8 +190,23 @@ def _boot_self_update_if_needed(paths: Paths, args: Dict[str, Any]) -> None:
         _log(f"boot self-update: no update (CDN={new_version}, local={DAEMON_VERSION})")
         _boot_update_stamp(paths, outcome=f"no-update (cdn={new_version})")
         return
+    # Cryptographic gate (py-1.27.5) — refuse to swap to an unsigned/forged
+    # build even if it's "newer". A compromised CDN can't sign with the
+    # operator's off-CDN key, so this keeps the trusted daemon running.
+    sig_err = verify_release_bundle(
+        payload,
+        url,
+        timeout=_BOOT_PROBE_TIMEOUT_SECS,
+        ua=f"meshcore-py/{DAEMON_VERSION} boot-sig",
+    )
+    if sig_err:
+        _log(
+            f"boot self-update: REFUSED unsigned/invalid build — {sig_err} (keeping {DAEMON_VERSION})"
+        )
+        _boot_update_stamp(paths, outcome=f"sig-refused: {sig_err}"[:120])
+        return
     _log(
-        f"boot self-update: CDN serves {new_version}, we are "
+        f"boot self-update: CDN serves {new_version} (signature OK), we are "
         f"{DAEMON_VERSION} — swapping + re-exec"
     )
     scripts_dir = paths.scripts_dir

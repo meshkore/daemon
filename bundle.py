@@ -42,6 +42,7 @@ OUT = DIST / "daemon.py"
 MODULES = [
     "constants.py",
     "paths.py",
+    "crypto_ed25519.py",
     "fsatomic.py",
     "timeutil.py",
     "yamlparse.py",
@@ -49,6 +50,7 @@ MODULES = [
     "utils.py",
     "debuglog.py",
     "cluster.py",
+    "scaffold.py",
     "hub.py",
     "registries.py",
     "workflows.py",
@@ -322,7 +324,42 @@ def bundle() -> Path:
     tls_link = DIST / "tls"
     if not tls_link.exists():
         tls_link.symlink_to(ROOT / "tls", target_is_directory=True)
+    _sign_bundle(OUT)
     return OUT
+
+
+def _sign_bundle(out_path: Path) -> None:
+    """Ed25519-sign the bundle so clusters can verify it before auto-updating
+    (py-1.27.5). Reads the PRIVATE seed from ``daemon/.release-signing-key``
+    (gitignored, never on the CDN), writes ``<bundle>.sig`` (base64) next to
+    the bundle. Publish BOTH files to the CDN — the daemon fetches
+    ``daemon.py.sig`` and verifies it against the pinned public key. A dev
+    build with no key is left unsigned (and a key-pinned cluster will refuse
+    to auto-update to it — that's the point)."""
+    key_file = ROOT / ".release-signing-key"
+    if not key_file.exists():
+        print(
+            "bundle.py: WARNING — daemon/.release-signing-key absent; bundle is "
+            "UNSIGNED. Key-pinned clusters will REFUSE to auto-update to it. "
+            "(Fine for local dev; NOT for a published release.)",
+            file=sys.stderr,
+        )
+        return
+    import base64
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from crypto_ed25519 import ed25519_publickey, ed25519_sign  # noqa: E402
+
+    seed = bytes.fromhex(key_file.read_text().strip())
+    pub = ed25519_publickey(seed)
+    sig = ed25519_sign(out_path.read_bytes(), seed, pub)
+    sig_path = out_path.with_name(out_path.name + ".sig")
+    sig_path.write_text(base64.b64encode(sig).decode("ascii") + "\n")
+    print(
+        f"bundle.py: signed → {sig_path.name} (release pubkey {pub.hex()[:16]}…)",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
