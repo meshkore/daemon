@@ -77,6 +77,7 @@ from selfupdatesvc import SelfUpdateMixin  # noqa: E402
 from verifysvc import VerifyMixin  # noqa: E402
 from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
 from registry import ProjectRegistry  # noqa: E402 — DC-2: project registry
+from globalledger import GlobalLedger  # noqa: E402 — DC-3: machine-global ledger
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
     _ensure_token,
@@ -260,6 +261,10 @@ class Daemon(
         self.hub = Hub()
         self.identity = identity or _detect_identity(paths) or _hostname_default()
         self.token = _ensure_token(paths)
+        # DC-3 — machine-global ledger (ideas, projects.json, external creds /
+        # agents). Lazy: resolves its root (~/.meshkore by default) but touches
+        # no disk until a write. NOT per-project.
+        self.global_ledger = GlobalLedger()
 
         # ── PER-PROJECT state (DC-1/DC-2, initiative `daemon-centralized`) ─
         # Per-cluster stores live in ProjectContext; the Daemon keeps a
