@@ -106,6 +106,7 @@ MODULES = [
     "projectctx.py",  # DC-1 — per-project state; after all its stores, before daemon.py
     "registry.py",  # DC-2 — project registry; after projectctx, before daemon.py
     "globalledger.py",  # DC-3 — machine-global ledger (deps: fsatomic, utils)
+    "projectsapi.py",  # DC-5 — /projects API mixin (deps: scaffold, paths, utils)
 ]
 
 

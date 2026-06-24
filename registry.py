@@ -83,9 +83,34 @@ class ProjectRegistry:
             self._ctxs[pid] = ctx
             return ctx
 
+    def register_root(self, root: Path, *, default: bool = False) -> str:
+        """DC-5 — build a context for `root` NOW and register it under its
+        cluster id (the stable, portable project_id). Returns that id."""
+        ctx = ProjectContext(
+            Paths(root),
+            hub=self._hub,
+            identity=self._identity,
+            daemon=self._daemon,
+        )
+        pid = ctx.cluster.id
+        with self._lock:
+            self._roots[pid] = ctx.paths.root
+            self._ctxs[pid] = ctx
+            if default or self.default_project_id is None:
+                self.default_project_id = pid
+        return pid
+
     def has(self, project_id: str) -> bool:
         with self._lock:
             return project_id in self._roots
+
+    def root_of(self, project_id: str) -> Optional[Path]:
+        with self._lock:
+            return self._roots.get(project_id)
+
+    def is_built(self, project_id: str) -> bool:
+        with self._lock:
+            return project_id in self._ctxs
 
     def unregister(self, project_id: str) -> bool:
         with self._lock:

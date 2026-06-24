@@ -78,6 +78,7 @@ from verifysvc import VerifyMixin  # noqa: E402
 from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
 from registry import ProjectRegistry  # noqa: E402 — DC-2: project registry
 from globalledger import GlobalLedger  # noqa: E402 — DC-3: machine-global ledger
+from projectsapi import ProjectsMixin  # noqa: E402 — DC-5: /projects API
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
     _ensure_token,
@@ -247,6 +248,7 @@ class Daemon(
     SelfUpdateMixin,
     VerifyMixin,
     WallsMixin,
+    ProjectsMixin,
 ):
     def __init__(
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
@@ -288,6 +290,9 @@ class Daemon(
         # Key the boot project by its cluster id (its stable project_id).
         self._registry.add_built(boot_ctx.cluster.id, boot_ctx, default=True)
         self._ctx = boot_ctx
+        # DC-5 — lazily register any ADDITIONAL projects from the global
+        # projects.json (read-only; writes nothing on boot).
+        self.rehydrate_projects()
 
         # Port depends on the (migrated + reloaded) cluster inside the ctx.
         self.port = _pick_port(

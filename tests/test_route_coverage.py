@@ -175,6 +175,13 @@ EXERCISE = [
     ("POST", "/links/__probe__", True, {("startswith", "/links/")}),
     ("POST", "/admission/__probe__", True, {("startswith", "/admission/")}),
     ("POST", "/credentials/probecred", True, {("startswith", "/credentials/")}),
+    # ── DC-5 (daemon-centralized) — global /projects API ──
+    # GET no-auth (boot discovery); POST {} → 400 path-required; DELETE of an
+    # unknown id → 404 unknown-project. All prove "wired" (none is the
+    # unknown-route fall-through).
+    ("GET", "/projects", False, {("==", "/projects")}),
+    ("POST", "/projects", True, {("==", "/projects")}),
+    ("DELETE", "/projects/__probe__", True, {("startswith", "/projects/")}),
 ]
 
 # Routes that exist in source but must NOT be invoked live (destructive).

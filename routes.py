@@ -310,6 +310,11 @@ def make_handler(daemon: Any):
                 name = p[len("/credentials/") :]
                 code, resp = daemon.credential_delete(name)
                 return self._json(code, resp)
+            # DC-5 (daemon-centralized) — GLOBAL: unregister a project (does
+            # NOT delete its ledger on disk).
+            if p.startswith("/projects/"):
+                pid = p[len("/projects/") :]
+                return self._json(*daemon.project_unregister(pid))
             # py-1.12.19 — Standard v16 queue: remove one item.
             #   DELETE /chat/conv/<id>/queue/<itemId>
             if p.startswith("/chat/conv/"):

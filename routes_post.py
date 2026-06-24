@@ -219,6 +219,10 @@ def route_post(self, daemon):  # noqa: N802
         )
 
     # U-DAEMON-04: task lifecycle.
+    # DC-5 (daemon-centralized) — GLOBAL: register a project by path
+    # (scaffolds .meshkore/ if absent). Auth-gated at the top of route_post.
+    if p == "/projects":
+        return self._json(*daemon.project_register(self._read_json_body()))
     if p == "/tasks":
         return self._json(*daemon.task_create(self._read_json_body()))
     if p.startswith("/tasks/") and p.endswith("/transition"):

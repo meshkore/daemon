@@ -151,6 +151,11 @@ def route_get(self, daemon):  # noqa: N802
         return self._json(200, {"ok": True, "generated_at": _iso_now()})
     if p == "/agents":
         return self._json(200, daemon.agents_listing())
+    # DC-5 (daemon-centralized) — GLOBAL: the projects this daemon serves.
+    # No auth (boot-time discovery, like /health); mutations (POST/DELETE)
+    # are gated.
+    if p == "/projects":
+        return self._json(*daemon.projects_list())
     if p == "/info":
         return self._json(200, daemon.info())
     # py-1.12.22 / Standard v22 — `.meshkore/` capacity report
