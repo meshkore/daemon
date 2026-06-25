@@ -256,6 +256,10 @@ def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Pop
     # D-TEST-ISO-01 — keep the sticky port registry in the test workdir so
     # the suite never writes the operator's real ~/.meshkore/ports.json.
     env["MESHKORE_PORTS_FILE"] = str(work / "ports.json")
+    # DC-3 — same isolation for the machine-global ledger (ideas, projects.json,
+    # external creds/agents). Without this, a `POST /projects` test would write
+    # the operator's real ~/.meshkore/. Per-test workdir → hermetic.
+    env["MESHKORE_GLOBAL_ROOT"] = str(work / "global-ledger")
     # Coverage in subprocess: tests/sitecustomize.py calls
     # coverage.process_startup() when COVERAGE_PROCESS_START is set. Adding
     # tests/ to PYTHONPATH gets sitecustomize.py imported automatically.
