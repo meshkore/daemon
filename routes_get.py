@@ -127,6 +127,11 @@ def route_get(self, daemon):  # noqa: N802
             tags=tags,
             min_level=lvl,
         )
+        # centralized/multi-project — optional ?project=<id> filter so the one
+        # debug stream can be sliced per project.
+        proj = (q.get("project") or "").strip()
+        if proj:
+            events = [e for e in events if e.get("project") == proj]
         return self._json(
             200,
             {

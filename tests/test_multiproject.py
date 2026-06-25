@@ -80,6 +80,38 @@ def test_register_isolate_unregister_second_project(daemon, tmp_path: Path) -> N
 
 
 @pytest.mark.cluster("populated")
+def test_debug_stream_is_project_tagged(daemon) -> None:
+    """Centralized multi-project debug: a cockpit-style POST /debug/log with the
+    X-MeshKore-Project header is tagged with that project and GET
+    /debug/tail?project=<id> slices the one stream per project."""
+    a_id = daemon.get("/projects").json()["default"]
+    r = daemon.post(
+        "/debug/log",
+        headers={**daemon.auth, "X-MeshKore-Project": a_id},
+        json={"events": [{"tag": "ws", "msg": "hello-from-cockpit", "lvl": "info"}]},
+    )
+    assert r.status_code == 200, r.text
+    # Tail filtered by THIS project shows the tagged entry.
+    r = daemon.get(
+        "/debug/tail",
+        headers=daemon.auth,
+        params={"project": a_id, "last": "120", "tag": "ws"},
+    )
+    assert r.status_code == 200, r.text
+    evs = r.json()["events"]
+    assert any(
+        e.get("project") == a_id and e.get("msg") == "hello-from-cockpit" for e in evs
+    ), evs
+    # Filtering by a DIFFERENT project excludes it.
+    r2 = daemon.get(
+        "/debug/tail",
+        headers=daemon.auth,
+        params={"project": "other-proj", "last": "120"},
+    )
+    assert not any(e.get("msg") == "hello-from-cockpit" for e in r2.json()["events"])
+
+
+@pytest.mark.cluster("populated")
 def test_register_requires_auth_and_valid_path(daemon, tmp_path: Path) -> None:
     # `Connection: close` on the early-reject probes: the global auth gate
     # returns 401 BEFORE draining the JSON body, which would misframe the next

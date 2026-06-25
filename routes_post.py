@@ -54,6 +54,9 @@ def route_post(self, daemon):  # noqa: N802
             conv = ev.get("conv")
             agent_id = ev.get("agent_id")
             data = ev.get("data") if isinstance(ev.get("data"), dict) else None
+            # Tag with the project: the event may name it, else the request's
+            # X-MeshKore-Project header (centralized multi-project debug).
+            project = ev.get("project") or self.headers.get("X-MeshKore-Project")
             get_debug_log().emit(
                 tag=tag,
                 msg=msg,
@@ -61,6 +64,7 @@ def route_post(self, daemon):  # noqa: N802
                 src="cockpit",
                 conv=(str(conv) if conv else None),
                 agent_id=(str(agent_id) if agent_id else None),
+                project=(str(project) if project else None),
                 data=data,
             )
             accepted += 1

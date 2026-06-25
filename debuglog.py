@@ -65,6 +65,7 @@ class DebugLog:
         src: str = "daemon",
         conv: Optional[str] = None,
         agent_id: Optional[str] = None,
+        project: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None,
     ) -> None:
         rec: Dict[str, Any] = {
@@ -74,6 +75,12 @@ class DebugLog:
             "tag": tag,
             "msg": msg,
         }
+        # centralized/multi-project — which project this entry belongs to (from
+        # the X-MeshKore-Project header on cockpit posts, or the daemon's
+        # request context). Lets the ONE centralized debug stream be filtered
+        # per project (GET /debug/tail?project=<id>).
+        if project:
+            rec["project"] = project
         if conv:
             rec["conv"] = conv
         if agent_id:
