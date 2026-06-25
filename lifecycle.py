@@ -134,7 +134,12 @@ class LifecycleMixin:
         )
         # D-CRON-02: start the scheduler. Ticks every 10s in a background
         # thread; cluster.yaml.crons jobs fire from here, no LaunchAgent.
-        self.cron_scheduler.start()
+        # OC-1 (daemon-centralized) — start cron for EVERY registered project,
+        # not just the default. Default mode = exactly one context (the boot
+        # project) → identical to before; multi-project / future server mode →
+        # each context's own scheduler. Empty registry → no-op (no crash).
+        for _ctx in self._registry.built_contexts():
+            _ctx.cron_scheduler.start()
         # py-1.10.27 — Quota prober. Wakes every 60s, probes paused
         # quota keys, unpauses (or extends pause) based on outcome.
         # Initiative `quota-aware-dispatch`.
@@ -158,7 +163,8 @@ class LifecycleMixin:
             self.server.serve_forever(poll_interval=0.5)
         finally:
             try:
-                self.cron_scheduler.stop()
+                for _ctx in self._registry.built_contexts():
+                    _ctx.cron_scheduler.stop()
             except Exception:
                 pass
             try:
