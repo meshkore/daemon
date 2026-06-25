@@ -176,7 +176,8 @@ def make_handler(daemon: Any):
                     "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
                 )
                 self.send_header(
-                    "Access-Control-Allow-Headers", "Authorization, Content-Type"
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, X-MeshKore-Project",
                 )
                 # py-1.9.1 — Chrome Local Network Access preflight opt-in, so
                 # the cockpit's plain-http://localhost diagnostic probe works.

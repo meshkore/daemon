@@ -112,6 +112,26 @@ def test_debug_stream_is_project_tagged(daemon) -> None:
 
 
 @pytest.mark.cluster("populated")
+def test_cors_allows_project_header(daemon) -> None:
+    """The cockpit sends X-MeshKore-Project on every request; if CORS doesn't
+    allow it, the browser preflight blocks EVERY cross-origin call (the
+    architect.meshkore.com → daemon failure seen 2026-06-25). A preflight from
+    an allowlisted origin must echo the header in Access-Control-Allow-Headers."""
+    r = daemon.client.request(
+        "OPTIONS",
+        daemon.base + "/state",
+        headers={
+            "Origin": "https://architect.meshkore.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-meshkore-project",
+            "Connection": "close",
+        },
+    )
+    allow = r.headers.get("access-control-allow-headers", "")
+    assert "x-meshkore-project" in allow.lower(), f"allow-headers={allow!r}"
+
+
+@pytest.mark.cluster("populated")
 def test_register_requires_auth_and_valid_path(daemon, tmp_path: Path) -> None:
     # `Connection: close` on the early-reject probes: the global auth gate
     # returns 401 BEFORE draining the JSON body, which would misframe the next
