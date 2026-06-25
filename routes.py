@@ -219,6 +219,21 @@ def make_handler(daemon: Any):
             # per-request isolation boundary: one project's handler error is a
             # 500 for that request, never a crash of the shared daemon or the
             # other projects.
+            # Drain + cache the request body UP-FRONT so an early-reject handler
+            # (401 unauth, 400 bad-input, 503 not-ready) never leaves it unread.
+            # On an HTTP/1.1 keep-alive socket an unread body makes the NEXT
+            # request parse the leftover bytes as its request line → "400 Bad
+            # request syntax" → the browser reports it as a CORS failure. The
+            # cockpit's debug-transport POSTs /debug/log before it holds a token
+            # (→401), so this bit hard the moment one daemon served the HTTPS
+            # cockpit. _read_json_body() now parses this cache. (daemon-centralized)
+            try:
+                _clen = int(self.headers.get("Content-Length") or 0)
+                self._raw_body = (
+                    self.rfile.read(_clen) if 0 < _clen <= MAX_BODY_BYTES else b""
+                )
+            except Exception:
+                self._raw_body = b""
             daemon._set_req_project(self.headers.get("X-MeshKore-Project"))
             try:
                 fn()
@@ -334,14 +349,15 @@ def make_handler(daemon: Any):
 
         # ── helpers used by do_POST handlers ───────────────────────────
         def _read_json_body(self) -> Dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY_BYTES:
+            # Parse the body that _guard already drained + cached on self._raw_body
+            # (NOT a fresh self.rfile.read — that would block, the bytes are gone).
+            raw = getattr(self, "_raw_body", b"")
+            if not raw:
                 return {}
             try:
-                raw = self.rfile.read(length).decode("utf-8")
-                data = json.loads(raw) if raw else {}
+                data = json.loads(raw.decode("utf-8"))
                 return data if isinstance(data, dict) else {}
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return {}
 
         # ── WebSocket handshake + run-loop ─────────────────────────────
