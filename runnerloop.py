@@ -17,6 +17,18 @@ from utils import _append_timeline, _debug_emit, _iso_now, _log
 class RunnerLoopMixin:
     def _reader_loop(self) -> None:
         assert self.proc and self.proc.stdout
+        # FC-2 (daemon-centralized) — this is a DEDICATED background thread that
+        # outlives the POST /chat/dispatch request, so the request threadlocal
+        # is already cleared. Re-bind this turn's project on THIS thread so every
+        # self.daemon.* callback below (record_usage, _maybe_wake_parent_architect,
+        # _persist_task_resolution, _handle_anchor*, _broadcast_conv_activity,
+        # chat_archive, _conv_meta_load) resolves to THIS project — not the
+        # default. Without this, project B's chat corrupts project A's roadmap/
+        # conv_meta/archive. self.paths/self.cluster/self.hub on the runner are
+        # already project-correct (captured at spawn); this fixes the daemon
+        # callbacks that resolve via the threadlocal.
+        if self._project_id and self.daemon is not None:
+            self.daemon._set_req_project(self._project_id)
         last_emit_at = 0.0
         result_text = ""
         for raw in self.proc.stdout:

@@ -50,10 +50,28 @@ class ChatSessionReaper:
 
     def _loop(self) -> None:
         while not self._stop.wait(self.TICK_SECS):
-            try:
-                self._sweep("tick")
-            except Exception as e:
-                _log(f"chat-reaper: tick failed ({e})")
+            # FC-2 (daemon-centralized) — sweep EVERY project's sessions, not
+            # just the default. Bind each project on this thread so
+            # self.daemon.chat_sessions / _flush_idle_chat_queues /
+            # _broadcast_conv_activity resolve to it. Without this, a stuck
+            # session in a non-default project is never reaped and its queue
+            # never idle-flushed (the conv looks dead forever).
+            reg = getattr(self.daemon, "_registry", None)
+            pids = (
+                [c.cluster.id for c in reg.built_contexts()]
+                if reg is not None
+                else [None]
+            )
+            for pid in pids:
+                try:
+                    if pid is not None:
+                        self.daemon._set_req_project(pid)
+                    self._sweep("tick")
+                except Exception as e:
+                    _log(f"chat-reaper: tick failed ({e})")
+                finally:
+                    if pid is not None:
+                        self.daemon._clear_req_project()
 
     def _sweep(self, source: str) -> None:
         # Phase 1: subprocess-died-without-done sweep.

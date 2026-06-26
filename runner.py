@@ -69,9 +69,16 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         daemon: Optional[Any] = None,
+        project_id: Optional[str] = None,
     ):
         self.paths = paths
         self.cluster = cluster
+        # FC-2 (daemon-centralized) — the project this turn belongs to. The
+        # reader-loop thread re-binds it (daemon._set_req_project) before any
+        # self.daemon.* callback, so anchor / conv_meta / architect-wake /
+        # task-resolution / usage / archive resolve to THIS project, not the
+        # default. Captured at spawn while the request threadlocal is still set.
+        self._project_id = project_id
         # MP1 (py-1.13.3) — Per-turn model preference. None / 'auto' →
         # claude-code uses its default; otherwise spawn injects
         # `--model <id>` into the argv.

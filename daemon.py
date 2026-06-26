@@ -336,6 +336,19 @@ class Daemon(
         ctx = self._registry.get(pid)
         return ctx if ctx is not None else self._ctx
 
+    def _current_project_id(self) -> Optional[str]:
+        # The EFFECTIVE project id for the current request/thread (the resolved
+        # one — header if known, else default). ASYNC workers (ChatRunner,
+        # reaper, quota prober) capture this at spawn and re-bind it on their
+        # own background thread via _set_req_project, so every self.<property>
+        # callback resolves to the originating project, not the default. This is
+        # the fix for the "chat for project B persisted into project A" bug:
+        # the threadlocal is request-scoped, but chat work outlives the request.
+        pid = getattr(self._req_local, "project_id", None)
+        if pid and self._registry.has(pid):
+            return pid
+        return self._registry.default_project_id
+
     @property
     def hub(self):
         # DC-6 — a per-project stamping view of the one real Hub (self._global_hub).

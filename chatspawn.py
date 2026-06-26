@@ -84,6 +84,13 @@ class ChatSpawnMixin:
             model=resolved_model,
             effort=resolved_effort,
             daemon=self,
+            # FC-2 (daemon-centralized) — capture the dispatch's project so the
+            # runner's BACKGROUND thread re-binds it before any self.daemon.*
+            # callback (anchor / conv_meta / architect-wake / task-resolution /
+            # usage / archive). Without this they persist into the DEFAULT
+            # project (the request threadlocal is cleared the instant POST
+            # /chat/dispatch returns 202).
+            project_id=self._current_project_id(),
         )
         runner.spawn()
         # Chained turns (auto-spawn when a queued prompt lands) inherit

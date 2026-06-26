@@ -56,14 +56,33 @@ class QuotaProber:
 
     def _loop(self) -> None:
         while not self._stop.wait(self.TICK_SECS):
-            try:
-                due = self.daemon.quota.keys_due_for_probe()
-                for key in due:
-                    if self._stop.is_set():
-                        break
-                    self._probe_one(key)
-            except Exception as e:
-                _log(f"quota-prober: tick failed ({e})")
+            # FC-2 (daemon-centralized) — probe paused quota in EVERY project,
+            # not just the default. Bind each project on this thread so
+            # self.daemon.quota / _spawn_chat_turn resolve to it (and the probe
+            # turn runs in the right cwd). Without this, a non-default project
+            # stays paused forever after one rate-limit.
+            reg = getattr(self.daemon, "_registry", None)
+            pids = (
+                [c.cluster.id for c in reg.built_contexts()]
+                if reg is not None
+                else [None]
+            )
+            for pid in pids:
+                if self._stop.is_set():
+                    break
+                try:
+                    if pid is not None:
+                        self.daemon._set_req_project(pid)
+                    due = self.daemon.quota.keys_due_for_probe()
+                    for key in due:
+                        if self._stop.is_set():
+                            break
+                        self._probe_one(key)
+                except Exception as e:
+                    _log(f"quota-prober: tick failed ({e})")
+                finally:
+                    if pid is not None:
+                        self.daemon._clear_req_project()
 
     def _probe_one(self, key: str) -> None:
         # Resolve an agent_type for this key (any type whose manifest

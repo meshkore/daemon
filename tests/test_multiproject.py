@@ -111,6 +111,89 @@ def test_debug_stream_is_project_tagged(daemon) -> None:
     assert not any(e.get("msg") == "hello-from-cockpit" for e in r2.json()["events"])
 
 
+_FAKE_CLAUDE = (
+    "#!/usr/bin/env python3\n"
+    "import sys, json\n"
+    "sys.stdin.read()\n"
+    'print(json.dumps({"type": "result", "result": "pong",\n'
+    '  "usage": {"input_tokens": 1, "output_tokens": 1,\n'
+    '            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}),\n'
+    "  flush=True)\n"
+)
+
+
+@pytest.mark.cluster("populated")
+def test_chat_dispatch_routes_to_its_project(daemon, tmp_path: Path) -> None:
+    """FC-2 regression — a chat dispatched with X-MeshKore-Project=B runs its
+    turn AND finalises into B, and does NOT leak into the default project A.
+    Exercises the dispatch → reader-loop (background thread) → finalise path
+    with a project header end-to-end (nothing else does)."""
+    binp = daemon.work / "bin" / "claude"
+    binp.write_text(_FAKE_CLAUDE)
+    binp.chmod(0o755)
+    b_root = tmp_path / "proj-b-chat"
+    b_root.mkdir(parents=True, exist_ok=True)
+    b_id = daemon.post(
+        "/projects", headers=daemon.auth, json={"path": str(b_root)}
+    ).json()["id"]
+    a_id = daemon.get("/projects").json()["default"]
+    assert b_id != a_id
+    conv = "route-b"
+    hb = {**daemon.auth, "X-MeshKore-Project": b_id}
+    ha = {**daemon.auth, "X-MeshKore-Project": a_id}
+
+    r = daemon.post("/chat/dispatch", headers=hb, json={"conv": conv, "text": "ping"})
+    assert r.status_code in (200, 202), r.text
+
+    import time as _t
+
+    final = None
+    for _ in range(80):
+        msgs = (
+            daemon.get(f"/chat/conv/{conv}/messages", headers=hb)
+            .json()
+            .get("messages", [])
+        )
+        final = next((m for m in msgs if m.get("type") == "chat.assistant.final"), None)
+        if final:
+            break
+        _t.sleep(0.25)
+    assert final, "no chat.assistant.final landed in project B"
+    # The conv must NOT exist in the default project A (no cross-project leak).
+    a_msgs = (
+        daemon.get(f"/chat/conv/{conv}/messages", headers=ha).json().get("messages", [])
+    )
+    assert not any(m.get("type") == "chat.assistant.final" for m in a_msgs), (
+        "conv leaked into the default project"
+    )
+
+
+@pytest.mark.cluster("populated")
+def test_state_is_project_isolated(daemon, tmp_path: Path) -> None:
+    """GET /state routes by header — A (populated) has initiatives, a freshly
+    registered B (empty scaffold) does not."""
+    b_root = tmp_path / "proj-b-state"
+    b_root.mkdir(parents=True, exist_ok=True)
+    b_id = daemon.post(
+        "/projects", headers=daemon.auth, json={"path": str(b_root)}
+    ).json()["id"]
+    a_id = daemon.get("/projects").json()["default"]
+    sa = daemon.get(
+        "/state", headers={**daemon.auth, "X-MeshKore-Project": a_id}
+    ).json()
+    sb = daemon.get(
+        "/state", headers={**daemon.auth, "X-MeshKore-Project": b_id}
+    ).json()
+    a_inits = len(
+        (sa.get("initiatives") or sa.get("roadmap", {}).get("initiatives") or [])
+    )
+    b_inits = len(
+        (sb.get("initiatives") or sb.get("roadmap", {}).get("initiatives") or [])
+    )
+    assert a_inits >= 1, f"default project A should have initiatives: {a_inits}"
+    assert b_inits == 0, f"fresh project B should have no initiatives: {b_inits}"
+
+
 @pytest.mark.cluster("populated")
 def test_cors_allows_project_header(daemon) -> None:
     """The cockpit sends X-MeshKore-Project on every request; if CORS doesn't
