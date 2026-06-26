@@ -11,6 +11,8 @@ import secrets
 import time
 from typing import List, Tuple
 
+from agent_types import _agent_manifest
+from contextpolicy import policy_for
 from utils import _append_timeline, _debug_emit, _iso_now, _log
 
 
@@ -213,6 +215,19 @@ class RunnerLoopMixin:
                     self.last_turn_usage,
                     self.last_turn_cost_usd,
                 )
+                # CTX1 (py-1.28.0) — context-window awareness. Resolve the
+                # per-PLATFORM policy from this agent type (claude-code knows
+                # its window + self-compacts; an unmodelled runtime gets a null
+                # policy — no gauge, no compaction claim). `describe()` turns
+                # this turn's prompt tokens into a fill ratio + a should_compact
+                # flag the cockpit paints as the context gauge / "will compact"
+                # hint. See contextpolicy.py for the headless-turn rationale.
+                platform = _agent_manifest(self.agent_type).get(
+                    "platform", "claude-code"
+                )
+                context_block = policy_for(platform).describe(
+                    self.last_turn_usage, self.model
+                )
                 self.hub.broadcast(
                     {
                         "type": "chat.usage",
@@ -224,6 +239,7 @@ class RunnerLoopMixin:
                         },
                         "total": cumulative,
                         "model": self.model,
+                        "context": context_block,
                         "ts": _iso_now(),
                     }
                 )

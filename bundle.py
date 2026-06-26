@@ -41,6 +41,7 @@ OUT = DIST / "daemon.py"
 # bundle stays one flat namespace.
 MODULES = [
     "constants.py",
+    "contextpolicy.py",
     "paths.py",
     "crypto_ed25519.py",
     "fsatomic.py",
