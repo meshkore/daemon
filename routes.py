@@ -234,7 +234,19 @@ def make_handler(daemon: Any):
                 )
             except Exception:
                 self._raw_body = b""
-            daemon._set_req_project(self.headers.get("X-MeshKore-Project"))
+            # Project resolution: prefer the X-MeshKore-Project header, but fall
+            # back to a ?project=<id> query param. The browser's <img> loader (and
+            # any raw URL: download links, anchor hrefs) CANNOT send a custom
+            # header, so chat-upload images would otherwise resolve against the
+            # default project and 404. (daemon-centralized FC-2)
+            _proj = self.headers.get("X-MeshKore-Project")
+            if not _proj:
+                try:
+                    _qs = urllib.parse.urlparse(self.path).query
+                    _proj = urllib.parse.parse_qs(_qs).get("project", [None])[0]
+                except Exception:
+                    _proj = None
+            daemon._set_req_project(_proj)
             try:
                 fn()
             except (BrokenPipeError, ConnectionResetError):

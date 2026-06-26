@@ -247,6 +247,39 @@ def test_server_home_never_appears_as_a_project(daemon, tmp_path: Path) -> None:
 
 
 @pytest.mark.cluster("populated")
+def test_uploads_route_by_query_project(daemon, tmp_path: Path) -> None:
+    """FC-2 — the browser's <img> loader can't send X-MeshKore-Project, so
+    GET /chat/uploads honours ?project=<id>. An image under project B is served
+    with ?project=B and NOT found under the default project A (no header)."""
+    b_root = tmp_path / "proj-b-upload"
+    b_root.mkdir(parents=True, exist_ok=True)
+    b_id = daemon.post(
+        "/projects", headers=daemon.auth, json={"path": str(b_root)}
+    ).json()["id"]
+    a_id = daemon.get("/projects").json()["default"]
+    assert b_id != a_id
+
+    bucket = "2026-06-26"  # serve_path requires a YYYY-MM-DD bucket
+    updir = b_root / ".meshkore" / "uploads" / bucket
+    updir.mkdir(parents=True, exist_ok=True)
+    fname = "route-b-1-0-abcd.png"
+    blob = b"\x89PNG\r\n\x1a\nDATA"
+    (updir / fname).write_bytes(blob)
+    url = f"/chat/uploads/{bucket}/{fname}"
+
+    # ?project=B (no header — like an <img>) → served from B.
+    r = daemon.get(url, params={"project": b_id})
+    assert r.status_code == 200, r.text
+    assert r.content == blob
+    # ?project=A → resolves against A, which has no such upload → 404.
+    r = daemon.get(url, params={"project": a_id})
+    assert r.status_code == 404, r.text
+    # The header path still works (the cockpit's authed requests use it).
+    r = daemon.get(url, headers={"X-MeshKore-Project": b_id})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.cluster("populated")
 def test_register_requires_auth_and_valid_path(daemon, tmp_path: Path) -> None:
     # `Connection: close` on the early-reject probes: the global auth gate
     # returns 401 BEFORE draining the JSON body, which would misframe the next
