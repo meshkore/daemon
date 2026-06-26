@@ -6,6 +6,7 @@ markers = [
     "slow: spawns a daemon subprocess (slower than in-process tests)",
     "cluster(name): which preset cluster the daemon fixture should build (empty | populated | heavy_archive)",
     "target(which): which daemon binary to spawn — 'source' (default) or 'bundle'",
+    "server_home: spawn with MESHKORE_GLOBAL_ROOT = <root>/.meshkore so the boot cluster IS the central home (FC-2)",
 ]
 
 [tool.coverage.run]

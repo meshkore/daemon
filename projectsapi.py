@@ -31,11 +31,37 @@ class ProjectsMixin:
         data = self.global_ledger.load_projects()
         return {p["id"]: p for p in data.get("projects", []) if p.get("id")}
 
+    def _is_home_context(self, root: Any) -> bool:
+        """True if this context is the SERVER'S OWN home — its `.meshkore` IS the
+        machine-global ledger (ideas, the projects registry, external creds /
+        agents). The home is the central store, NOT a project: it must never
+        appear in /projects, never be persisted to projects.json, and never be
+        offered to the cockpit as a selectable project. Detection is automatic —
+        in a per-project daemon the boot cluster's `.meshkore` is NOT the global
+        ledger, so that boot project is (correctly) treated as a real project."""
+        if not root:
+            return False
+        try:
+            return (
+                Path(root).resolve() / ".meshkore"
+            ) == self.global_ledger.root.resolve()
+        except Exception:
+            return False
+
+    def _real_project_ids(self) -> List[str]:
+        """Registry ids EXCLUDING the server home — i.e. only real projects."""
+        return [
+            pid
+            for pid in self._registry.ids()
+            if not self._is_home_context(self._registry.root_of(pid))
+        ]
+
     def _persist_projects(self) -> None:
-        """Write the current registry (id, name, path) to projects.json."""
+        """Write the real projects (id, name, path) to projects.json — NEVER the
+        server home (it's the global store, not a project)."""
         meta = self._projects_meta()
         rows: List[Dict[str, Any]] = []
-        for pid in self._registry.ids():
+        for pid in self._real_project_ids():
             root = self._registry.root_of(pid)
             rows.append(
                 {
@@ -66,9 +92,12 @@ class ProjectsMixin:
 
     # ── endpoints ────────────────────────────────────────────────────────
     def projects_list(self) -> Tuple[int, Dict[str, Any]]:
+        # ONLY real projects — the server home (central store: ideas, registry,
+        # creds) is never a project and is excluded here.
         meta = self._projects_meta()
+        real = self._real_project_ids()
         out: List[Dict[str, Any]] = []
-        for pid in self._registry.ids():
+        for pid in real:
             root = self._registry.root_of(pid)
             out.append(
                 {
@@ -79,7 +108,10 @@ class ProjectsMixin:
                     "built": self._registry.is_built(pid),
                 }
             )
-        return 200, {"projects": out, "default": self._registry.default_project_id}
+        # The cockpit's "default project to land on" is the first REAL project
+        # (never the home); None when no real project is registered yet.
+        default = real[0] if real else None
+        return 200, {"projects": out, "default": default}
 
     def project_register(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         raw = str(body.get("path") or "").strip()

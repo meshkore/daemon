@@ -245,7 +245,9 @@ class Daemon:
         return {"Authorization": f"Bearer {self.token}"}
 
 
-def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Popen:
+def _spawn(
+    daemon_py: Path, root: Path, port: int, work: Path, *, server_home: bool = False
+) -> subprocess.Popen:
     """Start the daemon at its source path so coverage.py tracks the
     same file the tests assert against. The daemon auto-detects its
     ``tls/`` sibling, so tests run over HTTPS with ``verify=False`` —
@@ -259,7 +261,13 @@ def _spawn(daemon_py: Path, root: Path, port: int, work: Path) -> subprocess.Pop
     # DC-3 — same isolation for the machine-global ledger (ideas, projects.json,
     # external creds/agents). Without this, a `POST /projects` test would write
     # the operator's real ~/.meshkore/. Per-test workdir → hermetic.
-    env["MESHKORE_GLOBAL_ROOT"] = str(work / "global-ledger")
+    # FC-2 — when server_home, the boot cluster's own .meshkore IS the global
+    # ledger (the central-server topology): the boot cluster becomes the HOME,
+    # which must never appear in /projects. Otherwise keep them separate so the
+    # boot cluster is a normal project.
+    env["MESHKORE_GLOBAL_ROOT"] = str(
+        (root / ".meshkore") if server_home else (work / "global-ledger")
+    )
     # Coverage in subprocess: tests/sitecustomize.py calls
     # coverage.process_startup() when COVERAGE_PROCESS_START is set. Adding
     # tests/ to PYTHONPATH gets sitecustomize.py imported automatically.
@@ -328,7 +336,8 @@ def daemon(
     base = f"https://127.0.0.1:{port}"
     work = root.parent / "daemon-work"
     work.mkdir(parents=True, exist_ok=True)
-    proc = _spawn(daemon_py, root, port, work)
+    server_home = request.node.get_closest_marker("server_home") is not None
+    proc = _spawn(daemon_py, root, port, work, server_home=server_home)
     try:
         with httpx.Client(timeout=5.0, verify=False) as client:
             _wait_ready(client, base, proc)

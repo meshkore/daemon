@@ -215,6 +215,38 @@ def test_cors_allows_project_header(daemon) -> None:
 
 
 @pytest.mark.cluster("populated")
+@pytest.mark.server_home
+def test_server_home_never_appears_as_a_project(daemon, tmp_path: Path) -> None:
+    """FC-2 — when the boot cluster's .meshkore IS the global ledger (the
+    central-server topology), that cluster is the HOME (ideas, projects
+    registry, external creds), NOT a project. It must NEVER appear in /projects
+    nor be the landing default; /health flags it with server_home=True. Only
+    real projects (registered by path) show up."""
+    # /health reports the home flag (so the cockpit can avoid landing on it).
+    assert daemon.get("/health").json()["server_home"] is True
+
+    # No real projects yet → empty list, no default to land on.
+    listing = daemon.get("/projects").json()
+    assert listing["projects"] == [], listing
+    assert listing["default"] is None, listing
+
+    # Register a REAL project by path.
+    b_root = tmp_path / "real-proj"
+    b_root.mkdir(parents=True, exist_ok=True)
+    b_id = daemon.post(
+        "/projects", headers=daemon.auth, json={"path": str(b_root)}
+    ).json()["id"]
+
+    # Now ONLY the real project shows; the home cluster id is never listed,
+    # and it becomes the landing default.
+    listing = daemon.get("/projects").json()
+    ids = {p["id"] for p in listing["projects"]}
+    assert ids == {b_id}, listing
+    assert "populated" not in ids, "the server home leaked into /projects"
+    assert listing["default"] == b_id, listing
+
+
+@pytest.mark.cluster("populated")
 def test_register_requires_auth_and_valid_path(daemon, tmp_path: Path) -> None:
     # `Connection: close` on the early-reject probes: the global auth gate
     # returns 401 BEFORE draining the JSON body, which would misframe the next

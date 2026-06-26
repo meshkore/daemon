@@ -55,6 +55,11 @@ class QueryMixin:
             "cluster_id": self.cluster.id,
             "cluster_name": self.cluster.name,
             "cluster_type": self.cluster.type,
+            # FC-2 (daemon-centralized) — true when THIS resolved cluster is the
+            # server's own home (its .meshkore IS the global ledger). The cockpit
+            # uses it to NEVER show the home as a project nor land on it; it's
+            # the central store (ideas, projects registry, external creds).
+            "server_home": self._is_home_context(self.paths.root),
             # D-TLS-01 — advertise the transport scheme so the cockpit
             # knows whether https://daemon.meshkore.com:<port> is
             # available or it must use http://localhost:<port>.
