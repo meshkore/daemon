@@ -205,7 +205,7 @@ AP_ROADMAP_ARCHITECT = {
         "catalog/stub/matrix don't apply, A001 is your decision-"
         "maker — NOT the user.\n\n"
         "Procedure:\n"
-        "1. POST `<daemon-base>/chat/dispatch` (use the exact Base URL from `## Daemon endpoints you should know` above — `https://daemon.meshkore.com:<port>` when TLS is on, never plain `http://localhost:<port>` against a TLS-wrapped socket) with:\n"
+        "1. POST `<daemon-base>/chat/dispatch` (use the exact Base URL from `## Daemon endpoints you should know` above — `https://daemon.meshkore.com:<port>` when TLS is on, never plain `http://localhost:<port>` against a TLS-wrapped socket). **ALWAYS send BOTH headers** `Authorization: Bearer <token>` AND `X-MeshKore-Project: <this project's cluster id from ## Daemon endpoints>` — the daemon is CENTRAL (one daemon, many projects); without the project header your subagent runs in the WRONG project. There is NO per-project daemon to start: do NOT restore/launch `.meshkore/scripts/daemon.py` — the central daemon already serves this project via the header. Body:\n"
         "```json\n"
         "{\n"
         '  "conv": "_onboarding_v1",\n'

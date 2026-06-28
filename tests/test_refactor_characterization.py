@@ -53,26 +53,29 @@ import daemon as d  # type: ignore[import-not-found]  # noqa: E402
 # py-1.25.3 (AOF1 autonomous-output-feed): ONLY the roadmap-architect "focus"
 # changed (terse continuous EVENT FEED + "don't echo the wake plumbing" + 2-3
 # line finish summary), so only that one agent type's hash shifts here.
+# Regenerated 2026-06-28 after the FC-2 centralized-daemon routing block was
+# added to the universal briefing (X-MeshKore-Project header + no per-project
+# daemon) and the architect SOP's dispatch step.
 BRIEFING_GOLDEN_EMPTY = {
-    "audit": "51bba2736e6840b99cf6b3abcb9a74befeff1088ad3851972c627ffd5274ce24",
-    "custom": "640dd4850daadbf7ab72fa99816b86127451efdc3ad286e0f8b6647fa8130128",
-    "db": "e0ff0cf23573e5364880511a009bc9fcb5b42eff2b936155a57b00c8bafe75fc",
-    "deploy": "fede154684b37f59c1f78cc0fef7459fd0a79ad46878772114521fc0ce20f62f",
-    "docs": "bc44f0f02e026e63bea112ea3785c0cd16ba07e5bdb534854b1a1f91f429ef01",
-    "review": "8d72692660d40fdc4963a4d9d9b79ebd931eecaea082ce29372b87cd32815e0f",
-    "roadmap-architect": "f9543661205be28418ab44da7b45d14991298a95c34c8cb05e5afa46ab2837bb",
-    "testing": "0f2000a0486303a0fa78d8aa713ac52c81444aafc219d7e83267b03884658fe2",
+    "audit": "1a806a89422b5bc794b28597e9c5755febb062756398e1788b73bf3d5d564419",
+    "custom": "840174b551c077424026c621049a32a2d5b53caf78aa8bd41262753a3de020d3",
+    "db": "ea3a4d6bc57ed0f21953ecf2fae4293bdc9f4689741e9a4e676e424bd254842b",
+    "deploy": "c84070110f371dc25fbe5c4ecbfeded43ad47562ebd43a6e82c8a13c42fcfe0d",
+    "docs": "78d26aace287dffb76930091f8463b468e3456760a8da8c7b162648a05fb0add",
+    "review": "823386f266aafc4261c95276f007d2ad5ecc4a3af39d90c7c731b314a8c3cece",
+    "roadmap-architect": "83e953000fde396e2cc9a577ad98b2202c1f2632ed8d945a46b7b7ab9d1952ae",
+    "testing": "86fe77b3e6311319f07cf2449c1f7e64ca5a6986e53747d3a6457a46ad9216f5",
 }
 
 BRIEFING_GOLDEN_POPULATED = {
-    "audit": "59716a27058fab6aab8fe5458feb1a5f0803005e9ba02eeed3e8860efc8ec425",
-    "custom": "8610769be359ab5ce4724c716d688140aa4aab11a71c1b3f89d2847fb598b2b0",
-    "db": "d297e8e3393ae7fee92c7871c5c6641ed65d18e58233112325f8233f2fbda207",
-    "deploy": "a3f396501315cbc0d1585e1fa5c560f069d9b8189bb376953d49865d1a4e07cf",
-    "docs": "754e345aa69e0c4df65074b9044e4c7035678a8b01ccb958b0458e60dd80c451",
-    "review": "98a415ab2cb38b1ee0d614b0b6f3f3664b6b520254f0224432e60b53cb47778a",
-    "roadmap-architect": "dd002ba337577a1458b8f8b72fd418f827da3c60c2ec588b0c8fd640706a8ea0",
-    "testing": "7a8af13b276bac9c9cf4a80aa9292b91868c2ceea609da8627a615af1680e442",
+    "audit": "97411171aa27447587f5f12c203690a3d3864b42f731512e0bb474232f8d2102",
+    "custom": "db1c46f5143853efadd64498012311a60779cdc4b693dba6bc420145f7ac5369",
+    "db": "a8b7831f385e7f36f80ed6446c416834fe6788ca2c75f55ab5c52f38952758a1",
+    "deploy": "9ddf67330493f4c4ace56e4a40d9a4530885cda38e9b083e343ae67a6625d57f",
+    "docs": "b35dd97702d4add0b4f2171b99b9d036117dfee28a8e9bea00bc11e74d98730e",
+    "review": "bdcb1246925158dc563814e277c56c699f88da7ebb75a78c1a25efdb392180a1",
+    "roadmap-architect": "e964593b9cedb0bc86a29c6eeab0166a2690b61ec51cc0605346b1821f125544",
+    "testing": "91aec26d02a946793ea9737580dc2f042541c45bff546bf3f79f51fc9d2b98fa",
 }
 
 AGENT_KEYS_GOLDEN = [
