@@ -93,6 +93,31 @@ def route_get(self, daemon):  # noqa: N802
         return self._json(200, {"token": daemon.token})
     if p == "/state":
         return self._json(200, daemon.state_manager.state())
+    # py-1.28.3 — live-task overlay. A TINY, cheap endpoint the cockpit polls
+    # (~2.5s) so the roadmap shows a loader on the task each live subagent is
+    # working RIGHT NOW — independent of the conv.* WS path (which can be missed
+    # after a reconnect / project switch). Authoritative: derived from the live
+    # ChatSessions + conv_meta for THIS project (routed by X-MeshKore-Project).
+    if p == "/roadmap/live":
+        tasks = []
+        try:
+            meta = daemon._conv_meta_load()
+            for conv in daemon.chat_sessions.list_active():
+                m = meta.get(conv) or {}
+                tid = (m.get("task_id") or "").strip()
+                if not tid:
+                    continue
+                tasks.append(
+                    {
+                        "conv": conv,
+                        "task_id": tid,
+                        "initiative_id": (m.get("initiative_id") or "").strip() or None,
+                        "agent_id": (m.get("agent_id") or "").strip() or None,
+                    }
+                )
+        except Exception:
+            tasks = []
+        return self._json(200, {"tasks": tasks, "ts": _iso_now()})
     # py-1.10.27 — Quota state read endpoint. Full per-key
     # ledger including probe history; richer than /health.quota
     # (which is just a snapshot). Auth-required because probe

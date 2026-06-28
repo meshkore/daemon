@@ -97,6 +97,7 @@ EXERCISE = [
     ("GET", "/chat/archives", True, {("==", "/chat/archives")}),
     ("GET", "/runs", True, {("==", "/runs")}),
     ("GET", "/quota", True, {("==", "/quota")}),
+    ("GET", "/roadmap/live", False, {("==", "/roadmap/live")}),
     ("GET", "/credentials", True, {("==", "/credentials")}),
     ("GET", "/log", True, {("==", "/log")}),
     ("GET", "/context", True, {("==", "/context")}),
