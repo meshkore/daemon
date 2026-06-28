@@ -147,16 +147,19 @@ class AnchorProgressMixin:
         `## Resolution` body section. Quiet on any failure — persistence
         must never block the final broadcast.
 
-        Skips when: the turn errored (non-zero exit), no final text, the
-        conv has no task_id, the task file is missing, or the task isn't
-        `done` (we don't record a resolution for blocked/abandoned work).
+        CTX/QX — records a resolution for BOTH outcomes so the cockpit's RES
+        line always has content + the right colour:
+          • SUCCESS (exit 0 + status `done`) → `completed_at`/`resolved_by` +
+            the Output-Contract summary (cockpit paints it BLUE).
+          • FAILURE (non-zero exit) → mark the task `blocked` + `failed_at` and
+            write the failure reason into `## Resolution` (cockpit paints it
+            RED — "hay que atenderlo"), UNLESS the task is already `done` (a
+            late non-zero on resolved work must not reopen it).
+        Skips only when the conv has no anchored task, the task file is gone,
+        or (success branch) the agent didn't mark it `done`. Quiet on any
+        failure — persistence must never block the final broadcast.
         """
         try:
-            if exit_code not in (None, 0):
-                return
-            summary = (final_text or "").strip()
-            if not summary:
-                return
             meta = self._conv_meta_load().get(conv) or {}
             tid = (meta.get("task_id") or "").strip()
             if not tid or not self._TASK_ID_RE.match(tid):
@@ -166,9 +169,47 @@ class AnchorProgressMixin:
                 return
             text = path.read_text(errors="replace")
             fm = parse_frontmatter(text)
-            if str(fm.get("status") or "").strip().lower() != "done":
-                return  # only completed tasks carry a resolution
+            status = str(fm.get("status") or "").strip().lower()
             now = _iso_now()
+            summary = (final_text or "").strip()
+
+            # ── FAILURE branch — the turn exited non-zero (after the TR1
+            #    transient-retry shield, so this is a genuine failure). ──────
+            if exit_code not in (None, 0):
+                if status == "done":
+                    return  # already resolved; don't reopen on a late failure
+                reason = summary or f"Turn failed (exit {exit_code}) with no output."
+                if len(reason) > _RESOLUTION_MAX_CHARS:
+                    reason = (
+                        reason[:_RESOLUTION_MAX_CHARS].rstrip() + "\n\n…(truncated)"
+                    )
+                files, commits = _changes_since(self.paths.root, start_sha)
+                fm_patch: Dict[str, Any] = {
+                    "status": "blocked",
+                    "failed_at": now,
+                    "resolved_by": agent_id or conv,
+                    "resolved_by_conv": conv,
+                }
+                if commits:
+                    fm_patch["commit_shas"] = commits
+                _patch_frontmatter(path, fm_patch)
+                body = (
+                    f"_Failed (exit {exit_code}) — {agent_id or conv} via "
+                    f"`{conv}` at {now}._\n\n{reason}"
+                )
+                if files:
+                    listed = "\n".join(f"- `{f}`" for f in files)
+                    body += f"\n\n**Ficheros tocados ({len(files)}):**\n{listed}"
+                text2 = path.read_text(errors="replace")
+                path.write_text(_upsert_body_section(text2, "Resolution", body))
+                self.state_manager.rebuild(broadcast=True)
+                return
+
+            # ── SUCCESS branch — only `done` tasks carry a resolution. ───────
+            if not summary:
+                return
+            if status != "done":
+                return
             # QX5 — what this turn actually changed (files + commits),
             # diffed from the HEAD captured at spawn. Empty when the turn
             # committed nothing.
