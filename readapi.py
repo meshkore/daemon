@@ -237,6 +237,9 @@ class QueryMixin:
         feats.extend(
             [
                 "stub.workers",
+                # Reserved future: off-device cluster admission. The daemon is
+                # local-only today; cross-device join is not wired. See
+                # initiative `private-clusters` (daemon out of scope for now).
                 "stub.admission",
                 "stub.tasks.dispatch",
                 "stub.version.next",

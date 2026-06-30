@@ -53,6 +53,17 @@ class Cluster:
 
     @property
     def id(self) -> str:
+        """The cluster's identifier from cluster.yaml.
+
+        LOCAL-ONLY today: it scopes THIS machine's daemon and its local
+        agents. It is the reserved ANCHOR for a possible future where the
+        daemon orchestrates off-device agents (cross-device cluster
+        membership / admission). No cross-device behaviour is wired today —
+        the facilitated cross-device channel work lives in initiative
+        `private-clusters`, which is intentionally out of the daemon's scope
+        for now. This placeholder exists so that future capability has a
+        stable identity to build on.
+        """
         return str(self.data.get("id") or "unknown")
 
     @property

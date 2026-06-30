@@ -302,8 +302,20 @@ def route_post(self, daemon):  # noqa: N802
     # U-DAEMON-07 + 08: workers + admission stubs.
     if p == "/workers":
         return self._json(501, {"error": "worker pool not implemented yet"})
+    # Cluster admission (joining a cluster from ANOTHER device) is a RESERVED
+    # FUTURE capability. Today the daemon orchestrates LOCAL agents only; no
+    # cross-device membership is wired. Kept as a placeholder so the route
+    # contract exists for when off-device orchestration lands. The facilitated
+    # cross-device channel work lives in initiative `private-clusters`, which
+    # is intentionally NOT routed through the daemon.
     if p.startswith("/admission/"):
-        return self._json(501, {"error": "admission flow not implemented yet"})
+        return self._json(
+            501,
+            {
+                "error": "cluster admission is local-only today; "
+                "off-device join is a reserved future capability"
+            },
+        )
 
     # py-1.11.3 — POST /credentials/<name> is treated as
     # write-or-create (alias of PUT). Some HTTP clients can't
