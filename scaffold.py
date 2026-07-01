@@ -12,8 +12,10 @@ clean cluster.
 
 The fix: the DAEMON owns scaffolding. The daemon ships matching the
 standard version it targets, so the files it writes are correct by
-construction — no drift class possible. The prompt shrinks to
-"download daemon + TLS, run `init`, run daemon".
+construction — no drift class possible. In the centralized model the
+already-running machine daemon adopts a new project (`POST /projects
+{path}`) and runs this scaffolding for it when the target has no
+cluster.yaml yet — the project never gets daemon code of its own.
 
 `scaffold_cluster()` is idempotent-safe: it REFUSES to clobber an
 existing cluster.yaml (the `--force` flag in daemon.py overrides). It is
@@ -266,14 +268,17 @@ def scaffold_cluster(
         paths.public / "README.md",
         f"# {name}\n\n"
         f"This is a [MeshKore](https://meshkore.com/standard) cluster — a "
-        f"local-first multi-agent project. A local daemon "
-        f"(`.meshkore/scripts/daemon.py`) exposes the cluster over "
-        f"`https://daemon.meshkore.com:<port>`; the cockpit at "
-        f"<https://architect.meshkore.com> auto-detects it (by cluster id "
-        f"`{slug}`, not by port) once it's running.\n\n"
-        f"To join: clone this repo, then run\n"
-        f"`python3 .meshkore/scripts/daemon.py` from the repo root and open "
-        f"the Architect.\n",
+        f"local-first multi-agent project. Its entire state lives in this "
+        f"repo's `.meshkore/` ledger; the project carries **no daemon code "
+        f"of its own** — clone it anywhere and it stays portable.\n\n"
+        f"One MeshKore daemon per machine serves every project on that "
+        f"machine, routing each request to this cluster by its id "
+        f"(`{slug}`), not by port. To work on this project, open the cockpit "
+        f"at <https://architect.meshkore.com> and add it by its path — the "
+        f"running daemon adopts it and the cockpit auto-detects it. If no "
+        f"daemon is running on this machine yet, install MeshKore once (see "
+        f"<https://meshkore.com/standard>) and it will serve this and all "
+        f"your other clusters.\n",
     )
 
     # ── public/AGENT_INSTRUCTIONS.md + per-CLI render ───────────────────

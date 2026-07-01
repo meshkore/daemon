@@ -23,8 +23,9 @@ Distinguishing properties (vs the legacy meshcore binary):
 
 - Stdlib only — works on locked-down corporate machines that block
   installable binaries but still allow scripts.
-- Multi-instance safe — every running daemon picks a different port in
-  the range; the architect lists them all in the Projects rail.
+- One shared daemon per machine — it serves every project at once,
+  routed by the `X-MeshKore-Project` header; the Architect's Projects
+  rail lists the PROJECTS it serves (not one daemon per project).
 - Stoppable from the architect — `POST /shutdown` with the bearer token
   ends the process gracefully.
 - Read-mostly today (state + reload + events). Heavy actions (agent
