@@ -65,11 +65,21 @@ _CLAUDE_WINDOWS: Dict[str, int] = {
     "claude-opus-4-8": _DEFAULT_CLAUDE_WINDOW,
     "claude-opus-4-7": _DEFAULT_CLAUDE_WINDOW,
     "claude-opus-4-6": _DEFAULT_CLAUDE_WINDOW,
+    "claude-sonnet-5": _DEFAULT_CLAUDE_WINDOW,
     "claude-sonnet-4-6": _DEFAULT_CLAUDE_WINDOW,
     "claude-haiku-4-5": _DEFAULT_CLAUDE_WINDOW,
-    "claude-fable-5": _DEFAULT_CLAUDE_WINDOW,
-    # 1M-context variants
+    # Claude 5 family — Fable 5's 1M window is NATIVE (the API's default and
+    # maximum are both 1M; there is no 200k tier), so both the bare id and the
+    # [1m]-suffixed variant map to 1M. Without the explicit bare-id entry the
+    # longest-prefix fallback made "claude-fable-5[1m]" inherit 200k → the
+    # cockpit context gauge read 5× too full.
+    "claude-fable-5": 1_000_000,
+    "claude-fable-5[1m]": 1_000_000,
+    # 1M-context variants (opt-in [1m] tier on Opus/Sonnet)
     "claude-opus-4-8[1m]": 1_000_000,
+    "claude-opus-4-7[1m]": 1_000_000,
+    "claude-opus-4-6[1m]": 1_000_000,
+    "claude-sonnet-5[1m]": 1_000_000,
     "claude-sonnet-4-6[1m]": 1_000_000,
 }
 

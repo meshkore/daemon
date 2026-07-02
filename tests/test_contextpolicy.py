@@ -30,6 +30,13 @@ def test_claude_window_sizing() -> None:
     assert p.context_window("claude-opus-4-8") == 200_000
     # 1M variant resolves exactly (and beats the non-[1m] prefix).
     assert p.context_window("claude-opus-4-8[1m]") == 1_000_000
+    # Claude 5 family. Sonnet 5 is a 200k tier like the Opus/Sonnet 4.x line;
+    # Fable 5's 1M window is NATIVE — both the bare id and the [1m] variant are
+    # 1M, so the longest-prefix fallback can't drag "claude-fable-5[1m]" to 200k.
+    assert p.context_window("claude-sonnet-5") == 200_000
+    assert p.context_window("claude-sonnet-5[1m]") == 1_000_000
+    assert p.context_window("claude-fable-5") == 1_000_000
+    assert p.context_window("claude-fable-5[1m]") == 1_000_000
     # unknown claude id → family default.
     assert p.context_window("claude-something-new") == 200_000
 
