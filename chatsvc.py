@@ -91,6 +91,36 @@ class ChatMixin:
         effort_pref = body.get("effort")
         if effort_pref is not None:
             effort_pref = str(effort_pref).strip() or None
+        # ATM10 (agent-team) — optional `member`: the team-member PROFILE this
+        # conv is an INSTANCE of. When set we resolve agent_type from the
+        # member and fill model/effort from it UNLESS the body overrode them
+        # (overrides win on any turn). The binding is frozen after the first
+        # message and singletons allow only one live instance — both enforced
+        # in _member_dispatch_prep, which returns a ready (code, body) error.
+        member = body.get("member")
+        if member is not None:
+            member = str(member).strip() or None
+        if member:
+            err, r_type, r_model, r_effort = self._member_dispatch_prep(
+                conv,
+                member,
+                body_agent_type=agent_type,
+                body_model=model_pref,
+                body_effort=effort_pref,
+            )
+            if err is not None:
+                code_err, body_err = err
+                _debug_emit(
+                    "chat-dispatch.refused",
+                    msg=body_err.get("error", "member refused"),
+                    lvl="warn",
+                    conv=conv,
+                    data=body_err,
+                )
+                return code_err, body_err
+            agent_type = r_type
+            model_pref = r_model
+            effort_pref = r_effort
         # py-1.10.25 — Daemon-side dispatch mutex. Enforces invariants
         # the architect prompt already claims but the LLM intermittently
         # violates (observed in cavioca 2026-05-30: same task got 4
@@ -193,6 +223,7 @@ class ChatMixin:
                 task_id=task_id,
                 model=model_pref,
                 effort=effort_pref,
+                member=member,
             )
         except Exception as e:
             return 400, {"error": str(e)}

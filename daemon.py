@@ -75,6 +75,7 @@ from readapi import QueryMixin  # noqa: E402
 from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
+from teamsvc import TeamMixin  # noqa: E402 — agent-team /team surface (ATM9/10/5)
 from verifysvc import VerifyMixin  # noqa: E402
 from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
 from registry import ProjectRegistry  # noqa: E402 — DC-2: project registry
@@ -247,6 +248,7 @@ class Daemon(
     LifecycleMixin,
     QueryMixin,
     SelfUpdateMixin,
+    TeamMixin,
     VerifyMixin,
     WallsMixin,
     ProjectsMixin,
@@ -297,6 +299,12 @@ class Daemon(
         # DC-5 — lazily register any ADDITIONAL projects from the global
         # projects.json (read-only; writes nothing on boot).
         self.rehydrate_projects()
+
+        # ATM10 (agent-team) — bind the coordinator conv `_onboarding_v1` to
+        # the architect-master member on boot if it has no member yet. Runs
+        # against the default (boot) project; idempotent (skips when already
+        # bound). Best-effort — never blocks startup.
+        self._team_backfill_onboarding()
 
         # Port depends on the (migrated + reloaded) cluster inside the ctx.
         self.port = _pick_port(
@@ -421,6 +429,13 @@ class Daemon(
     @property
     def cron_scheduler(self):
         return self._resolve_ctx().cron_scheduler
+
+    @property
+    def team_store(self):
+        # Initiative `agent-team` (ATM2/ATM9) — per-project TeamStore, seeded
+        # on ProjectContext construction. Resolves to the current request's
+        # project like every other per-project store.
+        return self._resolve_ctx().team_store
 
     # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
 

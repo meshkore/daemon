@@ -55,6 +55,7 @@ MODULES = [
     "hub.py",
     "registries.py",
     "workflows.py",
+    "team.py",  # agent-team (ATM2) — TeamStore; deps: yamlparse. Before projectctx/teamsvc.
     "statebuild.py",
     "state.py",
     "render.py",
@@ -96,6 +97,7 @@ MODULES = [
     "convmeta.py",
     "chatspawn.py",
     "crud.py",
+    "teamsvc.py",  # agent-team (ATM9/10/5) — /team surface mixin; deps: team, utils
     "quota.py",
     "quotaprober.py",
     "routes_get.py",

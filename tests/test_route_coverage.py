@@ -183,6 +183,17 @@ EXERCISE = [
     ("GET", "/projects", False, {("==", "/projects")}),
     ("POST", "/projects", True, {("==", "/projects")}),
     ("DELETE", "/projects/__probe__", True, {("startswith", "/projects/")}),
+    # ── agent-team (ATM9/ATM5) — /team surface ──
+    # GET no-auth (read-only, like /agents); GET /team/<id> unknown → 404
+    # resource (not the no-handler fall-through). POST /team {} → 400 (model
+    # mandatory); POST /team/draft {} → 400 (raw_text required); PATCH/DELETE
+    # of an unknown id → 404 resource. All prove "wired".
+    ("GET", "/team", False, {("==", "/team")}),
+    ("GET", "/team/__probe__", False, {("startswith", "/team/")}),
+    ("POST", "/team", True, {("==", "/team")}),
+    ("POST", "/team/draft", True, {("==", "/team/draft")}),
+    ("PATCH", "/team/__probe__", True, {("startswith", "/team/")}),
+    ("DELETE", "/team/__probe__", True, {("startswith", "/team/")}),
 ]
 
 # Routes that exist in source but must NOT be invoked live (destructive).

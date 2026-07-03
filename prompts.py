@@ -184,6 +184,7 @@ class BriefingPipeline:
         context_docs: Optional[List[Dict[str, Any]]] = None,
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
+        member_body: Optional[str] = None,
     ):
         self.paths = paths
         self.cluster = cluster
@@ -191,6 +192,10 @@ class BriefingPipeline:
         self.conv = conv
         self.user_text = user_text
         self.context_docs = context_docs or []
+        # ATM10 (agent-team) — the init-prompt body of the team member this
+        # conv is an INSTANCE of. Injected verbatim by `_section_member` on
+        # the FIRST turn only (later turns get the usual tight reminder).
+        self.member_body = (member_body or "").strip() or None
         # py-1.7.0 — agent_type drives role / focus / redirect / rules
         # selection from AGENT_PROMPTS. Defaults to 'custom' (General
         # coder) when missing/unknown so older cockpits and direct API
@@ -228,6 +233,7 @@ class BriefingPipeline:
             # no .meshkore/context/ tree yet.
             self._section_project_context(),
             self._section_role(),
+            self._section_member(),
             self._section_core_rules(),
             self._section_agent_focus(),
             self._section_agent_redirect(),
@@ -472,6 +478,17 @@ class BriefingPipeline:
             f"Cluster root: `{self.paths.root}`\nIdentity: `{self.identity}`"
             f" · Conv: `{self.conv}`"
             + (f" · Agent: `{self.agent_id}`" if self.agent_id else "")
+        )
+
+    def _section_member(self) -> str:
+        """ATM10 (agent-team) — inject the team member's init-prompt body on
+        the FIRST turn of an instance, verbatim, right after the role block.
+        Empty on later turns (the tight role reminder carries the identity)
+        and for convs not bound to a member."""
+        if not self.member_body or not self.is_first_turn:
+            return ""
+        return (
+            "## Team member profile (your standing instructions)\n\n" + self.member_body
         )
 
     def _section_core_rules(self) -> str:

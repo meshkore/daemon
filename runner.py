@@ -68,6 +68,7 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         agent_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        member_body: Optional[str] = None,
         daemon: Optional[Any] = None,
         project_id: Optional[str] = None,
     ):
@@ -105,6 +106,10 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         # agent_id is the human label (A001, A002, …) for logging.
         self.agent_type = _agent_type_normalised(agent_type)
         self.agent_id = (agent_id or "").strip() or None
+        # ATM10 (agent-team) — the init-prompt BODY of the team member this
+        # conv is an instance of, injected into the FIRST turn's system prompt
+        # by BriefingPipeline (`_section_member`). None for non-member convs.
+        self.member_body = member_body
         self.stream_id = f"s_{int(time.time() * 1000):x}_{secrets.token_hex(2)}"
         self.pid: Optional[int] = None
         self.proc: Any = None  # subprocess.Popen
@@ -184,6 +189,7 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
             context_docs=self.context_docs,
             agent_type=self.agent_type,
             agent_id=self.agent_id,
+            member_body=self.member_body,
         ).build()
 
     def cancel(self) -> None:

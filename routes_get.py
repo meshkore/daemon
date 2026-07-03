@@ -181,6 +181,16 @@ def route_get(self, daemon):  # noqa: N802
         return self._json(200, {"ok": True, "generated_at": _iso_now()})
     if p == "/agents":
         return self._json(200, daemon.agents_listing())
+    # Initiative `agent-team` (ATM9) — team roster. Read-only, no auth
+    # (like /agents /state); frontmatter carries no secrets. Mutations
+    # (POST/PATCH/DELETE) are gated in routes_post / do_PATCH / do_DELETE.
+    if p == "/team":
+        return self._json(*daemon.team_list_http())
+    if p.startswith("/team/") and p != "/team/draft":
+        mid = urllib.parse.unquote(p[len("/team/") :]).strip("/")
+        if not mid:
+            return self._json(400, {"error": "team member id required"})
+        return self._json(*daemon.team_get_http(mid))
     # DC-5 (daemon-centralized) — GLOBAL: the projects this daemon serves.
     # No auth (boot-time discovery, like /health); mutations (POST/DELETE)
     # are gated.

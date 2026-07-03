@@ -345,6 +345,17 @@ def scaffold_cluster(
         f"for **{name}**.\n",
     )
 
+    # ── team roster (initiative `agent-team`, ATM2) ─────────────────────
+    # Seed the canonical 8-member default team into `.meshkore/team/` at init
+    # so a fresh cluster is born with the roster. Idempotent + committed with
+    # the repo (v27 git contract; no secrets). Boot re-seeds too (belt+braces).
+    try:
+        from team import TeamStore
+
+        TeamStore(paths).seed_defaults()
+    except Exception as e:  # noqa: BLE001 — seeding is best-effort at init
+        _log(f"init: team seed skipped: {e}")
+
     # ── repo-root .gitignore (deny-list git contract) ───────────────────
     _write_gitignore(root)
 

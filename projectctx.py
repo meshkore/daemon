@@ -42,6 +42,7 @@ from registries import LinksRegistry
 from workflows import WorkflowsRegistry
 from render import AgentInstructionsRenderer
 from cronsched import CronScheduler
+from team import TeamStore
 from bootstrap import _migrate_cluster_daemon_block
 from paths import Paths
 from utils import _log
@@ -104,3 +105,16 @@ class ProjectContext:
         self.protocols_registry = self.workflows_registry
         self.instructions_renderer = AgentInstructionsRenderer(paths, phub)
         self.cron_scheduler = CronScheduler(paths, self.cluster, phub, identity)
+
+        # Initiative `agent-team` (ATM2) — the team roster. TeamStore is pure
+        # per-project FS state at `.meshkore/team/`. On boot, seed the canonical
+        # 8-member default team iff the folder is missing/empty (idempotent —
+        # operator edits + deletions survive a restart). No secrets are written;
+        # the roster travels with the repo (v27 git contract).
+        self.team_store = TeamStore(paths)
+        try:
+            n = self.team_store.seed_defaults()
+            if n:
+                _log(f"team: seeded {n} default member(s) into {paths.team_dir}")
+        except Exception as e:  # noqa: BLE001 — seeding is best-effort
+            _log(f"team seed skipped: {e}")

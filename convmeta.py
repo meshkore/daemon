@@ -83,6 +83,15 @@ class ConvMetaMixin:
             return None
         return e
 
+    def _conv_meta_get_member(self, conv: str) -> Optional[str]:
+        """ATM10 (agent-team) — Read the team member this conv is an INSTANCE
+        of. Returns the member id (e.g. 'api-developer') or None when the
+        conv is not bound to any member. The binding is frozen after the
+        first message; see teamsvc._member_dispatch_prep."""
+        meta = self._conv_meta_load().get(conv) or {}
+        m = str(meta.get("member") or "").strip()
+        return m or None
+
     def _conv_meta_set(
         self,
         conv: str,
@@ -93,6 +102,7 @@ class ConvMetaMixin:
         task_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        member: Optional[str] = None,
     ) -> None:
         try:
             # py-1.16.0 (D-STORE-RETENTION-01) — drop the read cache so the
@@ -144,6 +154,18 @@ class ConvMetaMixin:
                     entry["effort"] = e_norm
                 elif "effort" in entry:
                     del entry["effort"]
+            # ATM10 (agent-team) — the team member this conv is an INSTANCE of.
+            # Persisted beside type/model/effort so the binding survives daemon
+            # restarts, drives the /team `instances` join, and is frozen after
+            # the first message. Written once (on the first dispatch that
+            # carries `member`); chained/silent re-spawns pass member=None and
+            # inherit the stored value.
+            if member is not None:
+                m_norm = str(member).strip()
+                if m_norm:
+                    entry["member"] = m_norm
+                elif "member" in entry:
+                    del entry["member"]
             all_meta[conv] = entry
             p = self._conv_meta_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +185,7 @@ class ConvMetaMixin:
                         "task_id": entry.get("task_id"),
                         "model": entry.get("model"),
                         "effort": entry.get("effort"),
+                        "member": entry.get("member"),
                         "ts": _iso_now(),
                     }
                     if not existed_before:

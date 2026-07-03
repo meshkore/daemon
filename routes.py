@@ -173,7 +173,8 @@ def make_handler(daemon: Any):
                 self.send_header("Access-Control-Allow-Origin", allowed)
                 self.send_header("Vary", "Origin")
                 self.send_header(
-                    "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
                 )
                 self.send_header(
                     "Access-Control-Allow-Headers",
@@ -327,6 +328,23 @@ def make_handler(daemon: Any):
                 return self._json(code, resp)
             return self._json(404, {"error": "not found", "path": p})
 
+        def do_PATCH(self):  # noqa: N802
+            self._guard(self._do_PATCH, "PATCH")
+
+        def _do_PATCH(self):  # noqa: N802
+            p, _ = self._path()
+            if self._need_auth():
+                return
+            # Initiative `agent-team` (ATM9) — partial member update.
+            #   PATCH /team/<id>  {frontmatter fields / body / prompt}
+            # kind + required are immutable (409 from TeamStore).
+            if p.startswith("/team/") and p != "/team/draft":
+                mid = urllib.parse.unquote(p[len("/team/") :]).strip("/")
+                if not mid:
+                    return self._json(400, {"error": "team member id required"})
+                return self._json(*daemon.team_update_http(mid, self._read_json_body()))
+            return self._json(404, {"error": "not found", "path": p})
+
         def do_DELETE(self):  # noqa: N802
             self._guard(self._do_DELETE, "DELETE")
 
@@ -338,6 +356,13 @@ def make_handler(daemon: Any):
                 name = p[len("/credentials/") :]
                 code, resp = daemon.credential_delete(name)
                 return self._json(code, resp)
+            # Initiative `agent-team` (ATM9) — delete a member (409 when the
+            # member is required: true, e.g. architect-master).
+            if p.startswith("/team/") and p != "/team/draft":
+                mid = urllib.parse.unquote(p[len("/team/") :]).strip("/")
+                if not mid:
+                    return self._json(400, {"error": "team member id required"})
+                return self._json(*daemon.team_delete_http(mid))
             # DC-5 (daemon-centralized) — GLOBAL: unregister a project (does
             # NOT delete its ledger on disk).
             if p.startswith("/projects/"):

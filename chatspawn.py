@@ -26,6 +26,7 @@ class ChatSpawnMixin:
         task_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        member: Optional[str] = None,
     ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
         prompt re-spawns automatically when the current turn finishes.
@@ -63,7 +64,23 @@ class ChatSpawnMixin:
             task_id=task_id,
             model=model,
             effort=effort,
+            member=member,
         )
+        # ATM10 (agent-team) — if this conv is an INSTANCE of a team member,
+        # resolve the member's init-prompt BODY so BriefingPipeline can inject
+        # it into the FIRST turn's system prompt (verbatim). Read from the
+        # sidecar so chained turns inherit the binding even when the dispatch
+        # body omitted `member`. Only the body is threaded through; the
+        # pipeline itself decides to emit it on turn 1 only.
+        member_body: Optional[str] = None
+        try:
+            bound_member = self._conv_meta_get_member(conv)
+            if bound_member:
+                member_body = (
+                    self.team_store.team_get(bound_member).get("body") or ""
+                ).strip() or None
+        except Exception:
+            member_body = None
         # MP1 (py-1.13.3) / MP3 (py-1.13.4) — Resolve model + effort
         # AFTER the sidecar write so chained turns inherit even when the
         # dispatch body omitted them. Each returns None when the
@@ -83,6 +100,7 @@ class ChatSpawnMixin:
             agent_id=resolved_id,
             model=resolved_model,
             effort=resolved_effort,
+            member_body=member_body,
             daemon=self,
             # FC-2 (daemon-centralized) — capture the dispatch's project so the
             # runner's BACKGROUND thread re-binds it before any self.daemon.*

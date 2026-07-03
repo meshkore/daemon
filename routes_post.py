@@ -273,6 +273,15 @@ def route_post(self, daemon):  # noqa: N802
     if p == "/agents":
         return self._json(*daemon.agent_create(self._read_json_body()))
 
+    # Initiative `agent-team` — ATM5: free text → structured member draft
+    # (read-only, LLM-backed). Checked BEFORE /team create so the more
+    # specific path wins.
+    if p == "/team/draft":
+        return self._json(*daemon.team_draft(self._read_json_body()))
+    # ATM9: create a team member.
+    if p == "/team":
+        return self._json(*daemon.team_create_http(self._read_json_body()))
+
     # D-CRON-04: trigger + cancel a cron job.
     if p.startswith("/cron/") and p.endswith("/trigger"):
         jid = p[len("/cron/") : -len("/trigger")]
