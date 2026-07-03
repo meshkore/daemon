@@ -74,3 +74,10 @@ class Paths:
         # may contain anything); retention via cluster.yaml.uploads
         # (default 30 days), opportunistic GC on every upload.
         self.uploads_dir = self.meshkore / "uploads"
+        # Initiative `agent-team` (ATM2) — the team roster. One markdown
+        # file per member (frontmatter + init-prompt body) at
+        # `.meshkore/team/<id>.md`. Committed with the repo (part of the
+        # project's identity, no secrets); a chat conv becomes an INSTANCE
+        # of a member (ATM10). Seeded with the canonical 8-member team on
+        # first boot / init when the folder is missing or empty.
+        self.team_dir = self.meshkore / "team"
