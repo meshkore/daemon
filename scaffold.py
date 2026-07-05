@@ -346,13 +346,18 @@ def scaffold_cluster(
     )
 
     # ── team roster (initiative `agent-team`, ATM2) ─────────────────────
-    # Seed the canonical 8-member default team into `.meshkore/team/` at init
+    # Seed the canonical 9-member default team into `.meshkore/team/` at init
     # so a fresh cluster is born with the roster. Idempotent + committed with
     # the repo (v27 git contract; no secrets). Boot re-seeds too (belt+braces).
+    # TEG-1 — members seeded `exposure: external` (consultant) get their
+    # bearer token minted into credentials/team-tokens.yaml (deny-listed).
     try:
         from team import TeamStore
+        from teamext import TeamTokenStore
 
-        TeamStore(paths).seed_defaults()
+        _team = TeamStore(paths)
+        _team.seed_defaults()
+        TeamTokenStore(paths).ensure_for_external(_team)
     except Exception as e:  # noqa: BLE001 — seeding is best-effort at init
         _log(f"init: team seed skipped: {e}")
 

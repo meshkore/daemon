@@ -194,6 +194,25 @@ EXERCISE = [
     ("POST", "/team/draft", True, {("==", "/team/draft")}),
     ("PATCH", "/team/__probe__", True, {("startswith", "/team/")}),
     ("DELETE", "/team/__probe__", True, {("startswith", "/team/")}),
+    # ── team-external-gateway (TEG-1/2/4) ──
+    # POST ask is gated by the MEMBER token (not portal) → no-auth probe hits
+    # its own 401 (proves wired). Rotate is portal-gated → unknown member 404
+    # resource. Requests poll: no bearer → 401. Card: unknown member → 404
+    # resource ({"error": "unknown team member …"}, not the fall-through).
+    ("POST", "/team/__probe__/ask", False, {("endswith", "/ask")}),
+    (
+        "POST",
+        "/team/__probe__/token/rotate",
+        True,
+        {("endswith", "/token/rotate")},
+    ),
+    ("GET", "/team/requests/__probe__", False, {("startswith", "/team/requests/")}),
+    (
+        "GET",
+        "/team/__probe__/.well-known/agent.json",
+        False,
+        {("endswith", "/.well-known/agent.json")},
+    ),
 ]
 
 # Routes that exist in source but must NOT be invoked live (destructive).

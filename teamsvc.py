@@ -32,6 +32,7 @@ from team import (
     TeamError,
     _ID_RE,
 )
+from teamext import TeamTokenStore
 from utils import _iso_now, _log
 
 # The concrete Anthropic model id used for the /team/draft normaliser call.
@@ -76,20 +77,39 @@ class TeamMixin:
             counts[member] = counts.get(member, 0) + 1
         return counts
 
+    @staticmethod
+    def _member_exposure(fm: Dict[str, Any]) -> str:
+        """TEG-1 — exposure with the schema default (absent = internal)."""
+        return str(fm.get("exposure") or "internal").strip().lower()
+
     def team_list_http(self) -> Tuple[int, Dict[str, Any]]:
         members = self.team_store.team_list()
         counts = self._team_instance_counts()
         for m in members:
             m["instances"] = counts.get(str(m.get("id") or ""), 0)
+            # TEG-1 — normalise the default so pre-v1.30 member files read
+            # back as internal. The public list NEVER includes tokens.
+            m["exposure"] = self._member_exposure(m)
         return 200, {"members": members, "count": len(members)}
 
-    def team_get_http(self, mid: str) -> Tuple[int, Dict[str, Any]]:
+    def team_get_http(
+        self, mid: str, *, include_token: bool = False
+    ) -> Tuple[int, Dict[str, Any]]:
         try:
             member = self.team_store.team_get(mid)
         except TeamError as e:
             return self._team_err(e)
         counts = self._team_instance_counts()
         member["instances"] = counts.get(mid, 0)
+        fm = member.get("frontmatter") or {}
+        fm["exposure"] = self._member_exposure(fm)
+        # TEG-1 — the cockpit (portal-token caller) additionally gets the
+        # member's bearer token when it is external, so the Team UI can show
+        # + copy it. Anonymous/loopback reads never see it.
+        if include_token and fm["exposure"] == "external":
+            tok = TeamTokenStore(self.paths).get(mid)
+            if tok:
+                member["token"] = tok
         return 200, member
 
     def team_create_http(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -100,6 +120,10 @@ class TeamMixin:
         except TeamError as e:
             return self._team_err(e)
         mid = str(member["frontmatter"].get("id"))
+        # TEG-1 — a member BORN external gets its token minted right away
+        # (same rule as the internal→external PATCH transition).
+        if self._member_exposure(member.get("frontmatter") or {}) == "external":
+            member["token"] = TeamTokenStore(self.paths).ensure(mid)
         self._team_broadcast("team.created", mid)
         return 201, member
 
@@ -108,10 +132,29 @@ class TeamMixin:
     ) -> Tuple[int, Dict[str, Any]]:
         if not isinstance(patch, dict):
             return 400, {"error": "JSON object body required"}
+        # TEG-1 — capture the PRE-patch exposure so the token lifecycle can
+        # key on the transition (mint on →external, revoke on →internal).
+        try:
+            before = self.team_store.team_get(mid)
+        except TeamError as e:
+            return self._team_err(e)
+        old_exposure = self._member_exposure(before.get("frontmatter") or {})
         try:
             member = self.team_store.team_update(mid, patch, today=_iso_now()[:10])
         except TeamError as e:
             return self._team_err(e)
+        new_exposure = self._member_exposure(member.get("frontmatter") or {})
+        tokens = TeamTokenStore(self.paths)
+        if new_exposure == "external":
+            # Mint on internal→external (idempotent: an already-external
+            # member keeps its token — rotation is an explicit endpoint).
+            member["token"] = tokens.ensure(mid)
+        elif old_exposure == "external":
+            # Revoke: exposure flipped back to internal → the token entry is
+            # deleted atomically; any in-flight external caller 403s from
+            # its next request. (The Team UI's "Revoke access" is this PATCH.)
+            tokens.delete(mid)
+            _log(f"team: revoked external token for member {mid}")
         self._team_broadcast("team.updated", mid)
         return 200, member
 

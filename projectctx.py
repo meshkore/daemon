@@ -118,3 +118,16 @@ class ProjectContext:
                 _log(f"team: seeded {n} default member(s) into {paths.team_dir}")
         except Exception as e:  # noqa: BLE001 — seeding is best-effort
             _log(f"team seed skipped: {e}")
+        # TEG-1 (team-external-gateway) — mint bearer tokens for members
+        # seeded/marked `exposure: external` (the default `consultant`) into
+        # `.meshkore/credentials/team-tokens.yaml`. Idempotent: an existing
+        # token is NEVER rotated here (rotation is an explicit endpoint);
+        # internal members are never touched. Secrets stay out of team/.
+        try:
+            from teamext import TeamTokenStore
+
+            minted = TeamTokenStore(paths).ensure_for_external(self.team_store)
+            if minted:
+                _log(f"team: minted {minted} external member token(s)")
+        except Exception as e:  # noqa: BLE001 — token minting is best-effort
+            _log(f"team token mint skipped: {e}")

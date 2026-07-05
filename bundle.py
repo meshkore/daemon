@@ -56,6 +56,7 @@ MODULES = [
     "registries.py",
     "workflows.py",
     "team.py",  # agent-team (ATM2) — TeamStore; deps: yamlparse. Before projectctx/teamsvc.
+    "teamext.py",  # team-external-gateway (TEG-1/2/4) — token store + ask/poll + A2A card; deps: team, fsatomic, yamlparse, utils
     "statebuild.py",
     "state.py",
     "render.py",

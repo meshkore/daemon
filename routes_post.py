@@ -23,9 +23,32 @@ def route_post(self, daemon):  # noqa: N802
         threading.Thread(target=daemon.request_shutdown, daemon=True).start()
         return
 
+    # TEG-2 — external ask. Matched BEFORE the global portal-token gate:
+    # the caller authenticates with the MEMBER's bearer token (validated in
+    # the handler; 401/403/404/429 semantics live there). The member token
+    # authorizes ONLY this route + /team/requests/* it created — every
+    # other route still compares against the portal token and 401s.
+    if p.startswith("/team/") and p.endswith("/ask"):
+        mid = urllib.parse.unquote(p[len("/team/") : -len("/ask")]).strip("/")
+        if not mid:
+            return self._json(400, {"error": "team member id required"})
+        return self._json(
+            *daemon.team_ask_http(
+                mid, bearer=self._bearer(), body=self._read_json_body()
+            )
+        )
+
     # All other POSTs need auth.
     if self._need_auth():
         return
+
+    # TEG-1 — rotate an exposed member's bearer token (portal-token gated,
+    # NOT the member token). The old token dies with the write.
+    if p.startswith("/team/") and p.endswith("/token/rotate"):
+        mid = urllib.parse.unquote(p[len("/team/") : -len("/token/rotate")]).strip("/")
+        if not mid:
+            return self._json(400, {"error": "team member id required"})
+        return self._json(*daemon.team_token_rotate_http(mid))
 
     # py-1.2.0 — Daemon self-update (standard v7 §10.4). Driven by
     # the cockpit's auto-update flow on a version mismatch.

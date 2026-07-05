@@ -186,11 +186,33 @@ def route_get(self, daemon):  # noqa: N802
     # (POST/PATCH/DELETE) are gated in routes_post / do_PATCH / do_DELETE.
     if p == "/team":
         return self._json(*daemon.team_list_http())
+    # TEG-2 — external request poll. Gated by the MEMBER token (validated in
+    # the handler against the request's member) — NOT the portal token.
+    # Must precede the generic /team/<id> match.
+    if p.startswith("/team/requests/"):
+        rid = urllib.parse.unquote(p[len("/team/requests/") :]).strip("/")
+        if not rid:
+            return self._json(400, {"error": "request id required"})
+        return self._json(*daemon.team_request_get_http(rid, bearer=self._bearer()))
+    # TEG-4 — A2A Public Card for an EXPOSED member. No auth: cards are
+    # public metadata and the loopback bind is the perimeter. 404 for
+    # internal/unknown members. Must precede the generic /team/<id> match.
+    if p.startswith("/team/") and p.endswith("/.well-known/agent.json"):
+        mid = urllib.parse.unquote(
+            p[len("/team/") : -len("/.well-known/agent.json")]
+        ).strip("/")
+        if not mid:
+            return self._json(400, {"error": "team member id required"})
+        return self._json(*daemon.team_agent_card_http(mid))
     if p.startswith("/team/") and p != "/team/draft":
         mid = urllib.parse.unquote(p[len("/team/") :]).strip("/")
         if not mid:
             return self._json(400, {"error": "team member id required"})
-        return self._json(*daemon.team_get_http(mid))
+        # TEG-1 — portal-token callers (the cockpit) additionally receive
+        # the member's bearer token when it is external; anonymous reads
+        # get the same member WITHOUT the token.
+        authed = self._bearer() == daemon.token
+        return self._json(*daemon.team_get_http(mid, include_token=authed))
     # DC-5 (daemon-centralized) — GLOBAL: the projects this daemon serves.
     # No auth (boot-time discovery, like /health); mutations (POST/DELETE)
     # are gated.

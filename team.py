@@ -48,6 +48,12 @@ from yamlparse import parse_frontmatter
 _ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _KINDS = ("singleton", "profile")
 _EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")
+# TEG-1 (team-external-gateway) — who may consume this member. `internal`
+# (default when absent) = operator/cockpit only; `external` = the member
+# additionally answers the /team/<id>/ask surface with a per-member bearer
+# token (stored in credentials/, NEVER here). Enum leaves room for a future
+# `mesh` value (Phase 2) without another migration. Orthogonal to `kind`.
+_EXPOSURES = ("internal", "external")
 
 # The strongest available alias — policy is "strongest model, tune with
 # effort" (mirrors the cockpit's lib/models.ts default). Every seed +
@@ -98,6 +104,7 @@ _FIELD_ORDER = (
     "model",
     "effort",
     "pinned_order",
+    "exposure",
     "refs",
     "credentials_hint",
     "created",
@@ -196,6 +203,11 @@ def validate_member(fm: Dict[str, Any]) -> None:
     effort = str(fm.get("effort") or "default").strip().lower()
     if effort not in _EFFORTS:
         raise TeamValidationError(f"effort must be one of {_EFFORTS}")
+    # TEG-1 — exposure enum. Absent/empty means internal (all pre-v1.30
+    # member files validate unchanged); anything else must be in the enum.
+    exposure = str(fm.get("exposure") or "internal").strip().lower()
+    if exposure not in _EXPOSURES:
+        raise TeamValidationError(f"exposure must be one of {_EXPOSURES}")
 
 
 # ── TeamStore ──────────────────────────────────────────────────────────
@@ -299,9 +311,13 @@ class TeamStore:
 
     # ── seed ─────────────────────────────────────────────────────────────
     def seed_defaults(self) -> int:
-        """Write the canonical 8-member default team iff `.meshkore/team/`
+        """Write the canonical 9-member default team iff `.meshkore/team/`
         is missing or empty. Idempotent: a non-empty dir is left untouched
-        (operator edits + deletions survive). Returns the count written."""
+        (operator edits + deletions survive; existing files are NEVER
+        overwritten). Returns the count written. Token minting for members
+        seeded `exposure: external` (consultant) is the caller's job —
+        see teamext.TeamTokenStore.ensure_for_external (secrets never
+        touch `.meshkore/team/`)."""
         try:
             has_any = self.dir.exists() and any(self.dir.glob("*.md"))
         except OSError:
@@ -339,6 +355,7 @@ def _normalise_payload(payload: Dict[str, Any], *, today: str) -> Dict[str, Any]
         "model": str(payload.get("model") or STRONGEST_MODEL_ALIAS).strip(),
         "effort": str(payload.get("effort") or "default").strip().lower(),
         "pinned_order": _coerce_int(payload.get("pinned_order"), 50),
+        "exposure": str(payload.get("exposure") or "internal").strip().lower(),
         "refs": payload.get("refs") if isinstance(payload.get("refs"), list) else [],
         "credentials_hint": str(
             payload.get("credentials_hint") or ".meshkore/credentials/"
@@ -356,12 +373,15 @@ def _coerce_int(v: Any, default: int) -> int:
         return default
 
 
-# ── canonical default team (8 members) ─────────────────────────────────
+# ── canonical default team (9 members) ─────────────────────────────────
 #
 # Verbatim copies of `.meshkore/team/<id>.md` — the daemon ships these so
 # a fresh cluster (which has no `.meshkore/team/`) is born with the full
 # roster. Two singletons are `required: true` (undeletable): the Architect
 # Master (the "CEO") and the Roadmap Orchestrator (the Run-All engine).
+# The ninth member (`consultant`, TEG-1) ships `exposure: external` — the
+# standing info point for external agents; its bearer token is minted into
+# `.meshkore/credentials/team-tokens.yaml` at seed time, never here.
 
 SEED_FILES: Dict[str, str] = {}
 
@@ -751,4 +771,57 @@ findings most-severe first and verify them before reporting.
 
 - You review and report; fixes go back to the authoring developer.
 - Don't approve a change you couldn't verify — flag the gap instead.
+"""
+
+SEED_FILES["consultant"] = """---
+id: consultant
+name: "Consultant"
+emoji: "🛎"
+color: "#14B8A6"
+kind: profile
+required: false
+agent_type: custom
+model: opus
+effort: default
+pinned_order: 70
+exposure: external
+refs:
+  - .meshkore/docs/
+  - .meshkore/context/
+credentials_hint: ".meshkore/credentials/"
+created: 2026-07-05
+updated: 2026-07-05
+---
+# Consultant
+
+You are the **Consultant** — this project's standing information point
+for EXTERNAL agents: social-network bots, potential collaborators, and
+integrators who need technically accurate answers about THIS project.
+
+## Mission
+
+Answer questions about this project truthfully and precisely, from the
+project's own sources: its docs (`.meshkore/docs/`, `.meshkore/context/`),
+its README, and its source code. You produce raw factual material — the
+voice, formatting, and publishing belong to the CALLER, not to you.
+
+## How you work
+
+- CHECK before answering: open the relevant doc or source file and
+  verify the fact exists exactly as you are about to state it.
+- ALWAYS cite your sources — file paths, URLs, or doc sections — next
+  to every substantive claim, so the caller can verify independently.
+- If something is not implemented, not documented, or you cannot verify
+  it, say "not implemented" or "I don't know" — NEVER invent or
+  extrapolate features, endpoints, or behaviour that you did not find.
+- Prefer primary sources (code, committed docs) over recollection;
+  quote exact names, versions, and paths when they matter.
+
+## Limits
+
+- READ-ONLY: you never edit the repo, never commit, never deploy.
+- You answer for THIS project only; out-of-scope questions get a brief
+  "out of scope" plus a pointer when you know one.
+- No secrets: never reveal credential values or the contents of
+  `.meshkore/credentials/`.
 """
