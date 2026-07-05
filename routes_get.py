@@ -193,7 +193,13 @@ def route_get(self, daemon):  # noqa: N802
         rid = urllib.parse.unquote(p[len("/team/requests/") :]).strip("/")
         if not rid:
             return self._json(400, {"error": "request id required"})
-        return self._json(*daemon.team_request_get_http(rid, bearer=self._bearer()))
+        # CPL-2 — the machine remote-control token may poll architect-master
+        # requests on any project; classify the bearer so the handler can
+        # authorize it alongside the member-token path.
+        remote = daemon._remote_token_matches(self._bearer())
+        return self._json(
+            *daemon.team_request_get_http(rid, bearer=self._bearer(), remote=remote)
+        )
     # TEG-4 — A2A Public Card for an EXPOSED member. No auth: cards are
     # public metadata and the loopback bind is the perimeter. 404 for
     # internal/unknown members. Must precede the generic /team/<id> match.
@@ -324,6 +330,14 @@ def route_get(self, daemon):  # noqa: N802
         if "/" not in run_id:
             code, body = daemon.run_get(run_id)
             return self._json(code, body)
+    # CPL-2 (master-copilot) — GET the machine remote-control token for the
+    # cockpit's "Remote control" panel. PORTAL-gated (never reachable with the
+    # remote token itself); machine-level, so the X-MeshKore-Project header is
+    # ignored. 404 when no token is minted.
+    if p == "/remote/token":
+        if self._need_auth():
+            return
+        return self._json(*daemon.remote_token_get_http())
     # U-DAEMON-02: credentials listing — names only, never
     # contents. Matches Node's response shape.
     if p == "/credentials":

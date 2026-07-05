@@ -82,6 +82,7 @@ from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
 from registry import ProjectRegistry  # noqa: E402 — DC-2: project registry
 from globalledger import GlobalLedger  # noqa: E402 — DC-3: machine-global ledger
 from projectsapi import ProjectsMixin  # noqa: E402 — DC-5: /projects API
+from remotectl import RemoteControlMixin  # noqa: E402 — CPL-2: machine remote-control token
 from bootstrap import (  # noqa: E402,F401 — re-exported for main()/Daemon + tests
     _detect_identity,
     _ensure_token,
@@ -254,6 +255,7 @@ class Daemon(
     VerifyMixin,
     WallsMixin,
     ProjectsMixin,
+    RemoteControlMixin,
 ):
     def __init__(
         self, paths: Paths, identity: Optional[str], requested_port: Optional[int]
@@ -281,6 +283,10 @@ class Daemon(
         # agents). Lazy: resolves its root (~/.meshkore by default) but touches
         # no disk until a write. NOT per-project.
         self.global_ledger = GlobalLedger()
+        # CPL-2 (master-copilot) — mint the machine-level remote-control token
+        # on first boot after this upgrade (idempotent; logs the path once,
+        # never the value). Machine-level, alongside the global ledger.
+        self._ensure_remote_token()
 
         # ── PER-PROJECT state (DC-1/DC-2, initiative `daemon-centralized`) ─
         # Per-cluster stores live in ProjectContext; the Daemon keeps a

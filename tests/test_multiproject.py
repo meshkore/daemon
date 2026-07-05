@@ -281,21 +281,51 @@ def test_uploads_route_by_query_project(daemon, tmp_path: Path) -> None:
 
 @pytest.mark.cluster("populated")
 def test_register_requires_auth_and_valid_path(daemon, tmp_path: Path) -> None:
-    # `Connection: close` on the early-reject probes: the global auth gate
-    # returns 401 BEFORE draining the JSON body, which would misframe the next
-    # request on a reused keep-alive socket (same quirk test_route_coverage
-    # guards with _NO_KEEPALIVE; the cockpit never hits it — it always auths).
+    # `Connection: close` on the early-reject probes: the auth gate returns 401
+    # BEFORE draining the JSON body, which would misframe the next request on a
+    # reused keep-alive socket (same quirk test_route_coverage guards with
+    # _NO_KEEPALIVE; the cockpit never hits it — it always auths).
     close = {"Connection": "close"}
-    # No auth → 401 (global POST gate).
+    # No auth → 401 (POST /projects portal-OR-remote gate).
     r = daemon.post("/projects", json={"path": str(tmp_path)}, headers=close)
     assert r.status_code == 401, r.text
-    # Auth but missing path → 400.
+    # Auth but neither path nor parent+name → 400.
     r = daemon.post("/projects", headers={**daemon.auth, **close}, json={})
     assert r.status_code == 400, r.text
-    # Auth but non-existent path → 400.
+    # CPL-2 create-from-scratch: a non-existent path UNDER an allowlisted parent
+    # (the boot project's own parent) is mkdir'd + scaffolded + registered (201),
+    # replacing the old adopt-only 400. The folder now holds a real cluster.
     r = daemon.post(
         "/projects",
         headers={**daemon.auth, **close},
         json={"path": str(tmp_path / "nope")},
     )
-    assert r.status_code == 400, r.text
+    assert r.status_code == 201, r.text
+    assert r.json().get("scaffolded") is True, r.text
+    assert (tmp_path / "nope" / ".meshkore" / "public" / "cluster.yaml").exists()
+
+
+@pytest.mark.cluster("populated")
+def test_register_create_from_scratch_parent_name_and_allowlist(
+    daemon, tmp_path: Path
+) -> None:
+    close = {"Connection": "close"}
+    # {parent, name} under an allowlisted parent (the boot project's parent) →
+    # the folder is created from the slugified name, scaffolded, registered.
+    r = daemon.post(
+        "/projects",
+        headers={**daemon.auth, **close},
+        json={"parent": str(tmp_path), "name": "CPL Smoke!"},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body.get("scaffolded") is True, body
+    assert (tmp_path / "cpl-smoke" / ".meshkore" / "public" / "cluster.yaml").exists()
+    # A parent OUTSIDE the allowlist never scaffolds anywhere → 403.
+    r = daemon.post(
+        "/projects",
+        headers={**daemon.auth, **close},
+        json={"parent": "/opt/cpl-not-allowed-xyz", "name": "nope"},
+    )
+    assert r.status_code == 403, r.text
+    assert not Path("/opt/cpl-not-allowed-xyz").exists()

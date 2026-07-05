@@ -183,6 +183,14 @@ EXERCISE = [
     ("GET", "/projects", False, {("==", "/projects")}),
     ("POST", "/projects", True, {("==", "/projects")}),
     ("DELETE", "/projects/__probe__", True, {("startswith", "/projects/")}),
+    # ── master-copilot (CPL-2) — machine remote-control token ──
+    # GET is portal-gated → returns 200 {token} (test boot mints one) or 404
+    # remote_token_absent; DELETE returns 200 {deleted}; rotate returns 200
+    # {token}. None is the no-handler fall-through. GET ordered before DELETE so
+    # the shared per-test daemon still has a token when GET runs.
+    ("GET", "/remote/token", True, {("==", "/remote/token")}),
+    ("POST", "/remote/token/rotate", True, {("==", "/remote/token/rotate")}),
+    ("DELETE", "/remote/token", True, {("==", "/remote/token")}),
     # ── agent-team (ATM9/ATM5) — /team surface ──
     # GET no-auth (read-only, like /agents); GET /team/<id> unknown → 404
     # resource (not the no-handler fall-through). POST /team {} → 400 (model

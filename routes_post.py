@@ -32,15 +32,38 @@ def route_post(self, daemon):  # noqa: N802
         mid = urllib.parse.unquote(p[len("/team/") : -len("/ask")]).strip("/")
         if not mid:
             return self._json(400, {"error": "team member id required"})
+        # CPL-2 (master-copilot) — the machine remote-control token is the
+        # operator's hand: it may ask `architect-master` on ANY project
+        # (header-routed) WITHOUT the master having `exposure: external`. The
+        # handler enforces master-only + bypasses the exposure/member-token
+        # checks when `remote` is set; asks to any other member → 403.
+        remote = daemon._remote_token_matches(self._bearer())
         return self._json(
             *daemon.team_ask_http(
-                mid, bearer=self._bearer(), body=self._read_json_body()
+                mid, bearer=self._bearer(), body=self._read_json_body(), remote=remote
             )
         )
+
+    # CPL-2 (master-copilot) — POST /projects (discover/adopt/create-from-
+    # scratch) is reachable with EITHER the portal token (cockpit) OR the
+    # machine remote-control token (the operator's hand). Matched BEFORE the
+    # global portal-only gate so the remote token isn't rejected there; every
+    # OTHER POST route still 401s the remote token at the gate below.
+    if p == "/projects":
+        bearer = self._bearer()
+        if bearer == daemon.token or daemon._remote_token_matches(bearer):
+            return self._json(*daemon.project_register(self._read_json_body()))
+        return self._json(401, {"error": "unauthorized"})
 
     # All other POSTs need auth.
     if self._need_auth():
         return
+
+    # CPL-2 (master-copilot) — rotate the machine remote-control token
+    # (PORTAL-gated, NOT the remote token itself). The old value dies with the
+    # mint. Machine-level: the X-MeshKore-Project header is ignored.
+    if p == "/remote/token/rotate":
+        return self._json(*daemon.remote_token_rotate_http())
 
     # TEG-1 — rotate an exposed member's bearer token (portal-token gated,
     # NOT the member token). The old token dies with the write.
@@ -247,9 +270,8 @@ def route_post(self, daemon):  # noqa: N802
 
     # U-DAEMON-04: task lifecycle.
     # DC-5 (daemon-centralized) — GLOBAL: register a project by path
-    # (scaffolds .meshkore/ if absent). Auth-gated at the top of route_post.
-    if p == "/projects":
-        return self._json(*daemon.project_register(self._read_json_body()))
+    # (scaffolds .meshkore/ if absent). POST /projects is matched BEFORE the
+    # global auth gate above (CPL-2 combined portal-OR-remote auth).
     if p == "/tasks":
         return self._json(*daemon.task_create(self._read_json_body()))
     if p.startswith("/tasks/") and p.endswith("/transition"):

@@ -328,35 +328,86 @@ class TeamExtMixin:
         except Exception as e:  # noqa: BLE001 — broadcast failure is non-fatal
             _log(f"teamext broadcast {event} failed: {e}")
 
+    # ── CPL-1: resolve a singleton's bound conv ─────────────────────────
+    def _member_bound_conv(self, mid: str) -> Tuple[Optional[str], bool]:
+        """Return (conv, archived) for the conv this member is bound to, or
+        (None, False) when none exists. A NON-archived binding wins; an
+        archived one is returned only when there is no live binding (the
+        caller then unarchives it — the singleton's history IS the value).
+        Used by the singleton ask path so talking to a singleton always
+        lands in ITS one conversation."""
+        try:
+            meta = self._conv_meta_load()
+        except Exception:
+            return None, False
+        archived_conv: Optional[str] = None
+        for conv, entry in (meta or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("member") or "").strip() != mid:
+                continue
+            try:
+                is_arch = self.chat_archive.is_archived(conv)
+            except Exception:
+                is_arch = False
+            if not is_arch:
+                return conv, False
+            archived_conv = conv
+        if archived_conv is not None:
+            return archived_conv, True
+        return None, False
+
     # ── POST /team/<id>/ask ─────────────────────────────────────────────
     def team_ask_http(
-        self, mid: str, *, bearer: Optional[str], body: Dict[str, Any]
+        self,
+        mid: str,
+        *,
+        bearer: Optional[str],
+        body: Dict[str, Any],
+        remote: bool = False,
     ) -> Tuple[int, Dict[str, Any]]:
         """Member-token gated (NOT the portal token). Error order per TEG-2:
         401 bad/missing token · 403 member internal · 404 unknown member ·
-        429 over the per-member concurrent cap."""
+        429 over the per-member concurrent cap.
+
+        CPL-2 (master-copilot): when `remote` is set the caller presented the
+        machine remote-control token (the operator's hand). That path is
+        MASTER-ONLY — asks to any member other than `architect-master` → 403 —
+        and it BYPASSES the exposure check + the per-member token match (the
+        remote token IS the operator; `exposure: external` + member tokens stay
+        the third-party TEG surface, untouched)."""
         if not bearer:
             return 401, {
                 "error": "unauthorized",
                 "hint": "Authorization: Bearer <member-token> required",
+            }
+        if remote and mid != "architect-master":
+            # The remote token authorizes ONLY the operator's master, per
+            # project. Any other member id is the TEG member-token surface.
+            return 403, {
+                "error": "remote_token_master_only",
+                "member": mid,
+                "hint": "the remote-control token can only ask architect-master; "
+                "use a member token for other members",
             }
         try:
             member = self.team_store.team_get(mid)
         except TeamError:
             return 404, {"error": f"unknown team member {mid!r}", "member": mid}
         fm = member.get("frontmatter") or {}
-        exposure = str(fm.get("exposure") or "internal").strip().lower()
-        if exposure != "external":
-            # Revoke semantics: PATCH {exposure: internal} deleted the token,
-            # so any in-flight caller lands here — 403, access is gone.
-            return 403, {
-                "error": "member_not_exposed",
-                "member": mid,
-                "hint": "this member has exposure: internal — ask the operator to expose it",
-            }
-        tokens = TeamTokenStore(self.paths)
-        if not tokens.matches(mid, bearer):
-            return 401, {"error": "unauthorized", "member": mid}
+        if not remote:
+            exposure = str(fm.get("exposure") or "internal").strip().lower()
+            if exposure != "external":
+                # Revoke semantics: PATCH {exposure: internal} deleted the token,
+                # so any in-flight caller lands here — 403, access is gone.
+                return 403, {
+                    "error": "member_not_exposed",
+                    "member": mid,
+                    "hint": "this member has exposure: internal — ask the operator to expose it",
+                }
+            tokens = TeamTokenStore(self.paths)
+            if not tokens.matches(mid, bearer):
+                return 401, {"error": "unauthorized", "member": mid}
         if not isinstance(body, dict):
             return 400, {"error": "JSON object body required"}
         text = str(body.get("text") or "").strip()
@@ -381,21 +432,50 @@ class TeamExtMixin:
                 }
             self._teamext_save(data)
 
-        # Conv slug: session → continuity (same session = same conv = the
-        # member remembers the thread); no session → one-shot stamp conv.
-        session = str(body.get("session") or "").strip().lower()
-        session = _SESSION_SAFE_RE.sub("-", session).strip("-")[:48]
-        if session:
-            conv = f"ext-{mid}-{session}"
+        # Conv slug resolution.
+        # CPL-1 — a `kind: singleton` member has exactly ONE conversation:
+        # talking to it means talking to THAT thread. Resolve its bound conv
+        # (live → use it; archived → unarchive + use it; none → create + bind,
+        # letting the member's init prompt inject on turn 1). `session` is
+        # meaningless for a singleton (one thread by definition) and ignored;
+        # the 202 returns the real conv. Serialization is the existing dispatch
+        # queue: a second ask while a turn runs is queued into the same conv
+        # (chat_dispatch returns queued=True), never a duplicate conv.
+        # Profiles keep today's behaviour EXACTLY.
+        kind = str(fm.get("kind") or "").strip().lower()
+        if kind == "singleton":
+            conv, archived = self._member_bound_conv(mid)
+            if conv is None:
+                # A stable single-thread slug for this singleton; conv_meta
+                # binds `member` on turn 1 (dispatch_body below carries it).
+                conv = mid
+            elif archived:
+                self.chat_archive.unarchive(conv)
+                try:
+                    if getattr(self, "hub", None) is not None:
+                        self.hub.broadcast(
+                            {"type": "conv.unarchived", "conv": conv, "ts": _iso_now()}
+                        )
+                except Exception:  # noqa: BLE001 — broadcast failure is non-fatal
+                    pass
         else:
-            stamp = _iso_now()[:19].replace(":", "").replace("-", "").replace("T", "-")
-            conv = f"ext-{mid}-{stamp}"
+            # Profile: session → continuity (same session = same conv = the
+            # member remembers the thread); no session → one-shot stamp conv.
+            session = str(body.get("session") or "").strip().lower()
+            session = _SESSION_SAFE_RE.sub("-", session).strip("-")[:48]
+            if session:
+                conv = f"ext-{mid}-{session}"
+            else:
+                stamp = (
+                    _iso_now()[:19].replace(":", "").replace("-", "").replace("T", "-")
+                )
+                conv = f"ext-{mid}-{stamp}"
 
         dispatch_body: Dict[str, Any] = {
             "text": text,
             "conv": conv,
             "member": mid,
-            "author": f"ext:{mid}",
+            "author": f"{'remote' if remote else 'ext'}:{mid}",
         }
         if isinstance(body.get("context_docs"), list):
             dispatch_body["context_docs"] = body["context_docs"]
@@ -439,10 +519,13 @@ class TeamExtMixin:
 
     # ── GET /team/requests/<rid> ────────────────────────────────────────
     def team_request_get_http(
-        self, rid: str, *, bearer: Optional[str]
+        self, rid: str, *, bearer: Optional[str], remote: bool = False
     ) -> Tuple[int, Dict[str, Any]]:
         """Same bearer auth as the ask; a member token can ONLY read the
-        requests created for its own member (token identity = member)."""
+        requests created for its own member (token identity = member).
+
+        CPL-2: the machine remote-control token additionally reads any
+        `architect-master` request (the operator polls the asks it made)."""
         if not bearer:
             return 401, {"error": "unauthorized"}
         with self._teamext_lock:
@@ -451,7 +534,10 @@ class TeamExtMixin:
             return 404, {"error": f"unknown request {rid!r}"}
         mid = str(entry.get("member") or "")
         tokens = TeamTokenStore(self.paths)
-        if not tokens.matches(mid, bearer):
+        authorized = tokens.matches(mid, bearer) or (
+            remote and mid == "architect-master"
+        )
+        if not authorized:
             # Wrong member's token, revoked member, or a stale token after a
             # rotate — in every case the presented bearer no longer names the
             # member this request belongs to.

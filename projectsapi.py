@@ -17,10 +17,11 @@ Depends on `self._registry` (ProjectRegistry) and `self.global_ledger`.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from scaffold import ScaffoldError, scaffold_cluster
+from scaffold import ScaffoldError, scaffold_cluster, slugify_id
 from paths import Paths
 from utils import _log
 
@@ -113,17 +114,85 @@ class ProjectsMixin:
         default = real[0] if real else None
         return 200, {"projects": out, "default": default}
 
+    # ── CPL-2 (master-copilot): create-from-scratch guards ───────────────
+    @staticmethod
+    def _within(path: Path, ancestor: Path) -> bool:
+        """True if `path` is `ancestor` itself or a descendant of it."""
+        try:
+            path.relative_to(ancestor)
+            return True
+        except ValueError:
+            return False
+
+    def _allowed_project_parents(self) -> List[Path]:
+        """Operator-approved roots under which a BRAND-NEW project folder may be
+        scaffolded (create-from-scratch). Default = the parent dir of every
+        already-registered real project (the operator's existing project home(s),
+        nowhere else) so a stray order can't scaffold anywhere on disk. Extend
+        via `MESHKORE_PROJECT_ROOTS` (os.pathsep-joined absolute dirs). Adopting
+        an EXISTING dir is NOT gated by this — only mkdir of a new one is."""
+        parents: set = set()
+        for pid in self._real_project_ids():
+            root = self._registry.root_of(pid)
+            if not root:
+                continue
+            try:
+                parents.add(Path(root).expanduser().resolve().parent)
+            except Exception:  # noqa: BLE001 — a bad path never widens the allowlist
+                continue
+        extra = os.environ.get("MESHKORE_PROJECT_ROOTS") or ""
+        for chunk in extra.split(os.pathsep):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                parents.add(Path(chunk).expanduser().resolve())
+            except Exception:  # noqa: BLE001
+                continue
+        return sorted(parents)
+
     def project_register(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        # Target resolution: an explicit `path`, or `parent` + `name` (the
+        # create-from-scratch "crea un proyecto nuevo" voice flow, CPL-2).
         raw = str(body.get("path") or "").strip()
-        if not raw:
-            return 400, {"error": "path required"}
-        root = Path(raw).expanduser()
-        if not root.exists() or not root.is_dir():
+        parent = str(body.get("parent") or "").strip()
+        name_in = str(body.get("name") or "").strip()
+        if raw:
+            root = Path(raw).expanduser()
+        elif parent and name_in:
+            root = Path(parent).expanduser() / slugify_id(name_in)
+        else:
+            return 400, {"error": "path OR (parent + name) required"}
+
+        creating = not root.exists()
+        if root.exists() and not root.is_dir():
             return 400, {
-                "error": "path is not an existing directory",
+                "error": "path exists but is not a directory",
                 "path": str(root),
             }
-        name = str(body.get("name") or root.name).strip()
+        # CPL-2 — a NEW folder may only be created under an allowlisted parent.
+        # Adopting an EXISTING dir stays unrestricted (the operator already put a
+        # project there). `mkdir -p` then falls through to scaffold + register.
+        if creating:
+            try:
+                target_parent = root.expanduser().resolve().parent
+            except Exception:  # noqa: BLE001
+                target_parent = root.parent
+            allowed = self._allowed_project_parents()
+            if not any(self._within(target_parent, a) for a in allowed):
+                return 403, {
+                    "error": "parent not allowlisted for create-from-scratch",
+                    "parent": str(target_parent),
+                    "allowed": [str(a) for a in allowed],
+                }
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return 500, {
+                    "error": f"could not create folder: {e}",
+                    "path": str(root),
+                }
+        name = name_in or root.name
         # Scaffold the cluster ledger if this folder has none yet (the daemon
         # owns the schema — same path the `init` CLI uses).
         paths = Paths(root)

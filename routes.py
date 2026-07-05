@@ -356,6 +356,11 @@ def make_handler(daemon: Any):
                 name = p[len("/credentials/") :]
                 code, resp = daemon.credential_delete(name)
                 return self._json(code, resp)
+            # CPL-2 (master-copilot) — revoke the machine remote-control token
+            # (PORTAL-gated). The file is deleted; the daemon then 401s every
+            # remote call until re-minted from the cockpit.
+            if p == "/remote/token":
+                return self._json(*daemon.remote_token_delete_http())
             # Initiative `agent-team` (ATM9) — delete a member (409 when the
             # member is required: true, e.g. architect-master).
             if p.startswith("/team/") and p != "/team/draft":
