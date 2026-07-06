@@ -508,10 +508,16 @@ class TeamExtMixin:
             data={"member": mid, "request_id": rid, "status": status},
         )
         # Watcher observes the turn to completion (final → done, else error).
+        # Auto-archive ONLY profile instances: they're one-shot/session API
+        # artifacts, not operator-facing sessions, and must never clutter
+        # the chat rail once their turn ends. Singletons (architect-master,
+        # roadmap-orchestrator) keep their ONE conversation visible — that
+        # IS the operator's real working thread with that member.
+        auto_archive = kind != "singleton"
         project_id = self._current_project_id()
         threading.Thread(
             target=self._teamext_watch,
-            args=(project_id, rid, mid, conv, started_at),
+            args=(project_id, rid, mid, conv, started_at, auto_archive),
             name=f"teamext-{rid}",
             daemon=True,
         ).start()
@@ -619,14 +625,47 @@ class TeamExtMixin:
             return None
         return best_text
 
+    def _teamext_archive_conv(self, conv: str) -> None:
+        """Archive a one-shot/session profile-member conv once its turn
+        ends, so it never lingers in the operator's chat rail (only
+        History → Archived). Mirrors chatsvc.chat_archive_set's broadcast
+        so the cockpit updates live without a manual refresh. Best-effort —
+        never let an archive failure turn a successful ask into an error."""
+        try:
+            entry = self.chat_archive.archive(conv, by="teamext")
+            if getattr(self, "hub", None) is not None:
+                self.hub.broadcast(
+                    {
+                        "type": "conv.archived",
+                        "conv": conv,
+                        "archived_at": entry.get("archived_at"),
+                        "by": entry.get("by"),
+                        "ts": entry.get("archived_at"),
+                    }
+                )
+        except Exception:  # noqa: BLE001 — archiving is cosmetic, never fatal
+            pass
+
     def _teamext_watch(
-        self, project_id: Optional[str], rid: str, mid: str, conv: str, after_ts: str
+        self,
+        project_id: Optional[str],
+        rid: str,
+        mid: str,
+        conv: str,
+        after_ts: str,
+        auto_archive: bool = False,
     ) -> None:
         """Background observer for one external request. Re-binds the
         originating project on THIS thread (FC-2 pattern — the request
         threadlocal died with the 202) so every self.* property resolves to
         the right ProjectContext. Terminal states: done (final found on the
-        timeline) or error (turn ended finalless / observer budget spent)."""
+        timeline) or error (turn ended finalless / observer budget spent).
+
+        `auto_archive` (profile members only, see the call site): the conv
+        is archived on either terminal state so it never appears in the
+        chat rail's agents list — dispatch doesn't care about the archived
+        flag, so a later ask on the same `session` still works (it just
+        re-archives on completion)."""
         try:
             self._set_req_project(project_id)
         except Exception:
@@ -685,6 +724,12 @@ class TeamExtMixin:
         except Exception as e:  # noqa: BLE001 — watcher must never take the daemon down
             _log(f"teamext watcher {rid} failed: {e}")
         finally:
+            # Single choke point for all three terminal paths (done, idle
+            # error, timeout error) AND an unexpected exception above —
+            # archive before clearing the project threadlocal so path
+            # resolution still points at the right cluster.
+            if auto_archive:
+                self._teamext_archive_conv(conv)
             try:
                 self._clear_req_project()
             except Exception:
