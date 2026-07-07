@@ -25,8 +25,48 @@ from scaffold import ScaffoldError, scaffold_cluster, slugify_id
 from paths import Paths
 from utils import _log
 
+# ── HARDCODED server-home backstop (FC-2 / operator-directed 2026-07-07) ─────
+# The central daemon's OWN home (its `.meshkore` is the machine-global store:
+# ideas, the projects registry, external creds) is NEVER a project. The
+# structural test `_is_home_context` detects it by comparing the context root
+# against the global-ledger root — but that comparison DEPENDS ON HOW THE DAEMON
+# WAS LAUNCHED (if `MESHKORE_GLOBAL_ROOT` doesn't resolve to the home's
+# `.meshkore`, the structural test returns False and the home leaks into
+# /projects as if it were a project). It "kept coming back" for exactly this
+# reason. This id denylist is the env-independent backstop: a cluster id in it
+# is NEVER a project, regardless of launch flags, projects.json contents, or the
+# structural test. `meshkore-server` is this machine's home; extend the set per
+# machine via `MESHKORE_HOME_IDS` (os.pathsep- or comma-joined). Harmless on any
+# machine that has no cluster by that id.
+_DEFAULT_HOME_IDS = frozenset({"meshkore-server"})
+
 
 class ProjectsMixin:
+    # ── server-home identity (the central store, never a project) ────────
+    def _home_ids(self) -> frozenset:
+        """The set of cluster ids that ARE the server home / global store and
+        must never be treated as projects. Hardcoded default + per-machine env
+        override (`MESHKORE_HOME_IDS`, comma/os.pathsep-separated)."""
+        extra = os.environ.get("MESHKORE_HOME_IDS") or ""
+        ids = set(_DEFAULT_HOME_IDS)
+        for chunk in extra.replace(os.pathsep, ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                ids.add(chunk)
+        return frozenset(ids)
+
+    def is_home(self, pid: str, root: Any = None) -> bool:
+        """True if `pid` is the server home — by the hardcoded id denylist OR by
+        the structural global-ledger-root test. EITHER signal is sufficient, so
+        the home is excluded even when the daemon was launched such that the
+        structural test can't see it. This is the single gate every /projects
+        path goes through."""
+        if pid and pid in self._home_ids():
+            return True
+        if root is None:
+            root = self._registry.root_of(pid)
+        return self._is_home_context(root)
+
     # ── persistence helpers ──────────────────────────────────────────────
     def _projects_meta(self) -> Dict[str, Dict[str, Any]]:
         data = self.global_ledger.load_projects()
@@ -50,11 +90,13 @@ class ProjectsMixin:
             return False
 
     def _real_project_ids(self) -> List[str]:
-        """Registry ids EXCLUDING the server home — i.e. only real projects."""
+        """Registry ids EXCLUDING the server home — i.e. only real projects.
+        Uses the combined `is_home` gate (id denylist OR structural test) so the
+        home is dropped even when launched such that the structural test fails."""
         return [
             pid
             for pid in self._registry.ids()
-            if not self._is_home_context(self._registry.root_of(pid))
+            if not self.is_home(pid, self._registry.root_of(pid))
         ]
 
     def _persist_projects(self) -> None:
@@ -73,16 +115,19 @@ class ProjectsMixin:
             )
         self.global_ledger.save_projects(rows)
 
-    # ── boot rehydrate (READ-ONLY) ───────────────────────────────────────
+    # ── boot rehydrate ────────────────────────────────────────────────────
     def rehydrate_projects(self) -> None:
         """On boot, lazily register every additional project recorded in
-        projects.json. READ-ONLY: writes nothing (so a daemon/test boot never
-        creates a machine-global ledger). projects.json is only ever WRITTEN by
-        an explicit POST /projects. Called from __init__ after the boot project
-        is registered."""
+        projects.json, then SELF-HEAL: prune any server-home entry that a past
+        bad write left in projects.json. Called from __init__ after the boot
+        project is registered."""
+        home = self._home_ids()
         for p in self.global_ledger.load_projects().get("projects", []):
             pid, path = p.get("id"), p.get("path")
             if not pid or not path:
+                continue
+            # NEVER re-register the server home from a stale projects.json entry.
+            if pid in home or self._is_home_context(path):
                 continue
             if self._registry.has(pid):
                 continue  # already registered (e.g. the boot project)
@@ -90,6 +135,29 @@ class ProjectsMixin:
                 _log(f"projects: skip {pid!r} — path gone: {path}")
                 continue
             self._registry.add_path(pid, Path(path))
+        self._prune_home_from_projects()
+
+    def _prune_home_from_projects(self) -> None:
+        """Rewrite projects.json without any server-home row. No-op (no write)
+        when the file is empty or already clean — so a fresh machine never gets
+        a machine-global ledger created by this. Idempotent self-heal for the
+        recurring 'home shows up as a project' bug."""
+        try:
+            rows = self.global_ledger.load_projects().get("projects", [])
+        except Exception:  # noqa: BLE001
+            return
+        home = self._home_ids()
+        kept = [
+            p
+            for p in rows
+            if p.get("id") not in home and not self._is_home_context(p.get("path"))
+        ]
+        if len(kept) != len(rows):
+            self.global_ledger.save_projects(kept)
+            _log(
+                f"projects: pruned {len(rows) - len(kept)} server-home entry "
+                "from projects.json (never a project)"
+            )
 
     # ── endpoints ────────────────────────────────────────────────────────
     def projects_list(self) -> Tuple[int, Dict[str, Any]]:
@@ -208,10 +276,23 @@ class ProjectsMixin:
             pid = self._registry.register_root(root)
         except Exception as e:  # noqa: BLE001 — surface a clean 400 to the cockpit
             return 500, {"error": f"could not register project: {e}"}
-        # Record the operator-facing name (registry only knows ids/paths).
+        # The server home (central store) can never be adopted as a project.
+        # Refuse to persist it to projects.json — regardless of the id denylist
+        # or the structural test. (Leave the registry as-is: the home may be the
+        # boot/default cluster.)
+        if self.is_home(pid, root):
+            return 409, {
+                "error": "the server home is the central store, not a project",
+                "id": pid,
+                "path": str(root),
+            }
+        # Record the operator-facing name (registry only knows ids/paths). Persist
+        # the REAL projects only (never the home) — reuse the single writer.
         meta = self._projects_meta()
         meta[pid] = {"id": pid, "name": name, "path": str(root)}
-        self.global_ledger.save_projects(list(meta.values()))
+        self.global_ledger.save_projects(
+            [row for row in meta.values() if not self.is_home(row.get("id", ""))]
+        )
         return 201, {
             "id": pid,
             "name": name,

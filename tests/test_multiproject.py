@@ -246,6 +246,30 @@ def test_server_home_never_appears_as_a_project(daemon, tmp_path: Path) -> None:
     assert listing["default"] == b_id, listing
 
 
+def test_server_home_id_backstop(daemon, tmp_path: Path) -> None:
+    """FC-2 backstop (operator-directed 2026-07-07) — a cluster whose id is in
+    the hardcoded home denylist (`meshkore-server`) is NEVER a project, even when
+    the STRUCTURAL global-ledger test can't see it. This `daemon` fixture is NOT
+    server_home, so its global ledger is elsewhere and `_is_home_context` is
+    False for the folder below — only the id backstop catches it. This is the
+    env-independent guarantee that killed the recurring 'home reappears in the
+    rail' bug (it came back whenever the daemon was launched so the structural
+    test failed)."""
+    # A folder whose scaffolded cluster id is `meshkore-server` (folder name →
+    # slug). Adopting it must be REFUSED (409) — the home is never a project.
+    home_like = tmp_path / "meshkore-server"
+    home_like.mkdir(parents=True, exist_ok=True)
+    r = daemon.post("/projects", headers=daemon.auth, json={"path": str(home_like)})
+    assert r.status_code == 409, r.text
+    assert "not a project" in r.json().get("error", ""), r.text
+
+    # And it never shows in /projects nor becomes the default, regardless.
+    listing = daemon.get("/projects").json()
+    ids = {p["id"] for p in listing["projects"]}
+    assert "meshkore-server" not in ids, listing
+    assert listing["default"] != "meshkore-server", listing
+
+
 @pytest.mark.cluster("populated")
 def test_uploads_route_by_query_project(daemon, tmp_path: Path) -> None:
     """FC-2 — the browser's <img> loader can't send X-MeshKore-Project, so

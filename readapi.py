@@ -59,7 +59,10 @@ class QueryMixin:
             # server's own home (its .meshkore IS the global ledger). The cockpit
             # uses it to NEVER show the home as a project nor land on it; it's
             # the central store (ideas, projects registry, external creds).
-            "server_home": self._is_home_context(self.paths.root),
+            "server_home": (
+                self.cluster.id in self._home_ids()
+                or self._is_home_context(self.paths.root)
+            ),
             # D-TLS-01 — advertise the transport scheme so the cockpit
             # knows whether https://daemon.meshkore.com:<port> is
             # available or it must use http://localhost:<port>.
