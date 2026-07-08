@@ -166,6 +166,20 @@ def serialise_member(fm: Dict[str, Any], body: str) -> str:
             s = str(val).replace("\\", "\\\\").replace('"', '\\"')
             lines.append(f'{key}: "{s}"')
             return
+        # DM-CLI-05 follow-up (live smoke test, 2026-07-08) — a bare
+        # `key:` with nothing after it (the naive `_yaml_scalar("")`
+        # output) round-trips through this project's simplified YAML
+        # parser as `{}` (an empty MAPPING), not an empty string — the
+        # parser's block-mapping heuristic treats "nothing on this
+        # line" as "the value is a nested block starting below", same
+        # as real YAML. `client: codex` + empty `model` (Codex/Gemini's
+        # own "use account default" sentinel, DM-CLI-05) hit this
+        # exactly: saved as `model: ` (blank), reloaded as `model: {}`.
+        # Quote empty values explicitly so the round-trip preserves
+        # "empty string", not "empty mapping".
+        if val == "":
+            lines.append(f'{key}: ""')
+            return
         lines.append(f"{key}: {_yaml_scalar(val)}")
 
     for key in _FIELD_ORDER:

@@ -18,12 +18,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from team import (
+from team import (  # noqa: E402
     STRONGEST_MODEL_ALIAS,
     TeamValidationError,
     _normalise_payload,
+    serialise_member,
+    split_member_file,
     validate_member,
-)  # noqa: E402
+)
 
 
 def test_normalise_payload_claude_code_defaults_to_strongest_alias() -> None:
@@ -84,6 +86,22 @@ def test_validate_member_codex_accepts_empty_model() -> None:
 
 def test_validate_member_gemini_accepts_empty_model() -> None:
     validate_member(_base_fm(client="gemini", model=""))  # must not raise
+
+
+def test_serialise_roundtrip_preserves_empty_model_as_string() -> None:
+    # Live smoke test (2026-07-08): serialise_member wrote a bare
+    # `model:` (nothing after the colon) for an empty string, which
+    # this project's simplified YAML parser reads back as `{}` (an
+    # empty MAPPING) — not an empty string — because "nothing on this
+    # line" is its block-mapping-continues heuristic. Confirmed live:
+    # PATCHing a codex member's model to "" round-tripped to `{}` on
+    # the very next GET. Empty values must serialise as `""`.
+    fm = _base_fm(client="codex", model="")
+    text = serialise_member(fm, "body text")
+    assert 'model: ""' in text
+    reparsed_fm, _ = split_member_file(text)
+    assert reparsed_fm["model"] == ""
+    assert isinstance(reparsed_fm["model"], str)
 
 
 def test_validate_member_unknown_client_rejected() -> None:
