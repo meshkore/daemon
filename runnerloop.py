@@ -233,7 +233,8 @@ class RunnerLoopMixin:
         exit_code = self.proc.wait() if self.proc else None
         text_len = len(cleaned_text or "")
         _log(
-            f"claude({self.conv}) exit={exit_code} stream={self.stream_id} "
+            f"{getattr(self, 'client', None) or 'claude-code'}({self.conv}) "
+            f"exit={exit_code} stream={self.stream_id} "
             f"text_len={text_len} agent_type={self.agent_type}"
         )
         _debug_emit(
@@ -394,14 +395,16 @@ class RunnerLoopMixin:
         attempt = getattr(self, "_transient_attempt", 0)
         if attempt >= self._MAX_TRANSIENT_RETRIES:
             _log(
-                f"claude({self.conv}) transient API error — retry budget "
+                f"{getattr(self, 'client', None) or 'claude-code'}({self.conv}) "
+                f"transient API error — retry budget "
                 f"({self._MAX_TRANSIENT_RETRIES}) exhausted; surfacing error"
             )
             return False
         self._transient_attempt = attempt + 1
         preview = (result_text or "").strip()[:200]
         _log(
-            f"claude({self.conv}) transient API error "
+            f"{getattr(self, 'client', None) or 'claude-code'}({self.conv}) "
+            f"transient API error "
             f"(attempt {self._transient_attempt}/{self._MAX_TRANSIENT_RETRIES}) "
             f"— re-spawning. err={preview!r}"
         )

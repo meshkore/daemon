@@ -205,8 +205,16 @@ def validate_member(fm: Dict[str, Any]) -> None:
     if client not in known_ids():
         raise TeamValidationError(f"client must be one of {known_ids()}")
     model = str(fm.get("model") or "").strip()
+    # DM-CLI-05 follow-up (live smoke test, 2026-07-08) — a driver may
+    # declare "" as a legitimate "use the CLI/account default" catalog
+    # entry (codex, gemini — neither has a claude-style alias to fall
+    # back on). Only THOSE drivers get an empty-model exemption; every
+    # other client (claude-code included) keeps the original mandatory-
+    # non-empty rule unchanged.
     if not model:
-        raise TeamValidationError("model is mandatory and must be non-empty")
+        allowed = {m.get("id") for m in driver_for(client).models_catalog()}
+        if "" not in allowed:
+            raise TeamValidationError("model is mandatory and must be non-empty")
     kind = str(fm.get("kind") or "").strip()
     if kind not in _KINDS:
         raise TeamValidationError(f"kind must be one of {_KINDS}")
@@ -360,6 +368,17 @@ def _order_of(m: Dict[str, Any]) -> int:
 
 def _normalise_payload(payload: Dict[str, Any], *, today: str) -> Dict[str, Any]:
     """Coerce a create payload into a frontmatter dict with defaults."""
+    client = str(payload.get("client") or "claude-code").strip().lower()
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        # DM-CLI-05 follow-up (live smoke test, 2026-07-08) — "opus" is a
+        # Claude-specific alias; defaulting an omitted model to it for a
+        # non-claude-code member produces an invalid `-m opus` argv for
+        # that client (confirmed live: Codex rejects it outright). Only
+        # default to the strongest alias when the resolved driver does
+        # NOT declare "" as its own "use default" catalog entry.
+        allows_empty = "" in {m.get("id") for m in driver_for(client).models_catalog()}
+        model = "" if allows_empty else STRONGEST_MODEL_ALIAS
     fm: Dict[str, Any] = {
         "id": str(payload.get("id") or "").strip(),
         "name": str(payload.get("name") or payload.get("id") or "").strip(),
@@ -368,8 +387,8 @@ def _normalise_payload(payload: Dict[str, Any], *, today: str) -> Dict[str, Any]
         "kind": str(payload.get("kind") or "profile").strip(),
         "required": bool(payload.get("required")),
         "agent_type": str(payload.get("agent_type") or "custom").strip(),
-        "client": str(payload.get("client") or "claude-code").strip().lower(),
-        "model": str(payload.get("model") or STRONGEST_MODEL_ALIAS).strip(),
+        "client": client,
+        "model": model,
         "effort": str(payload.get("effort") or "default").strip().lower(),
         "pinned_order": _coerce_int(payload.get("pinned_order"), 50),
         "exposure": str(payload.get("exposure") or "internal").strip().lower(),

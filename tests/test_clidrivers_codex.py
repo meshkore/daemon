@@ -141,6 +141,32 @@ def test_parse_turn_completed_carries_usage() -> None:
     }
 
 
+def test_parse_error_and_turn_failed_surface_as_final_text() -> None:
+    # Real captured output (2026-07-08 live smoke test): an invalid `-m`
+    # for the account comes back as `error` then `turn.failed`, NOT as an
+    # agent_message. Before this was handled, parse_stream_line returned
+    # [] for both lines and the turn silently finalised with EMPTY text
+    # and exit=1 — no diagnostic anywhere the operator could see.
+    error_line = (
+        '{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,'
+        '\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":'
+        "\\\"The 'opus' model is not supported when using Codex with a "
+        'ChatGPT account.\\"}}"}'
+    )
+    failed_line = (
+        '{"type":"turn.failed","error":{"message":"{\\"type\\":\\"error\\",'
+        '\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",'
+        '\\"message\\":\\"The \'opus\' model is not supported when using '
+        'Codex with a ChatGPT account.\\"}}"}}'
+    )
+    for line in (error_line, failed_line):
+        evs = _driver().parse_stream_line(line)
+        assert len(evs) == 1
+        assert isinstance(evs[0], Final)
+        assert "not supported" in evs[0].text
+        assert evs[0].text.startswith("[codex error]")
+
+
 def test_parse_thread_started_and_turn_started_are_inert() -> None:
     assert (
         _driver().parse_stream_line('{"type":"thread.started","thread_id":"x"}') == []

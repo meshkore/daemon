@@ -189,6 +189,22 @@ class CodexDriver(ClientDriver):
             # with no additional text of its own).
             out.append(Final(text="", usage=usage, cost_usd=None))
             return out
+        # DM-CLI-05 follow-up (live smoke test, 2026-07-08) — a request-
+        # shape error (e.g. an invalid `-m <model>` for the account) comes
+        # back as `{"type":"error", ...}` immediately followed by
+        # `{"type":"turn.failed", ...}`, NOT as an `agent_message`. Before
+        # this branch existed, neither `if` above matched, `parse_stream_line`
+        # returned [], and the turn silently finalised with EMPTY text and
+        # exit=1 — no diagnostic anywhere the operator could see. Surface
+        # the message as Final text (mirrors claude-code's own "API Error:
+        # ..." final-text convention, which is also what `is_transient_error`
+        # below is written to recognize).
+        if ev_type in ("error", "turn.failed"):
+            raw = ev.get("message") or ev.get("error") or ev
+            if isinstance(raw, dict):
+                raw = raw.get("message") or json.dumps(raw)
+            out.append(Final(text=f"[codex error] {raw}", usage=None, cost_usd=None))
+            return out
         return []
 
     def is_transient_error(self, text: str) -> bool:
