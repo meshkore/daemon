@@ -52,7 +52,11 @@ from yamlparse import parse_simple_yaml
 
 # Per-member concurrent-ask cap (TEG-2 guard-rail). Loopback binding is the
 # perimeter; no rate limiting beyond this in v1. Config knob comes later.
-EXT_ASK_CONCURRENT_CAP = 2
+# Raised 2 -> 6 (2026-07-08, operator): a single local operator legitimately
+# fires off several ask/poll probes in quick succession while debugging —
+# 2 was tight enough that ONE orphaned request (see _teamext_reap_stale)
+# was enough to lock the member out entirely.
+EXT_ASK_CONCURRENT_CAP = 6
 # Requests older than this are GC'd from the runtime index.
 EXT_REQUEST_TTL_HOURS = 24
 # Watcher poll cadence + overall turn budget. Agent turns take 30 s – minutes;
@@ -302,6 +306,50 @@ class TeamExtMixin:
             if str((e or {}).get("started_at") or "") >= cutoff
         }
 
+    def _teamext_reap_stale(
+        self, data: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Self-heal requests orphaned by a daemon restart mid-turn.
+
+        `_teamext_watch` is a daemon thread with no persisted registry of
+        its own — if the PROCESS dies (crash, `/shutdown`, a manual
+        restart between different ports) while a watch is in flight, the
+        thread dies with it and nothing will ever call `_teamext_update`
+        to mark the request done/error. The entry is then indistinguishable
+        from a genuinely live request by data shape alone, and sits
+        `running`/`queued` forever — occupying an `EXT_ASK_CONCURRENT_CAP`
+        slot until the 24h GC eventually erases it outright (2026-07-08
+        incident: a daemon port-restart orphaned one, which then silently
+        ate a cap slot for hours).
+
+        Age is the tell: no watcher legitimately survives past
+        `_WATCH_MAX_SECS` — its own hard-timeout branch would have fired
+        and marked it `error` first. So anything `queued`/`running` older
+        than that ceiling belongs to a process that no longer exists;
+        flip it to `error` here so it (a) frees the cap slot immediately
+        and (b) a client polling it sees a terminal status instead of
+        hanging indefinitely."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=_WATCH_MAX_SECS)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        for rid, e in data.items():
+            if e.get("status") not in ("queued", "running"):
+                continue
+            if str(e.get("started_at") or "") >= cutoff:
+                continue
+            e["status"] = "error"
+            e["error"] = (
+                "orphaned by a daemon restart mid-turn (no watcher survived to finish it)"
+            )
+            e["finished_at"] = _iso_now()
+            try:
+                self._teamext_broadcast(
+                    "team.request.error", str(e.get("member") or ""), rid
+                )
+            except Exception:
+                pass
+        return data
+
     def _teamext_update(self, rid: str, **fields: Any) -> Optional[Dict[str, Any]]:
         with self._teamext_lock:
             data = self._teamext_load()
@@ -416,7 +464,7 @@ class TeamExtMixin:
 
         # Per-member concurrent cap (queued|running requests).
         with self._teamext_lock:
-            data = self._teamext_gc(self._teamext_load())
+            data = self._teamext_reap_stale(self._teamext_gc(self._teamext_load()))
             active = sum(
                 1
                 for e in data.values()
@@ -535,7 +583,9 @@ class TeamExtMixin:
         if not bearer:
             return 401, {"error": "unauthorized"}
         with self._teamext_lock:
-            entry = self._teamext_load().get(rid)
+            data = self._teamext_reap_stale(self._teamext_load())
+            self._teamext_save(data)
+            entry = data.get(rid)
         if entry is None:
             return 404, {"error": f"unknown request {rid!r}"}
         mid = str(entry.get("member") or "")
