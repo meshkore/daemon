@@ -26,6 +26,7 @@ class ChatSpawnMixin:
         task_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        client: Optional[str] = None,
         member: Optional[str] = None,
     ) -> ChatRunner:
         """Start one chat turn. Wires the chain so a buffered next
@@ -64,6 +65,7 @@ class ChatSpawnMixin:
             task_id=task_id,
             model=model,
             effort=effort,
+            client=client,
             member=member,
         )
         # ATM10 (agent-team) — if this conv is an INSTANCE of a team member,
@@ -88,6 +90,7 @@ class ChatSpawnMixin:
         # skips the matching CLI flag in that case.
         resolved_model = self._conv_meta_get_model(conv)
         resolved_effort = self._conv_meta_get_effort(conv)
+        resolved_client = self._conv_meta_get_client(conv)
         runner = ChatRunner(
             paths=self.paths,
             cluster=self.cluster,
@@ -100,6 +103,7 @@ class ChatSpawnMixin:
             agent_id=resolved_id,
             model=resolved_model,
             effort=resolved_effort,
+            client=resolved_client,
             member_body=member_body,
             daemon=self,
             # FC-2 (daemon-centralized) — capture the dispatch's project so the

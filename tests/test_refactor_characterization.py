@@ -239,14 +239,6 @@ class _FakeProc:
         pass
 
 
-def _runner_module() -> Any:
-    """The module whose namespace `spawn` resolves `_find_claude` against —
-    'daemon' before the refactor, 'runner' after DM-modularize, 'runnerspawn'
-    after the Phase-3d ChatRunner mixin split. Keyed off spawn's own module so
-    the monkeypatch lands wherever spawn is defined."""
-    return sys.modules[d.ChatRunner.spawn.__module__]
-
-
 def _build_runner(cluster_root: Path, **kw: Any) -> Any:
     paths = d.Paths(cluster_root)
     clu = d.Cluster(paths)
@@ -277,8 +269,18 @@ def _bare_runner() -> Any:
 
 
 def _spawn_capture(cluster_root: Path, monkeypatch: Any, **runner_kw: Any) -> list[str]:
+    # DM-CLI-01 (multi-cli-clients) — binary discovery moved off a
+    # module-level `_find_claude` function (patchable by module) onto
+    # `ClientDriver.find_binary()` (patchable by class/instance). Patch
+    # the driver actually resolved by `driver_for(None)` — the default
+    # ClaudeCodeDriver singleton — so this test doesn't depend on a
+    # real `claude` binary being on PATH.
+    from clidrivers import DRIVERS
+
     monkeypatch.setattr(subprocess, "Popen", _FakeProc)
-    monkeypatch.setattr(_runner_module(), "_find_claude", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(
+        DRIVERS["claude-code"], "find_binary", lambda: "/usr/bin/claude"
+    )
     runner = _build_runner(cluster_root, **runner_kw)
     runner.spawn()
     runner.done.wait(timeout=5)

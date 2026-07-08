@@ -16,8 +16,9 @@ archive. Those calls are all None-guarded so the runner is still
 constructable in tests without a full daemon.
 
 Helpers that ONLY the runner used travel with it: ``_session_id_for_conv``
-(deterministic per-conv claude session id) + ``_find_claude`` (CLI path
-discovery) + ``_CLAUDE_SESSION_NAMESPACE``.
+(deterministic per-conv claude session id) + ``_CLAUDE_SESSION_NAMESPACE``.
+CLI binary discovery (formerly ``_find_claude``) is now per-driver —
+see ``clidrivers/`` (DM-CLI-01, multi-cli-clients).
 
 Bundler note: imports shared helpers from utils + the briefing pipeline
 from prompts (both stripped by bundle.py; resolved via the flat global
@@ -68,6 +69,7 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         agent_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        client: Optional[str] = None,
         member_body: Optional[str] = None,
         daemon: Optional[Any] = None,
         project_id: Optional[str] = None,
@@ -88,6 +90,11 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         # 'default' → no flag; otherwise spawn injects
         # `--effort <level>` (low/medium/high/xhigh/max).
         self.effort = effort
+        # DM-CLI-01/02 (multi-cli-clients) — which ClientDriver spawns
+        # this turn. None (every caller today) resolves to
+        # `clidrivers.driver_for(None)` -> ClaudeCodeDriver, so this is
+        # a no-op until DM-CLI-02 threads a real value through dispatch.
+        self.client = client
         # CU1 (py-1.13.3) — Per-turn usage payload populated when the
         # SDK emits its terminal `result` event with `usage` +
         # `total_cost_usd`. Used in finalize to broadcast `chat.usage`

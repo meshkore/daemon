@@ -83,6 +83,15 @@ class ConvMetaMixin:
             return None
         return e
 
+    def _conv_meta_get_client(self, conv: str) -> Optional[str]:
+        """DM-CLI-02 (multi-cli-clients) — read the per-conv CLI-client
+        preference. Returns None when unset (mirrors
+        `_conv_meta_get_model`/`_conv_meta_get_effort`); the caller
+        falls back to `clidrivers.driver_for(None)` -> claude-code."""
+        meta = self._conv_meta_load().get(conv) or {}
+        c = str(meta.get("client") or "").strip().lower()
+        return c or None
+
     def _conv_meta_get_member(self, conv: str) -> Optional[str]:
         """ATM10 (agent-team) — Read the team member this conv is an INSTANCE
         of. Returns the member id (e.g. 'api-developer') or None when the
@@ -102,6 +111,7 @@ class ConvMetaMixin:
         task_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        client: Optional[str] = None,
         member: Optional[str] = None,
     ) -> None:
         try:
@@ -154,6 +164,15 @@ class ConvMetaMixin:
                     entry["effort"] = e_norm
                 elif "effort" in entry:
                     del entry["effort"]
+            # DM-CLI-02 (multi-cli-clients) — per-conv CLI-client
+            # preference, same "unset means no override" shape as
+            # model/effort above.
+            if client is not None:
+                c_norm = str(client).strip().lower()
+                if c_norm:
+                    entry["client"] = c_norm
+                elif "client" in entry:
+                    del entry["client"]
             # ATM10 (agent-team) — the team member this conv is an INSTANCE of.
             # Persisted beside type/model/effort so the binding survives daemon
             # restarts, drives the /team `instances` join, and is frozen after
@@ -185,6 +204,7 @@ class ConvMetaMixin:
                         "task_id": entry.get("task_id"),
                         "model": entry.get("model"),
                         "effort": entry.get("effort"),
+                        "client": entry.get("client"),
                         "member": entry.get("member"),
                         "ts": _iso_now(),
                     }

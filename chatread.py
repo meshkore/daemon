@@ -88,6 +88,9 @@ class ChatReadMixin:
                 "model": meta.get("model"),
                 # MP3 (py-1.13.4) — per-conv effort (reasoning depth).
                 "effort": meta.get("effort"),
+                # DM-CLI-02 (multi-cli-clients) — per-conv CLI-client
+                # preference; absent means claude-code.
+                "client": meta.get("client"),
                 "archived": arch is not None,
                 "archived_at": arch.get("archived_at") if arch else None,
                 "archived_by": arch.get("by") if arch else None,

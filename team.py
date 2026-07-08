@@ -25,8 +25,11 @@ Schema (frontmatter):
     kind: profile              # singleton | profile
     required: false            # true ⇒ DELETE refused (singleton only)
     agent_type: custom         # AGENT_PROMPTS baseline for the prompt builder
+    client: claude-code        # DM-CLI-02 (multi-cli-clients) — which CLI
+                               # spawns this member's turns. Absent = claude-code
+                               # (every pre-DM-CLI-02 member file, unchanged).
     model: opus                # MANDATORY — strongest alias by default
-    effort: default            # default | low | medium | high | xhigh | max
+    effort: default            # driver-relative — see clidrivers/*.py:efforts_catalog()
     pinned_order: 20           # roster ordering; lower = first
     refs: []                   # docs/workflows the member should know
     credentials_hint: ".meshkore/credentials/"
@@ -34,8 +37,10 @@ Schema (frontmatter):
     updated: 2026-07-03
 
 Validation: `model` required + non-empty; `kind` ∈ {singleton, profile};
-`required: true` only valid with `kind: singleton`.
-"""
+`required: true` only valid with `kind: singleton`; `client` ∈
+`clidrivers.known_ids()`; `effort` ∈ that client's own
+`efforts_catalog()` (NOT a single global enum — different clients can
+offer different reasoning-depth vocabularies)."""
 
 from __future__ import annotations
 
@@ -43,11 +48,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from clidrivers import driver_for, known_ids
 from yamlparse import parse_frontmatter
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _KINDS = ("singleton", "profile")
-_EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")
 # TEG-1 (team-external-gateway) — who may consume this member. `internal`
 # (default when absent) = operator/cockpit only; `external` = the member
 # additionally answers the /team/<id>/ask surface with a per-member bearer
@@ -101,6 +106,7 @@ _FIELD_ORDER = (
     "kind",
     "required",
     "agent_type",
+    "client",
     "model",
     "effort",
     "pinned_order",
@@ -191,6 +197,13 @@ def validate_member(fm: Dict[str, Any]) -> None:
         raise TeamValidationError(
             "id must match ^[a-z][a-z0-9-]{1,31}$ (lowercase slug)"
         )
+    # DM-CLI-02 (multi-cli-clients) — absent/empty means claude-code
+    # (every pre-existing member file validates unchanged). Resolved
+    # BEFORE effort so effort can be checked against THIS client's own
+    # vocabulary rather than one global enum.
+    client = str(fm.get("client") or "claude-code").strip().lower()
+    if client not in known_ids():
+        raise TeamValidationError(f"client must be one of {known_ids()}")
     model = str(fm.get("model") or "").strip()
     if not model:
         raise TeamValidationError("model is mandatory and must be non-empty")
@@ -201,8 +214,11 @@ def validate_member(fm: Dict[str, Any]) -> None:
     if required and kind != "singleton":
         raise TeamValidationError("required: true is only valid with kind: singleton")
     effort = str(fm.get("effort") or "default").strip().lower()
-    if effort not in _EFFORTS:
-        raise TeamValidationError(f"effort must be one of {_EFFORTS}")
+    valid_efforts = sorted(e["id"] for e in driver_for(client).efforts_catalog())
+    if effort not in valid_efforts:
+        raise TeamValidationError(
+            f"effort must be one of {valid_efforts} for client {client!r}"
+        )
     # TEG-1 — exposure enum. Absent/empty means internal (all pre-v1.30
     # member files validate unchanged); anything else must be in the enum.
     exposure = str(fm.get("exposure") or "internal").strip().lower()
@@ -352,6 +368,7 @@ def _normalise_payload(payload: Dict[str, Any], *, today: str) -> Dict[str, Any]
         "kind": str(payload.get("kind") or "profile").strip(),
         "required": bool(payload.get("required")),
         "agent_type": str(payload.get("agent_type") or "custom").strip(),
+        "client": str(payload.get("client") or "claude-code").strip().lower(),
         "model": str(payload.get("model") or STRONGEST_MODEL_ALIAS).strip(),
         "effort": str(payload.get("effort") or "default").strip().lower(),
         "pinned_order": _coerce_int(payload.get("pinned_order"), 50),

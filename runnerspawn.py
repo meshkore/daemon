@@ -1,7 +1,13 @@
 """runnerspawn.py — extracted from runner.py (daemon-architecture-v2 Phase 3d).
 
 RunnerSpawnMixin: methods moved VERBATIM out of ChatRunner; Daemon inherits both so
-every self.* resolves on the combined instance -> byte-identical."""
+every self.* resolves on the combined instance -> byte-identical.
+
+DM-CLI-01 (multi-cli-clients) — spawn() no longer hardcodes the `claude`
+binary/argv. It resolves a ClientDriver (`self.client`, default
+claude-code) and delegates binary discovery + argv construction to it,
+so a future member on `client: gemini`/`codex` spawns through the same
+path with zero changes here."""
 
 from __future__ import annotations
 
@@ -9,7 +15,8 @@ import os
 import threading
 import time
 
-from runnerutil import _find_claude, _session_id_for_conv
+from clidrivers import driver_for
+from runnerutil import _session_id_for_conv
 from utils import _append_timeline, _iso_now, _log
 
 
@@ -17,9 +24,11 @@ class RunnerSpawnMixin:
     def spawn(self) -> None:
         import subprocess
 
-        claude_bin = _find_claude()
-        if not claude_bin:
-            err = "claude CLI not found — install via `npm i -g @anthropic-ai/claude-code`"
+        driver = driver_for(getattr(self, "client", None))
+        self._driver_id = driver.id
+        binary = driver.find_binary()
+        if not binary:
+            err = f"{driver.label} not found — {driver.install_hint()}"
             _log(err)
             self.hub.broadcast(
                 _append_timeline(
@@ -35,62 +44,27 @@ class RunnerSpawnMixin:
             )
             self.done.set()
             return
-        # py-1.6.1 HOTFIX — --session-id from py-1.6.0 caused empty
-        # assistant responses in production (claude-code exited
-        # silently on subsequent turns of the same conv). Reverted to
-        # opt-in via env var MESHKORE_CLAUDE_SESSION_ID=1. Default off
-        # until the failure mode is understood and re-tested.
-        # The uuid5 helper is preserved so reintroduction is a one-line
-        # flip once safe.
         session_id = _session_id_for_conv(self.conv)
+        # py-1.6.1 HOTFIX (claude-code specific, see ClaudeCodeDriver) —
+        # --session-id caused empty assistant responses in production;
+        # default off until re-tested. Computed here (driver-agnostic
+        # conv→uuid hash) and passed through; only the claude-code
+        # driver currently ever puts it in argv.
         use_session = os.environ.get("MESHKORE_CLAUDE_SESSION_ID", "").strip() in (
             "1",
             "true",
             "yes",
             "on",
         )
-        args = [
-            claude_bin,
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            "bypassPermissions",
-            # Headless: cockpit has no UI to surface interactive question
-            # tools. Disallow them so the model defaults to plain-text
-            # asks in the chat bubble instead of stalling on a hanging
-            # AskUserQuestion / ExitPlanMode call.
-            "--disallowed-tools",
-            "AskUserQuestion,ExitPlanMode",
-        ]
-        # MP1 (py-1.13.3) — Per-conv model override. `--model` accepts
-        # one of `opus` / `sonnet` / `haiku` or an explicit model id
-        # (claude-opus-4-7, etc.). When unset (`auto` / None), we omit
-        # the flag entirely and let claude-code pick its default.
-        if self.model:
-            args.extend(["--model", self.model])
-        # MP3 (py-1.13.4) — reasoning-depth dial. Omitted when None
-        # ('default' sentinel) so claude-code uses its own default.
-        if self.effort:
-            args.extend(["--effort", self.effort])
-        if use_session:
-            args[2:2] = ["--session-id", session_id]
-        # py-1.10.5 — Pipe the briefing through stdin instead of
-        # appending it as a positional argument. claude 2.1.145
-        # rejects a trailing positional that arrives AFTER a
-        # multi-value flag (`--disallowed-tools <comma,list>`) — the
-        # parser consumes our prompt as another disallowed-tool name
-        # or just drops it, and claude exits 1 with stderr:
-        #   "Error: Input must be provided either through stdin or
-        #    as a prompt argument when using --print"
-        # Captured 2026-05-29 by py-1.10.4's stderr drainer (which
-        # had been silently dropping this error for every spawn
-        # since the cockpit's roadmap-architect feature shipped).
-        # Stdin works regardless of argv order, so it's the
-        # forward-compatible answer.
         briefing = self._briefing()
+        args = driver.build_args(
+            binary,
+            prompt=briefing,
+            model=self.model,
+            effort=self.effort,
+            session_id=session_id,
+            use_session=use_session,
+        )
         env = {
             **os.environ,
             "MESHKORE_IDENTITY": self.identity,
@@ -128,16 +102,11 @@ class RunnerSpawnMixin:
             start_new_session=True,
         )
         self.pid = self.proc.pid
-        # Write the briefing to stdin and close. claude reads it
-        # all (EOF on close) then begins streaming results to stdout.
-        try:
-            if self.proc.stdin is not None:
-                self.proc.stdin.write(briefing.encode("utf-8"))
-                self.proc.stdin.close()
-        except (BrokenPipeError, OSError) as e:
-            _log(f"claude({self.conv}) stdin write failed: {e}")
+        # Deliver the briefing (stdin-pipe by default; a driver may
+        # override for a client that wants it delivered differently).
+        driver.write_prompt(self.proc, briefing)
         _log(
-            f"claude({self.conv}) spawned pid={self.pid} agent_type={self.agent_type} "
+            f"{driver.id}({self.conv}) spawned pid={self.pid} agent_type={self.agent_type} "
             f"stream={self.stream_id} briefing_len={len(briefing)}"
         )
         self.hub.broadcast(
@@ -146,7 +115,7 @@ class RunnerSpawnMixin:
                 "id": f"chat:{self.conv}",
                 "agent": self.identity,
                 "ts": _iso_now(),
-                "runner": "claude-code",
+                "runner": driver.id,
                 "conv": self.conv,
                 "stream_id": self.stream_id,
             }
@@ -187,4 +156,6 @@ class RunnerSpawnMixin:
             except Exception:
                 continue
             if line:
-                _log(f"claude({self.conv}) stderr: {line}")
+                _log(
+                    f"{getattr(self, '_driver_id', 'claude-code')}({self.conv}) stderr: {line}"
+                )

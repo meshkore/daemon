@@ -12,8 +12,9 @@ The in-process data layer (schema, validation, CRUD, seed) lives in team.py
   chat.* WS bus; GET /team decorates each member with a live `instances`
   count (non-archived convs whose conv_meta.member == id).
 - ATM10: `_member_dispatch_prep` resolves a `member` on /chat/dispatch into
-  (agent_type, model, effort) + enforces freeze-after-first-message and the
-  singleton one-live-instance rule.
+  (agent_type, client, model, effort) + enforces freeze-after-first-message
+  and the singleton one-live-instance rule. `client` added DM-CLI-02
+  (multi-cli-clients) — same override rule as model/effort.
 - ATM5: POST /team/draft — free text → structured member draft via the
   project's Anthropic key (read-only; 503 when no key).
 """
@@ -182,31 +183,35 @@ class TeamMixin:
         body_agent_type: Optional[str],
         body_model: Optional[str],
         body_effort: Optional[str],
+        body_client: Optional[str] = None,
     ) -> Tuple[
         Optional[Tuple[int, Dict[str, Any]]],
+        Optional[str],
         Optional[str],
         Optional[str],
         Optional[str],
     ]:
         """Resolve a `member` binding for a /chat/dispatch turn.
 
-        Returns (err | None, agent_type, model, effort). On any rule
-        violation the first element is a ready (code, body) HTTP error and
-        the rest are None:
+        Returns (err | None, agent_type, client, model, effort). On any
+        rule violation the first element is a ready (code, body) HTTP
+        error and the rest are None:
           - unknown member                → 400
           - rebind after ≥1 message       → 409
           - 2nd live singleton instance   → 409 singleton_instance_exists
 
-        Resolution (when OK): agent_type ← member.agent_type; model/effort ←
-        member values UNLESS the dispatch body explicitly overrides them
-        (overrides win on ANY turn). The caller passes the resolved values
-        through to _spawn_chat_turn / conv_meta so they persist.
+        Resolution (when OK): agent_type ← member.agent_type; client/
+        model/effort ← member values UNLESS the dispatch body explicitly
+        overrides them (overrides win on ANY turn). The caller passes the
+        resolved values through to _spawn_chat_turn / conv_meta so they
+        persist.
         """
         try:
             m = self.team_store.team_get(member)
         except TeamError:
             return (
                 (400, {"error": f"unknown team member {member!r}", "member": member}),
+                None,
                 None,
                 None,
                 None,
@@ -230,6 +235,7 @@ class TeamMixin:
                 None,
                 None,
                 None,
+                None,
             )
 
         # Singleton: only one live (non-archived) instance across convs.
@@ -248,10 +254,16 @@ class TeamMixin:
                     None,
                     None,
                     None,
+                    None,
                 )
 
         resolved_type = str(fm.get("agent_type") or "custom").strip() or "custom"
         # body overrides win on any turn; member fills the gaps.
+        resolved_client = (
+            body_client
+            if body_client
+            else (str(fm.get("client") or "").strip().lower() or None)
+        )
         resolved_model = (
             body_model if body_model else (str(fm.get("model") or "").strip() or None)
         )
@@ -266,7 +278,7 @@ class TeamMixin:
         # body agent_type does NOT override the member's baseline (ATM10:
         # "agent_type ← member's agent_type"). Ignore body_agent_type here.
         _ = body_agent_type
-        return None, resolved_type, resolved_model, resolved_effort
+        return None, resolved_type, resolved_client, resolved_model, resolved_effort
 
     def _conv_has_message(self, conv: str) -> bool:
         """True iff this conv already has ≥1 assistant/user turn on disk —

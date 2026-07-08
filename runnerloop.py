@@ -1,17 +1,26 @@
 """runnerloop.py — extracted from runner.py (daemon-architecture-v2 Phase 3d).
 
 RunnerLoopMixin: methods moved VERBATIM out of ChatRunner; Daemon inherits both so
-every self.* resolves on the combined instance -> byte-identical."""
+every self.* resolves on the combined instance -> byte-identical.
+
+DM-CLI-01 (multi-cli-clients) — the per-line JSON recognition (`ev_type
+== "stream_event"/"user"/"result"`) moved to each ClientDriver's
+`parse_stream_line()`, which returns the four NormalizedEvent shapes
+(TextDelta/ToolUse/ToolResult/Final). Everything else in this loop —
+anchor-marker head buffering, delta throttling, tool timeline
+persistence, usage/cost capture — is UNCHANGED: it's wire-protocol
+orchestration MeshKore owns regardless of which client produced the
+event, so it stays generic here rather than being duplicated per
+driver."""
 
 from __future__ import annotations
 
-import json
-import re
 import secrets
 import time
 from typing import List, Tuple
 
-from agent_types import _agent_manifest
+from clidrivers import driver_for
+from clidrivers.base import Final, TextDelta, ToolResult, ToolUse
 from contextpolicy import policy_for
 from utils import _append_timeline, _debug_emit, _iso_now, _log
 
@@ -31,6 +40,7 @@ class RunnerLoopMixin:
         # callbacks that resolve via the threadlocal.
         if self._project_id and self.daemon is not None:
             self.daemon._set_req_project(self._project_id)
+        driver = driver_for(getattr(self, "client", None))
         last_emit_at = 0.0
         result_text = ""
         for raw in self.proc.stdout:
@@ -40,56 +50,42 @@ class RunnerLoopMixin:
                 continue
             if not line:
                 continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            ev_type = ev.get("type")
-            if ev_type == "stream_event":
-                inner = ev.get("event") or {}
-                if (
-                    inner.get("type") == "content_block_delta"
-                    and (inner.get("delta") or {}).get("type") == "text_delta"
-                ):
-                    delta = (inner.get("delta") or {}).get("text") or ""
-                    if delta:
-                        self.deltas_seen += 1
-                        # LAL2 — Anchor protocol head buffering. Until the
-                        # first newline (or 4 KB) the delta is held in
-                        # `_head_buffer`; once we can decide whether it
-                        # opens with `⟦anchor⟧ {...}` we strip the marker
-                        # and forward the rest. After the head is resolved
-                        # subsequent deltas just pass through the
-                        # `⟦anchor-progress⟧` stripper.
+            for ev in driver.parse_stream_line(line):
+                if isinstance(ev, TextDelta):
+                    delta = ev.text
+                    if not delta:
+                        continue
+                    self.deltas_seen += 1
+                    # LAL2 — Anchor protocol head buffering. Until the
+                    # first newline (or 4 KB) the delta is held in
+                    # `_head_buffer`; once we can decide whether it
+                    # opens with `⟦anchor⟧ {...}` we strip the marker
+                    # and forward the rest. After the head is resolved
+                    # subsequent deltas just pass through the
+                    # `⟦anchor-progress⟧` stripper.
+                    if not self._anchor_head_resolved:
+                        visible = self._resolve_anchor_head(delta)
                         if not self._anchor_head_resolved:
-                            visible = self._resolve_anchor_head(delta)
-                            if not self._anchor_head_resolved:
-                                # Still buffering; nothing to broadcast yet.
-                                continue
-                            self._cumulative_text += visible
-                        else:
-                            self._cumulative_text += self._strip_anchor_progress(delta)
-                        now = time.monotonic()
-                        if now - last_emit_at > 0.2:
-                            last_emit_at = now
-                            self.hub.broadcast(
-                                {
-                                    "type": "chat.assistant.delta",
-                                    "author": self.identity,
-                                    "conv": self.conv,
-                                    "stream_id": self.stream_id,
-                                    "text": self._cumulative_text[:16000],
-                                    "ts": _iso_now(),
-                                }
-                            )
-                elif (
-                    inner.get("type") == "content_block_start"
-                    and (inner.get("content_block") or {}).get("type") == "tool_use"
-                ):
+                            # Still buffering; nothing to broadcast yet.
+                            continue
+                        self._cumulative_text += visible
+                    else:
+                        self._cumulative_text += self._strip_anchor_progress(delta)
+                    now = time.monotonic()
+                    if now - last_emit_at > 0.2:
+                        last_emit_at = now
+                        self.hub.broadcast(
+                            {
+                                "type": "chat.assistant.delta",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "text": self._cumulative_text[:16000],
+                                "ts": _iso_now(),
+                            }
+                        )
+                elif isinstance(ev, ToolUse):
                     self.tool_calls_count += 1
-                    cb = inner.get("content_block") or {}
                     # py-1.5.0 — Persist tool.use to timeline so the
                     # cockpit can replay full turn detail after a reload
                     # or a daemon restart. Previously broadcast-only,
@@ -103,58 +99,37 @@ class RunnerLoopMixin:
                                 "author": self.identity,
                                 "conv": self.conv,
                                 "stream_id": self.stream_id,
-                                "tool": cb.get("name"),
-                                "input": cb.get("input"),
+                                "tool": ev.name,
+                                "input": ev.input,
                             },
                         )
                     )
-                continue
-            if ev_type == "user":
-                for c in (ev.get("message") or {}).get("content") or []:
-                    if isinstance(c, dict) and c.get("type") == "tool_result":
-                        # py-1.5.0 — Persist tool.result too (was
-                        # broadcast-only). Pair-matched to a tool.use
-                        # via stream_id in the cockpit.
-                        self.hub.broadcast(
-                            _append_timeline(
-                                self.paths,
-                                {
-                                    "type": "tool.result",
-                                    "author": self.identity,
-                                    "conv": self.conv,
-                                    "stream_id": self.stream_id,
-                                    "ok": not c.get("is_error"),
-                                },
-                            )
+                elif isinstance(ev, ToolResult):
+                    # py-1.5.0 — Persist tool.result too (was
+                    # broadcast-only). Pair-matched to a tool.use
+                    # via stream_id in the cockpit.
+                    self.hub.broadcast(
+                        _append_timeline(
+                            self.paths,
+                            {
+                                "type": "tool.result",
+                                "author": self.identity,
+                                "conv": self.conv,
+                                "stream_id": self.stream_id,
+                                "ok": ev.ok,
+                            },
                         )
-                continue
-            if ev_type == "result" and isinstance(ev.get("result"), str):
-                result_text = ev["result"]
-                # CU1 (py-1.13.3) — Capture token usage + cost from the
-                # SDK's terminal event. claude-code emits e.g.
-                #   {"type":"result","result":"…","usage":{
-                #       "input_tokens":N,"output_tokens":N,
-                #       "cache_read_input_tokens":N,
-                #       "cache_creation_input_tokens":N},
-                #    "total_cost_usd":N,"num_turns":N}
-                # Daemon previously ignored both fields. Stored on the
-                # runner so `_finalize_usage` can broadcast + accumulate
-                # after the loop exits.
-                usage = ev.get("usage")
-                if isinstance(usage, dict):
-                    self.last_turn_usage = {
-                        "input_tokens": int(usage.get("input_tokens") or 0),
-                        "output_tokens": int(usage.get("output_tokens") or 0),
-                        "cache_read_input_tokens": int(
-                            usage.get("cache_read_input_tokens") or 0
-                        ),
-                        "cache_creation_input_tokens": int(
-                            usage.get("cache_creation_input_tokens") or 0
-                        ),
-                    }
-                cost = ev.get("total_cost_usd")
-                if isinstance(cost, (int, float)):
-                    self.last_turn_cost_usd = float(cost)
+                    )
+                elif isinstance(ev, Final):
+                    result_text = ev.text
+                    # CU1 (py-1.13.3) — Capture token usage + cost from
+                    # the client's terminal event, when it reports one.
+                    # Stored on the runner so the finalize block below
+                    # can broadcast + accumulate after the loop exits.
+                    if ev.usage is not None:
+                        self.last_turn_usage = ev.usage
+                    if ev.cost_usd is not None:
+                        self.last_turn_cost_usd = ev.cost_usd
         # Finalize. py-1.13.2 — `result_text` (from the Claude SDK
         # `result` event) was bypassing the anchor stripper because the
         # stripper runs delta-by-delta on `_cumulative_text`. Sweep both
@@ -216,16 +191,20 @@ class RunnerLoopMixin:
                     self.last_turn_cost_usd,
                 )
                 # CTX1 (py-1.28.0) — context-window awareness. Resolve the
-                # per-PLATFORM policy from this agent type (claude-code knows
-                # its window + self-compacts; an unmodelled runtime gets a null
-                # policy — no gauge, no compaction claim). `describe()` turns
-                # this turn's prompt tokens into a fill ratio + a should_compact
-                # flag the cockpit paints as the context gauge / "will compact"
-                # hint. See contextpolicy.py for the headless-turn rationale.
-                platform = _agent_manifest(self.agent_type).get(
-                    "platform", "claude-code"
-                )
-                context_block = policy_for(platform).describe(
+                # policy from the CLIENT that actually ran this turn
+                # (claude-code knows its window + self-compacts; an
+                # unmodelled client gets a null policy — no gauge, no
+                # compaction claim). `describe()` turns this turn's prompt
+                # tokens into a fill ratio + a should_compact flag the
+                # cockpit paints as the context gauge / "will compact"
+                # hint. See contextpolicy.py for the headless-turn
+                # rationale. DM-CLI-02 (multi-cli-clients) — was keyed by
+                # `_agent_manifest(agent_type).get("platform")` (a
+                # role-level, always-claude-code-in-practice value); now
+                # keyed by `self.client`, the actual per-member dispatch
+                # target, so a future Gemini/Codex member reports
+                # "unmodelled" instead of a false claude-code claim.
+                context_block = policy_for(self.client or "claude-code").describe(
                     self.last_turn_usage, self.model
                 )
                 self.hub.broadcast(
@@ -374,48 +353,20 @@ class RunnerLoopMixin:
 
     # TR1 (py-1.21.1) — re-spawn budget for transport-class API errors.
     # 2 retries = 3 attempts total. Past this we surface the error so a
-    # genuinely stuck turn can't loop forever.
+    # genuinely stuck turn can't loop forever. (Driver-agnostic: the
+    # budget applies regardless of which client is running; only the
+    # error-string CLASSIFIER below is driver-specific.)
     _MAX_TRANSIENT_RETRIES = 2
-    # Status codes claude-code surfaces as "API Error: <code> …" that a
-    # fresh spawn can clear (overload / upstream / gateway). 400/401/403/
-    # 404/413 are deliberately EXCLUDED — those are request-shape problems
-    # (bad model id, auth, prompt-too-long) a retry won't fix; the one 400
-    # we DO retry is matched by signature below, not by code.
-    _TRANSIENT_STATUS_RE = re.compile(r"api error:\s*(?:429|5\d\d)\b")
 
     def _is_transient_api_error(self, text: str) -> bool:
-        """True iff `text` is a claude-code API error that a fresh spawn
-        can plausibly clear — a TRANSPORT failure, not a task outcome.
-        Conservative: only the explicit allowlist below qualifies."""
-        if not text:
-            return False
-        low = text.strip().lower()
-        if not low.startswith("api error"):
-            return False
-        # NEVER retry request-shape failures — a re-spawn rebuilds the same
-        # oversized/invalid request and burns the budget for nothing.
-        if "too long" in low or "prompt is too" in low:
-            return False
-        # The specific 400 we DO retry: the thinking/redacted_thinking
-        # "cannot be modified" CLI reconstruction bug — a fresh message
-        # array makes it disappear.
-        if "cannot be modified" in low or "redacted_thinking" in low:
-            return True
-        # Transient upstream conditions.
-        markers = (
-            "overloaded",
-            "rate limit",
-            "rate_limit",
-            "internal server error",
-            "service unavailable",
-            "bad gateway",
-            "gateway timeout",
-            "timed out",
-            "timeout",
-        )
-        if any(m in low for m in markers):
-            return True
-        return bool(self._TRANSIENT_STATUS_RE.search(low))
+        """True iff `text` is a TRANSPORT failure (rate limit, upstream
+        5xx, timeout) the current client's driver recognizes as
+        plausibly cleared by a fresh spawn — not a task outcome.
+        DM-CLI-01: thin delegate to the resolved driver so this method
+        name/signature stays stable for every existing caller/test;
+        the actual per-client error vocabulary now lives in
+        `clidrivers/*.py:is_transient_error()`."""
+        return driver_for(getattr(self, "client", None)).is_transient_error(text)
 
     def _maybe_retry_transient(self, result_text: str) -> bool:
         """If the turn died on a transient API error and we still have

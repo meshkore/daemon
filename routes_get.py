@@ -181,6 +181,12 @@ def route_get(self, daemon):  # noqa: N802
         return self._json(200, {"ok": True, "generated_at": _iso_now()})
     if p == "/agents":
         return self._json(200, daemon.agents_listing())
+    # DM-CLI-06 (multi-cli-clients) — which CLI clients a team member
+    # can be dispatched through, and whether each is actually usable on
+    # THIS machine right now. No auth (like /agents /state): catalog +
+    # local install/auth probes carry no secrets.
+    if p == "/clients":
+        return self._json(200, daemon.clients_listing())
     # Initiative `agent-team` (ATM9) — team roster. Read-only, no auth
     # (like /agents /state); frontmatter carries no secrets. Mutations
     # (POST/PATCH/DELETE) are gated in routes_post / do_PATCH / do_DELETE.

@@ -91,6 +91,7 @@ EXERCISE = [
     ("GET", "/state", False, {("==", "/state")}),
     ("GET", "/info", False, {("==", "/info")}),
     ("GET", "/agents", False, {("==", "/agents")}),
+    ("GET", "/clients", False, {("==", "/clients")}),
     ("GET", "/storage/usage", False, {("==", "/storage/usage")}),
     ("GET", "/chat/snapshot", True, {("==", "/chat/snapshot")}),
     ("GET", "/chat/convs", True, {("==", "/chat/convs")}),

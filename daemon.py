@@ -76,6 +76,7 @@ from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
 from teamsvc import TeamMixin  # noqa: E402 — agent-team /team surface (ATM9/10/5)
+from clidriverssvc import ClientsMixin  # noqa: E402 — DM-CLI-06 GET /clients
 from teamext import TeamExtMixin  # noqa: E402 — team-external-gateway (TEG-1/2/4)
 from verifysvc import VerifyMixin  # noqa: E402
 from projectctx import ProjectContext  # noqa: E402 — DC-1: per-project state
@@ -252,6 +253,7 @@ class Daemon(
     SelfUpdateMixin,
     TeamMixin,
     TeamExtMixin,
+    ClientsMixin,
     VerifyMixin,
     WallsMixin,
     ProjectsMixin,
