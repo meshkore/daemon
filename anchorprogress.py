@@ -58,6 +58,47 @@ def _changes_since(root: Any, start_sha: Optional[str]) -> Tuple[List[str], List
     return uniq_files[:_MAX_FILES], commits[:_MAX_COMMITS]
 
 
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: 128234 → '128k', 950 → '950'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{round(n / 1000)}k"
+    return str(n)
+
+
+def _resolution_facts(files: List[str], commits: List[str], total_tokens: int) -> str:
+    """The one-line facts strip + the files block appended below a
+    resolution summary. English (Standard: product strings are English).
+
+    Returns '' when there's nothing durable to record, so a turn that
+    committed nothing and reported no tokens leaves a clean summary.
+
+    Shape:
+        **Commit** `a1b2c3d4e` (+2) · 12 files · 128k tokens
+
+        **Files changed (12):**
+        - `apps/web/x.tsx`
+        - …
+    """
+    strip: List[str] = []
+    if commits:
+        more = f" (+{len(commits) - 1})" if len(commits) > 1 else ""
+        strip.append(f"**Commit** `{commits[0][:9]}`{more}")
+    if files:
+        strip.append(f"{len(files)} file{'s' if len(files) != 1 else ''}")
+    if total_tokens > 0:
+        strip.append(f"{_fmt_tokens(total_tokens)} tokens")
+
+    out = ""
+    if strip:
+        out += " · ".join(strip)
+    if files:
+        listed = "\n".join(f"- `{f}`" for f in files)
+        out += f"\n\n**Files changed ({len(files)}):**\n{listed}"
+    return out
+
+
 def _upsert_body_section(text: str, heading: str, content: str) -> str:
     """Replace the `## <heading>` section (heading line through the line
     before the next `## ` or EOF) with `content`, or append it if absent.
@@ -173,6 +214,20 @@ class AnchorProgressMixin:
             now = _iso_now()
             summary = (final_text or "").strip()
 
+            # Cumulative tokens spent on this task's conv (input + output +
+            # both cache buckets). 0 when the conv has no recorded turns.
+            total_tokens = 0
+            try:
+                usage = self.chat_sessions.usage_total(conv) or {}
+                total_tokens = (
+                    int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("output_tokens", 0) or 0)
+                    + int(usage.get("cache_read_input_tokens", 0) or 0)
+                    + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                )
+            except Exception:
+                total_tokens = 0
+
             # ── FAILURE branch — the turn exited non-zero (after the TR1
             #    transient-retry shield, so this is a genuine failure). ──────
             if exit_code not in (None, 0):
@@ -193,13 +248,14 @@ class AnchorProgressMixin:
                 if commits:
                     fm_patch["commit_shas"] = commits
                 _patch_frontmatter(path, fm_patch)
-                body = (
-                    f"_Failed (exit {exit_code}) — {agent_id or conv} via "
-                    f"`{conv}` at {now}._\n\n{reason}"
-                )
-                if files:
-                    listed = "\n".join(f"- `{f}`" for f in files)
-                    body += f"\n\n**Ficheros tocados ({len(files)}):**\n{listed}"
+                # No "who/when" prose prefix — the who (`resolved_by`) and
+                # when (`failed_at`) live in frontmatter and the cockpit
+                # renders them separately. The body carries only what's
+                # actionable: WHY it failed + what it touched.
+                body = f"**Failed — exit {exit_code}.**\n\n{reason}"
+                facts = _resolution_facts(files, commits, total_tokens)
+                if facts:
+                    body += f"\n\n{facts}"
                 text2 = path.read_text(errors="replace")
                 path.write_text(_upsert_body_section(text2, "Resolution", body))
                 self.state_manager.rebuild(broadcast=True)
@@ -224,15 +280,17 @@ class AnchorProgressMixin:
             _patch_frontmatter(path, fm_patch)
             if len(summary) > _RESOLUTION_MAX_CHARS:
                 summary = summary[:_RESOLUTION_MAX_CHARS].rstrip() + "\n\n…(truncated)"
-            body = (
-                f"_Resolved by {agent_id or conv} via `{conv}` at {now}._\n\n{summary}"
-            )
-            # The modified-files list lives in the body (no frontmatter
-            # schema change → no Standard bump). The cockpit renders the
-            # resolution body, so this surfaces in the archived registry.
-            if files:
-                listed = "\n".join(f"- `{f}`" for f in files)
-                body += f"\n\n**Ficheros modificados ({len(files)}):**\n{listed}"
+            # The resolution body is now pure signal: the agent's own
+            # summary of WHAT it did, then a compact facts strip (commit +
+            # files + tokens) and the changed-files list. Dropped the
+            # "_Resolved by <agent> via <conv>_" prefix — the operator
+            # doesn't care which ephemeral subagent ran it (that's obvious),
+            # and who/when already live in frontmatter (`resolved_by`,
+            # `completed_at`), which the cockpit shows on its own line.
+            body = summary
+            facts = _resolution_facts(files, commits, total_tokens)
+            if facts:
+                body += f"\n\n{facts}"
             text2 = path.read_text(errors="replace")  # re-read after fm patch
             path.write_text(_upsert_body_section(text2, "Resolution", body))
             self.state_manager.rebuild(broadcast=True)
