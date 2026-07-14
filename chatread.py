@@ -91,6 +91,18 @@ class ChatReadMixin:
                 # DM-CLI-02 (multi-cli-clients) — per-conv CLI-client
                 # preference; absent means claude-code.
                 "client": meta.get("client"),
+                # agent-team (ATM10) — the roster member this conv is bound
+                # to. Was persisted to conv_meta but never surfaced here, so
+                # the cockpit could never learn/heal a pre-existing conv's
+                # member binding (only conv-creation-time local state), and
+                # `member` was silently omitted from EVERY dispatch on such
+                # a conv — defeating per-member model/client/provider
+                # (operator field report 2026-07-13: switching a member's
+                # provider had zero effect on its long-lived system conv).
+                "member": meta.get("member"),
+                # multi-provider-agents (MPV1) — surfaced for symmetry with
+                # client/model so the cockpit can display/heal it too.
+                "provider": meta.get("provider"),
                 "archived": arch is not None,
                 "archived_at": arch.get("archived_at") if arch else None,
                 "archived_by": arch.get("by") if arch else None,
