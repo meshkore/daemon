@@ -185,9 +185,17 @@ class BriefingPipeline:
         agent_type: Optional[str] = None,
         agent_id: Optional[str] = None,
         member_body: Optional[str] = None,
+        daemon_port: Optional[int] = None,
     ):
         self.paths = paths
         self.cluster = cluster
+        # daemon-centralized — the LIVE port the central daemon is listening on,
+        # injected by the runner from its daemon back-ref. This is the SINGLE
+        # source of truth for the in-briefing base URL. Reading a per-project
+        # `.runtime/port` file instead was fragile: an ADOPTED project never gets
+        # one written, so the read fell back to a hardcoded 5570 and every agent
+        # probed a dead port ("daemon down" false alarm, field 2026-07-09).
+        self.daemon_port = daemon_port
         self.identity = identity
         self.conv = conv
         self.user_text = user_text
@@ -492,10 +500,16 @@ class BriefingPipeline:
         )
 
     def _section_core_rules(self) -> str:
-        try:
-            port = int(self.paths.port_file.read_text().strip())
-        except (OSError, ValueError):
-            port = 5570
+        # SINGLE source of truth: the live daemon port the runner injected.
+        # Fall back to the per-project port file only when the builder was
+        # constructed without a daemon back-ref (rare non-dispatch paths), and
+        # to 5570 only as an absolute last resort.
+        port = self.daemon_port
+        if not port:
+            try:
+                port = int(self.paths.port_file.read_text().strip())
+            except (OSError, ValueError):
+                port = 5570
         # py-1.10.14 — single source of truth for the in-prompt base URL.
         # HTTPS over `daemon.meshkore.com:<port>` when the TLS bundle is
         # present (the default since D-TLS-01), plain HTTP only as

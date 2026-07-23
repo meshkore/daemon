@@ -79,6 +79,40 @@ def test_register_isolate_unregister_second_project(daemon, tmp_path: Path) -> N
     assert r.status_code == 409, r.text
 
 
+def test_register_seeds_daemon_token_into_project(daemon, tmp_path: Path) -> None:
+    """daemon-centralized — registering a project must seed the daemon's single
+    bearer token into that project's `.meshkore/credentials/portal-token`, so
+    its subagents authenticate with zero operator action. The daemon validates
+    every request against ONE token; an adopted folder that lacks the file (or
+    carries a stale one) would leave every agent request 401ing."""
+    token = daemon.auth["Authorization"].split("Bearer ", 1)[1]
+
+    # (a) create-from-scratch path: fresh dir, no credentials yet.
+    root = tmp_path / "seed-me"
+    root.mkdir(parents=True, exist_ok=True)
+    r = daemon.post(
+        "/projects", headers=daemon.auth, json={"path": str(root), "name": "Seed Me"}
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["token_synced"] is True
+    tf = root / ".meshkore" / "credentials" / "portal-token"
+    assert tf.exists(), "portal-token must be written on register"
+    assert tf.read_text().strip() == token, "must equal the daemon's token"
+
+    # (b) adopt path with a STALE token already present → corrected to match.
+    root2 = tmp_path / "adopt-stale"
+    (root2 / ".meshkore" / "credentials").mkdir(parents=True, exist_ok=True)
+    stale = root2 / ".meshkore" / "credentials" / "portal-token"
+    stale.write_text("stale-wrong-token")
+    r = daemon.post(
+        "/projects",
+        headers=daemon.auth,
+        json={"path": str(root2), "name": "Adopt Stale"},
+    )
+    assert r.status_code == 201, r.text
+    assert stale.read_text().strip() == token, "stale token must be corrected"
+
+
 @pytest.mark.cluster("populated")
 def test_debug_stream_is_project_tagged(daemon) -> None:
     """Centralized multi-project debug: a cockpit-style POST /debug/log with the

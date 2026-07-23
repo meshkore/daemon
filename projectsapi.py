@@ -115,6 +115,49 @@ class ProjectsMixin:
             )
         self.global_ledger.save_projects(rows)
 
+    # ── per-project token sync (daemon-centralized) ──────────────────────
+    def _ensure_project_token(self, root: Any) -> bool:
+        """Write the daemon's single bearer token into a served project's
+        `.meshkore/credentials/portal-token`.
+
+        The centralized daemon validates EVERY request against ONE token
+        (`daemon.token`, its own home's portal-token — see routes._need_auth).
+        But subagents dispatched for a project read the token from THAT
+        project's `.meshkore/credentials/portal-token` (the briefing points
+        there). An ADOPTED folder has no such file (→ agent has no token) and a
+        folder scaffolded standalone once has a STALE one (≠ daemon.token →
+        every agent request 401s). Either way the project's agents can't reach
+        the daemon. Fix: the daemon — the single source of truth — syncs its
+        own token into each project on register + boot, so agents always read a
+        token the daemon will accept, with zero operator action. Gitignored
+        (Standard §2), mode 600, same trust level as the home's own token file.
+
+        Returns True when it wrote (created or corrected), False when already
+        in sync or on error (best-effort — never blocks registration)."""
+        token = getattr(self, "token", "") or ""
+        if not token:
+            return False
+        try:
+            paths = Paths(Path(root))
+            paths.credentials.mkdir(parents=True, exist_ok=True)
+            try:
+                paths.credentials.chmod(0o700)
+            except OSError:
+                pass
+            tf = paths.token_file
+            if tf.exists() and tf.read_text().strip() == token:
+                return False  # already in sync
+            tf.write_text(token)
+            try:
+                os.chmod(tf, 0o600)
+            except OSError:
+                pass
+            _log(f"projects: synced portal-token → {tf}")
+            return True
+        except OSError as e:  # noqa: BLE001 — never let token sync block a register
+            _log(f"projects: could not sync portal-token for {root}: {e}")
+            return False
+
     # ── boot rehydrate ────────────────────────────────────────────────────
     def rehydrate_projects(self) -> None:
         """On boot, lazily register every additional project recorded in
@@ -136,6 +179,13 @@ class ProjectsMixin:
                 continue
             self._registry.add_path(pid, Path(path))
         self._prune_home_from_projects()
+        # Backfill the daemon token into EVERY served project (adopted folders
+        # that never had one, and folders left with a stale one) so their agents
+        # authenticate from the first turn — heals the whole fleet on boot.
+        for pid in self._real_project_ids():
+            r = self._registry.root_of(pid)
+            if r:
+                self._ensure_project_token(r)
 
     def _prune_home_from_projects(self) -> None:
         """Rewrite projects.json without any server-home row. No-op (no write)
@@ -293,11 +343,16 @@ class ProjectsMixin:
         self.global_ledger.save_projects(
             [row for row in meta.values() if not self.is_home(row.get("id", ""))]
         )
+        # Seed the daemon token into the project so its agents authenticate with
+        # zero operator action — the whole point of "add a project" being
+        # one-click (works for both adopt-existing and create-from-scratch).
+        token_synced = self._ensure_project_token(root)
         return 201, {
             "id": pid,
             "name": name,
             "path": str(root),
             "scaffolded": scaffolded,
+            "token_synced": token_synced,
         }
 
     def project_unregister(self, project_id: str) -> Tuple[int, Dict[str, Any]]:

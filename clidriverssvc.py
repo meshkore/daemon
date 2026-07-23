@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from clidrivers import DRIVERS
+from providers import CLIENT_KEY_SPECS
 
 
 class ClientsMixin:
@@ -29,14 +30,32 @@ class ClientsMixin:
         out: List[Dict[str, Any]] = []
         for driver_id in sorted(DRIVERS):
             driver = DRIVERS[driver_id]
-            out.append(
-                {
-                    "id": driver.id,
-                    "label": driver.label,
-                    "installed": driver.find_binary() is not None,
-                    "authConfigured": driver.auth_configured(),
-                    "models": driver.models_catalog(),
-                    "efforts": driver.efforts_catalog(),
-                }
-            )
+            entry: Dict[str, Any] = {
+                "id": driver.id,
+                "label": driver.label,
+                "installed": driver.find_binary() is not None,
+                "authConfigured": driver.auth_configured(),
+                "models": driver.models_catalog(),
+                "efforts": driver.efforts_catalog(),
+            }
+            # multi-provider-agents (MPV1) — the claude-code client carries a
+            # PROVIDER dimension (Anthropic / ZAI / …). Attach the availability
+            # list (booleans + catalogs, NEVER key material) so the cockpit's
+            # member UI can gate the Provider dropdown. Older cockpits ignore
+            # the extra field; daemons without ProvidersMixin never reach here.
+            if driver.id == "claude-code" and hasattr(self, "providers_public_listing"):
+                entry["providers"] = self.providers_public_listing()
+            # multi-provider-agents follow-up — Codex/Gemini aren't claude-code
+            # providers; they're CLIENTS with an optional daemon-managed API
+            # key (see providers.CLIENT_KEY_SPECS). Surface whether one is
+            # stored, and let it upgrade `authConfigured` from the driver's
+            # own env-only probe (False/None) to a confident True — a key set
+            # in Config → General settings makes the client usable even in a
+            # shell with no env var / no interactive login done.
+            elif driver.id in CLIENT_KEY_SPECS and hasattr(self, "resolve_client_key"):
+                key = self.resolve_client_key(driver.id)
+                entry["keyPresent"] = key is not None
+                if key is not None:
+                    entry["authConfigured"] = True
+            out.append(entry)
         return out

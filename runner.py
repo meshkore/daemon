@@ -70,6 +70,7 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         client: Optional[str] = None,
+        provider: Optional[str] = None,
         member_body: Optional[str] = None,
         daemon: Optional[Any] = None,
         project_id: Optional[str] = None,
@@ -95,6 +96,12 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
         # `clidrivers.driver_for(None)` -> ClaudeCodeDriver, so this is
         # a no-op until DM-CLI-02 threads a real value through dispatch.
         self.client = client
+        # multi-provider-agents (MPV1) — which LLM backend the claude-code
+        # client talks to this turn. None / 'anthropic' → native env (login
+        # /config); a non-default provider (e.g. 'zai') makes spawn overlay
+        # ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL/SMALL_FAST_MODEL from the
+        # machine-global config. Only acted on for the claude-code driver.
+        self.provider = provider
         # CU1 (py-1.13.3) — Per-turn usage payload populated when the
         # SDK emits its terminal `result` event with `usage` +
         # `total_cost_usd`. Used in finalize to broadcast `chat.usage`
@@ -197,6 +204,10 @@ class ChatRunner(RunnerAnchorMixin, RunnerLoopMixin, RunnerSpawnMixin):
             agent_type=self.agent_type,
             agent_id=self.agent_id,
             member_body=self.member_body,
+            # daemon-centralized — the ONE live port is the daemon's own; the
+            # briefing must state it, not a per-project file that adopted
+            # projects never get (which fell back to a dead 5570).
+            daemon_port=getattr(self.daemon, "port", None) if self.daemon else None,
         ).build()
 
     def cancel(self) -> None:

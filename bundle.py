@@ -56,7 +56,8 @@ MODULES = [
     "registries.py",
     "workflows.py",
     "clidrivers",  # package folder — DM-CLI-01 (multi-cli-clients); deps: none. Before team.py (validate_member needs driver_for/known_ids).
-    "team.py",  # agent-team (ATM2) — TeamStore; deps: yamlparse, clidrivers (DM-CLI-02). Before projectctx/teamsvc.
+    "providers.py",  # multi-provider-agents (MPV1) — provider registry + build_launch_env; deps: none. Before team.py (validate_member needs known_provider_ids) and runnerspawn.py.
+    "team.py",  # agent-team (ATM2) — TeamStore; deps: yamlparse, clidrivers (DM-CLI-02), providers (MPV1). Before projectctx/teamsvc.
     "teamext.py",  # team-external-gateway (TEG-1/2/4) — token store + ask/poll + A2A card; deps: team, fsatomic, yamlparse, utils
     "statebuild.py",
     "state.py",
@@ -101,6 +102,7 @@ MODULES = [
     "crud.py",
     "teamsvc.py",  # agent-team (ATM9/10/5) — /team surface mixin; deps: team, utils
     "clidriverssvc.py",  # DM-CLI-06 (multi-cli-clients) — GET /clients mixin; deps: clidrivers
+    "providersvc.py",  # MPV1 (multi-provider-agents) — /config/providers mixin + key store + resolve_provider; deps: clidrivers, providers, fsatomic, utils
     "quota.py",
     "quotaprober.py",
     "routes_get.py",

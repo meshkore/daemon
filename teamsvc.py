@@ -184,8 +184,10 @@ class TeamMixin:
         body_model: Optional[str],
         body_effort: Optional[str],
         body_client: Optional[str] = None,
+        body_provider: Optional[str] = None,
     ) -> Tuple[
         Optional[Tuple[int, Dict[str, Any]]],
+        Optional[str],
         Optional[str],
         Optional[str],
         Optional[str],
@@ -193,24 +195,25 @@ class TeamMixin:
     ]:
         """Resolve a `member` binding for a /chat/dispatch turn.
 
-        Returns (err | None, agent_type, client, model, effort). On any
-        rule violation the first element is a ready (code, body) HTTP
-        error and the rest are None:
+        Returns (err | None, agent_type, client, model, effort, provider).
+        On any rule violation the first element is a ready (code, body)
+        HTTP error and the rest are None:
           - unknown member                → 400
           - rebind after ≥1 message       → 409
           - 2nd live singleton instance   → 409 singleton_instance_exists
 
         Resolution (when OK): agent_type ← member.agent_type; client/
-        model/effort ← member values UNLESS the dispatch body explicitly
-        overrides them (overrides win on ANY turn). The caller passes the
-        resolved values through to _spawn_chat_turn / conv_meta so they
-        persist.
+        model/effort/provider ← member values UNLESS the dispatch body
+        explicitly overrides them (overrides win on ANY turn). The caller
+        passes the resolved values through to _spawn_chat_turn / conv_meta
+        so they persist.
         """
         try:
             m = self.team_store.team_get(member)
         except TeamError:
             return (
                 (400, {"error": f"unknown team member {member!r}", "member": member}),
+                None,
                 None,
                 None,
                 None,
@@ -236,6 +239,7 @@ class TeamMixin:
                 None,
                 None,
                 None,
+                None,
             )
 
         # Singleton: only one live (non-archived) instance across convs.
@@ -251,6 +255,7 @@ class TeamMixin:
                             "conv": other,
                         },
                     ),
+                    None,
                     None,
                     None,
                     None,
@@ -275,10 +280,26 @@ class TeamMixin:
         # 'default' effort is a no-op sentinel — treat as no override.
         if resolved_effort in ("default", ""):
             resolved_effort = None
+        # multi-provider-agents (MPV1) — provider resolves like client, but
+        # DEFAULTS to 'anthropic' (a concrete value, not None) so a member
+        # explicitly on Anthropic overwrites a stale 'zai' in the sidecar.
+        # spawn treats 'anthropic'/None identically (native env).
+        resolved_provider = (
+            body_provider
+            if body_provider
+            else (str(fm.get("provider") or "").strip().lower() or "anthropic")
+        )
         # body agent_type does NOT override the member's baseline (ATM10:
         # "agent_type ← member's agent_type"). Ignore body_agent_type here.
         _ = body_agent_type
-        return None, resolved_type, resolved_client, resolved_model, resolved_effort
+        return (
+            None,
+            resolved_type,
+            resolved_client,
+            resolved_model,
+            resolved_effort,
+            resolved_provider,
+        )
 
     def _conv_has_message(self, conv: str) -> bool:
         """True iff this conv already has ≥1 assistant/user turn on disk —

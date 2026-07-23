@@ -92,6 +92,17 @@ class ConvMetaMixin:
         c = str(meta.get("client") or "").strip().lower()
         return c or None
 
+    def _conv_meta_get_provider(self, conv: str) -> Optional[str]:
+        """multi-provider-agents (MPV1) — read the per-conv PROVIDER (LLM
+        backend for the claude-code client). Returns None when unset;
+        otherwise the provider id (e.g. 'zai'). 'anthropic' is stored
+        explicitly (not collapsed to None) so switching a member BACK to
+        Anthropic clears a stale 'zai' from the sidecar on the next turn;
+        ChatRunner.spawn treats None/'anthropic' identically (native env)."""
+        meta = self._conv_meta_load().get(conv) or {}
+        p = str(meta.get("provider") or "").strip().lower()
+        return p or None
+
     def _conv_meta_get_member(self, conv: str) -> Optional[str]:
         """ATM10 (agent-team) — Read the team member this conv is an INSTANCE
         of. Returns the member id (e.g. 'api-developer') or None when the
@@ -112,6 +123,7 @@ class ConvMetaMixin:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         client: Optional[str] = None,
+        provider: Optional[str] = None,
         member: Optional[str] = None,
     ) -> None:
         try:
@@ -173,6 +185,15 @@ class ConvMetaMixin:
                     entry["client"] = c_norm
                 elif "client" in entry:
                     del entry["client"]
+            # multi-provider-agents (MPV1) — per-conv PROVIDER (LLM backend
+            # for the claude-code client). Same "unset means no override"
+            # shape as client/model/effort above.
+            if provider is not None:
+                p_norm = str(provider).strip().lower()
+                if p_norm:
+                    entry["provider"] = p_norm
+                elif "provider" in entry:
+                    del entry["provider"]
             # ATM10 (agent-team) — the team member this conv is an INSTANCE of.
             # Persisted beside type/model/effort so the binding survives daemon
             # restarts, drives the /team `instances` join, and is frozen after
@@ -205,6 +226,7 @@ class ConvMetaMixin:
                         "model": entry.get("model"),
                         "effort": entry.get("effort"),
                         "client": entry.get("client"),
+                        "provider": entry.get("provider"),
                         "member": entry.get("member"),
                         "ts": _iso_now(),
                     }

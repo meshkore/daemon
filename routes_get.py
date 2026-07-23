@@ -187,6 +187,14 @@ def route_get(self, daemon):  # noqa: N802
     # local install/auth probes carry no secrets.
     if p == "/clients":
         return self._json(200, daemon.clients_listing())
+    # multi-provider-agents (MPV1) — machine-global clients/providers config
+    # for the Config-General UI. PORTAL-gated (it reveals base-URLs +
+    # keyPresent booleans; the key VALUES are never returned). Machine-level,
+    # so the X-MeshKore-Project header is ignored.
+    if p == "/config/providers":
+        if self._need_auth():
+            return
+        return self._json(*daemon.provider_config_get_http())
     # Initiative `agent-team` (ATM9) — team roster. Read-only, no auth
     # (like /agents /state); frontmatter carries no secrets. Mutations
     # (POST/PATCH/DELETE) are gated in routes_post / do_PATCH / do_DELETE.

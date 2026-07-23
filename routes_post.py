@@ -59,6 +59,13 @@ def route_post(self, daemon):  # noqa: N802
     if self._need_auth():
         return
 
+    # multi-provider-agents (MPV1) — save the machine-global clients/providers
+    # config (enable clients, per-provider enabled/base_url/small_model, and
+    # set/clear API keys). PORTAL-gated (above). Keys land in the chmod-600
+    # credentials store, NEVER in clients-config.json. Machine-level.
+    if p == "/config/providers":
+        return self._json(*daemon.provider_config_set_http(self._read_json_body()))
+
     # CPL-2 (master-copilot) — rotate the machine remote-control token
     # (PORTAL-gated, NOT the remote token itself). The old value dies with the
     # mint. Machine-level: the X-MeshKore-Project header is ignored.

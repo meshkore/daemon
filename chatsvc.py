@@ -96,6 +96,11 @@ class ChatMixin:
         client_pref = body.get("client")
         if client_pref is not None:
             client_pref = str(client_pref).strip().lower() or None
+        # multi-provider-agents (MPV1) — optional per-conv PROVIDER (LLM
+        # backend for the claude-code client). None resolves to anthropic.
+        provider_pref = body.get("provider")
+        if provider_pref is not None:
+            provider_pref = str(provider_pref).strip().lower() or None
         # ATM10 (agent-team) — optional `member`: the team-member PROFILE this
         # conv is an INSTANCE of. When set we resolve agent_type from the
         # member and fill model/effort from it UNLESS the body overrode them
@@ -106,13 +111,16 @@ class ChatMixin:
         if member is not None:
             member = str(member).strip() or None
         if member:
-            err, r_type, r_client, r_model, r_effort = self._member_dispatch_prep(
-                conv,
-                member,
-                body_agent_type=agent_type,
-                body_model=model_pref,
-                body_effort=effort_pref,
-                body_client=client_pref,
+            err, r_type, r_client, r_model, r_effort, r_provider = (
+                self._member_dispatch_prep(
+                    conv,
+                    member,
+                    body_agent_type=agent_type,
+                    body_model=model_pref,
+                    body_effort=effort_pref,
+                    body_client=client_pref,
+                    body_provider=provider_pref,
+                )
             )
             if err is not None:
                 code_err, body_err = err
@@ -128,6 +136,7 @@ class ChatMixin:
             client_pref = r_client
             model_pref = r_model
             effort_pref = r_effort
+            provider_pref = r_provider
         # py-1.10.25 — Daemon-side dispatch mutex. Enforces invariants
         # the architect prompt already claims but the LLM intermittently
         # violates (observed in cavioca 2026-05-30: same task got 4
@@ -231,6 +240,7 @@ class ChatMixin:
                 model=model_pref,
                 effort=effort_pref,
                 client=client_pref,
+                provider=provider_pref,
                 member=member,
             )
         except Exception as e:

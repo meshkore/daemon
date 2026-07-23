@@ -38,11 +38,25 @@ def _iso_now() -> str:
 
 
 class WSClient:
-    __slots__ = ("sock", "closed")
+    __slots__ = ("sock", "closed", "_send_lock")
 
     def __init__(self, sock: socket.socket):
         self.sock = sock
         self.closed = False
+        # py-1.31.4 (daemon-centralized) — SERIALIZE every write to this
+        # socket. `broadcast()` is called from MANY threads (heartbeat, agent
+        # runners, anchor, state-rebuild) AND the ws handler thread itself
+        # sends frames — all onto the SAME `SSLSocket`. Two concurrent
+        # `sendall`s become two concurrent `SSL_write`s on ONE OpenSSL
+        # connection object, which is undefined behavior → native heap
+        # corruption ("BUG IN CLIENT OF LIBMALLOC" in `tls_setup_write_buffer`,
+        # 5 hard crashes 2026-07-05→09). The GIL does NOT prevent it: `SSL_write`
+        # releases the GIL for the duration of the I/O. One lock per connection
+        # guarantees at most one writer at a time (reads stay lock-free — OpenSSL
+        # allows one concurrent reader + one writer). Version-independent fix.
+        # RLock (reentrant): `send_text` calls `close()` on its own OSError while
+        # still holding the lock — a plain Lock would self-deadlock there.
+        self._send_lock = threading.RLock()
         # py-1.16.0 (D-WS-02) — bound sends so a client with a full TCP
         # send buffer (suspended laptop, paused devtools) can't block a
         # broadcaster forever. SO_SNDTIMEO affects ONLY send, not the
@@ -75,23 +89,34 @@ class WSClient:
         else:
             header.append(127)
             header.extend(struct.pack(">Q", n))
-        try:
-            self.sock.sendall(bytes(header) + data)
-        except OSError:
-            self.close()
+        frame = bytes(header) + data
+        # Hold the per-connection lock across the WHOLE sendall so no other
+        # thread can interleave an SSL_write on this socket (see __init__).
+        with self._send_lock:
+            if self.closed:
+                return
+            try:
+                self.sock.sendall(frame)
+            except OSError:
+                self.close()
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        # Serialize teardown against in-flight sends (same per-connection lock)
+        # so we never shutdown/close the socket mid-`SSL_write`. Reentrant, so
+        # `send_text`'s own error-path `close()` (already holding the lock) is
+        # fine; an external `remove()` waits for the bounded send to finish.
+        with self._send_lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
 
 class Hub:

@@ -109,3 +109,43 @@ class GlobalLedger:
         with self._lock:
             self.ensure(self.projects_file)
             atomic_write_json(self.projects_file, {"version": 1, "projects": projects})
+
+    # ── clients/providers config (multi-provider-agents, MPV1) ───────────
+    # NON-secret machine-global config: which CLI clients are enabled and,
+    # per provider, {enabled, base_url, small_fast_model}. Stored as JSON
+    # (`clients-config.json`) — consistent with projects.json and needs no
+    # YAML writer. The API KEYS never live here; they're chmod-600 files in
+    # `credentials_dir` (see providersvc.ProviderKeyStore).
+    @property
+    def clients_config_file(self) -> Path:
+        return self.root / "clients-config.json"
+
+    def load_clients_config(self) -> Dict[str, Any]:
+        """Read clients-config.json → {version, clients, providers}. Returns
+        an empty skeleton when absent (callers merge over their defaults)."""
+        with self._lock:
+            f = self.clients_config_file
+            if not f.exists():
+                return {"version": 1, "clients": {}, "providers": {}}
+            try:
+                import json
+
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    return {"version": 1, "clients": {}, "providers": {}}
+                data.setdefault("clients", {})
+                data.setdefault("providers", {})
+                return data
+            except (OSError, ValueError) as e:
+                _log(f"GlobalLedger: clients-config.json unreadable ({e}); empty")
+                return {"version": 1, "clients": {}, "providers": {}}
+
+    def save_clients_config(self, config: Dict[str, Any]) -> None:
+        with self._lock:
+            self.ensure(self.clients_config_file)
+            payload = {
+                "version": 1,
+                "clients": config.get("clients") or {},
+                "providers": config.get("providers") or {},
+            }
+            atomic_write_json(self.clients_config_file, payload)

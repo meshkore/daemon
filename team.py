@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from clidrivers import driver_for, known_ids
+from providers import known_provider_ids
 from yamlparse import parse_frontmatter
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
@@ -107,6 +108,7 @@ _FIELD_ORDER = (
     "required",
     "agent_type",
     "client",
+    "provider",
     "model",
     "effort",
     "pinned_order",
@@ -218,6 +220,13 @@ def validate_member(fm: Dict[str, Any]) -> None:
     client = str(fm.get("client") or "claude-code").strip().lower()
     if client not in known_ids():
         raise TeamValidationError(f"client must be one of {known_ids()}")
+    # multi-provider-agents (MPV1) — which LLM backend the claude-code
+    # client talks to. Absent/empty means anthropic (every pre-MPV1 member
+    # file validates unchanged); anything else must be a known provider.
+    # Orthogonal to `client`; only acted on when client == claude-code.
+    provider = str(fm.get("provider") or "anthropic").strip().lower()
+    if provider not in known_provider_ids():
+        raise TeamValidationError(f"provider must be one of {known_provider_ids()}")
     model = str(fm.get("model") or "").strip()
     # DM-CLI-05 follow-up (live smoke test, 2026-07-08) — a driver may
     # declare "" as a legitimate "use the CLI/account default" catalog
@@ -402,6 +411,7 @@ def _normalise_payload(payload: Dict[str, Any], *, today: str) -> Dict[str, Any]
         "required": bool(payload.get("required")),
         "agent_type": str(payload.get("agent_type") or "custom").strip(),
         "client": client,
+        "provider": str(payload.get("provider") or "anthropic").strip().lower(),
         "model": model,
         "effort": str(payload.get("effort") or "default").strip().lower(),
         "pinned_order": _coerce_int(payload.get("pinned_order"), 50),
