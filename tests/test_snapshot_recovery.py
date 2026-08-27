@@ -149,7 +149,7 @@ def test_snapshot_no_current_turn_for_idle_convs(daemon: Daemon) -> None:
     """Idle (non-live) convs in /chat/snapshot do NOT carry
     current_turn or queue. Keeps the payload small for the common
     case (most convs are idle)."""
-    r = daemon.get("/chat/snapshot")
+    r = daemon.get("/chat/snapshot", headers=daemon.auth)
     assert r.status_code == 200
     for c in r.json()["convs"]:
         if not c.get("live"):

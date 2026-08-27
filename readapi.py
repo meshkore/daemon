@@ -228,6 +228,19 @@ class QueryMixin:
             # daemon that HAS the endpoint from one that doesn't, rather than
             # reading a 404 as "this file needs no snapshot".
             "snapshots.v1",
+            # py-1.34.0 DAH2 — the GET surface is FAIL-CLOSED. `route_get` now
+            # has a single global auth gate driven by the declarative
+            # PUBLIC_GET_EXACT / PUBLIC_GET_PREFIXES tables, mirroring the one
+            # POST always had; a new GET is private unless deliberately
+            # published. DAH2(b) rides on it: /chat/snapshot, /chat/convs and
+            # everything under /chat/conv/ now REQUIRE the portal token —
+            # `/chat/conv/<id>/messages` returns message bodies, i.e. the
+            # operator's transcripts with the agents, and was anonymous.
+            # A cockpit older than architect@bdc8dd4 fetched those with the
+            # Authorization header suppressed by construction and will get 401s
+            # against this daemon; it must reload to pick up the bundle that
+            # sends the token. That is what this flag is for.
+            "chat.reads.authed.v1",
             # py-1.6.0 → py-1.6.1 — session_resume opt-in only.
             # Set env MESHKORE_CLAUDE_SESSION_ID=1 to enable. Default
             # off after a production bug where claude-code exited

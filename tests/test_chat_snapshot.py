@@ -3,7 +3,13 @@
 These are the endpoints behind the architect's rail. Anonymous reads
 (conv ids are not secrets — they appear in timeline events served by
 /state). The 2026-06-10 incident hung exactly here, so we hammer it
-with the heavy-archive cluster too."""
+with the heavy-archive cluster too.
+
+DAH2(b) (py-1.34.0) — `/chat/snapshot`, `/chat/convs` and `/chat/conv/<id>/*`
+now require the portal token; they serve conversation CONTENT and were
+anonymous. These reads therefore pass `headers=daemon.auth`. `/chat/archives`
+deliberately still does not: it is ids + booleans, no message bodies.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ from conftest import Daemon
 
 
 def test_snapshot_shape(daemon: Daemon) -> None:
-    r = daemon.get("/chat/snapshot")
+    r = daemon.get("/chat/snapshot", headers=daemon.auth)
     assert r.status_code == 200
     d = r.json()
     for k in ("convs", "paused_agent_types", "quota", "version", "generated_at"):
@@ -25,7 +31,10 @@ def test_snapshot_archived_flag(daemon: Daemon) -> None:
     """conv-b is in archives.json — daemon must mark it archived=True
     even though conv_meta.json doesn't carry the flag (the archive
     registry is the authority)."""
-    convs = {c["conv"]: c for c in daemon.get("/chat/snapshot").json()["convs"]}
+    convs = {
+        c["conv"]: c
+        for c in daemon.get("/chat/snapshot", headers=daemon.auth).json()["convs"]
+    }
     assert "conv-a" in convs and convs["conv-a"]["archived"] is False
     assert "conv-b" in convs and convs["conv-b"]["archived"] is True
 
@@ -33,13 +42,16 @@ def test_snapshot_archived_flag(daemon: Daemon) -> None:
 def test_snapshot_msg_count(daemon: Daemon) -> None:
     """msg_count is computed from timeline files. conv-a has 2 chat events
     (user + assistant.final), conv-b has 1."""
-    convs = {c["conv"]: c for c in daemon.get("/chat/snapshot").json()["convs"]}
+    convs = {
+        c["conv"]: c
+        for c in daemon.get("/chat/snapshot", headers=daemon.auth).json()["convs"]
+    }
     assert convs["conv-a"]["msg_count"] == 2
     assert convs["conv-b"]["msg_count"] == 1
 
 
 def test_convs_endpoint(daemon: Daemon) -> None:
-    r = daemon.get("/chat/convs")
+    r = daemon.get("/chat/convs", headers=daemon.auth)
     assert r.status_code == 200
     d = r.json()
     assert "convs" in d and "generated_at" in d
@@ -56,7 +68,7 @@ def test_archives_endpoint(daemon: Daemon) -> None:
 
 
 def test_conv_meta(daemon: Daemon) -> None:
-    r = daemon.get("/chat/conv/conv-a/meta")
+    r = daemon.get("/chat/conv/conv-a/meta", headers=daemon.auth)
     assert r.status_code == 200
     d = r.json()
     assert d["conv"] == "conv-a"
@@ -70,7 +82,7 @@ def test_snapshot_under_heavy_archive(daemon: Daemon) -> None:
     import time
 
     start = time.time()
-    r = daemon.get("/chat/snapshot", timeout=10.0)
+    r = daemon.get("/chat/snapshot", headers=daemon.auth, timeout=10.0)
     elapsed = time.time() - start
     assert r.status_code == 200
     assert elapsed < 5.0, (

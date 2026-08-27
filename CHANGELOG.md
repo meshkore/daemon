@@ -3,6 +3,38 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.34.0 — GET IS FAIL-CLOSED (initiative `daemon-audit-hardening`, task DAH2).
+  DAH1 measured the problem; this closes it. **(a)** `route_get` had no global
+  auth gate: every route opted in with its own `if self._need_auth(): return`,
+  23 of them, so a GET added without that line was PUBLIC and nothing failed
+  when it happened — the opposite default from `route_post`, which has had one
+  global gate all along. There is now a single gate driven by declarative
+  `PUBLIC_GET_EXACT` / `PUBLIC_GET_PREFIXES` tables at the top of
+  `routes_get.py`: a new GET is private unless someone deliberately publishes
+  it, in review, with a reason. Two routes stay in the public table because
+  they authenticate INSIDE their handler and would 401 before reaching it —
+  `/auth/local-token` (origin-gated, stricter than a token) and
+  `/team/requests/<rid>` (member token, or the CPL-2 remote token).
+  `test_auth_matrix.test_get_is_fail_closed` pins both halves of the invariant:
+  exactly one `_need_auth()` call in the file, and declared-public == observed-
+  public for every route the endpoint warranty knows.
+  **(b)** Riding on that: `/chat/snapshot`, `/chat/convs` and everything under
+  `/chat/conv/` now REQUIRE the portal token. `/chat/conv/<id>/messages`
+  returns message BODIES — the operator's full transcripts with the agents —
+  and was anonymous; the in-code justification ("conv ids are not secrets")
+  was true of the ids and not of the bodies. This needed a coordinated
+  two-repo change in a mandatory order, because the cockpit fetched them with
+  `requireAuth: false`, a flag that SUPPRESSES the Authorization header even
+  when a token is in hand (and skips the 401 self-heal). Cockpit shipped first
+  (architect@bdc8dd4 — sending a token to a daemon that does not require one is
+  a no-op), daemon second. Reversed, every cockpit still on the old bundle
+  would have lost its chat history until the Pages deploy landed. Advertised as
+  `chat.reads.authed.v1` so a stale cockpit's 401s are diagnosable rather than
+  mysterious. `cluster.yaml` also gained the explicit Standard §20
+  `snapshots: {enabled, retention_days}` block — same values the daemon
+  defaults to, but worth making visible now that the endpoint exists.
+  Tests: 497 → 500 passing.
+
 - 1.33.0 — DEEP-AUDIT PASS (initiative `daemon-audit-hardening`, task DAH1). A
   full audit of the daemon as it stands after gaining three surfaces since the
   last architecture pass (Team External Gateway, master-copilot remote control,

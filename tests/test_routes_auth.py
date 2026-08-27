@@ -2,7 +2,11 @@
 
 If a route's auth gate flips during the modularization, the cockpit
 breaks silently (401 instead of data, or — worse — secrets leak to
-anonymous clients). This file pins the gate per route."""
+anonymous clients). This file pins the gate per route.
+
+Hand-curated spot-check. The EXHAUSTIVE version — every route the endpoint
+warranty knows about, probed live, plus the structural fail-closed guards for
+both verb tables — is `test_auth_matrix.py` (DAH1/DAH2)."""
 
 from __future__ import annotations
 
@@ -19,12 +23,15 @@ ANONYMOUS_GET = [
     "/auth/challenge",
     "/storage/usage",
     "/chat/archives",
-    "/chat/snapshot",
-    "/chat/convs",
-    "/chat/conv/conv-a/meta",
 ]
 
 TOKEN_REQUIRED_GET = [
+    # DAH2(b) — these three served conversation CONTENT anonymously until
+    # py-1.34.0. `/chat/conv/<id>/messages` returns message BODIES; the
+    # snapshot/convs pair reaches the same content by another door.
+    "/chat/snapshot",
+    "/chat/convs",
+    "/chat/conv/conv-a/messages",
     "/reload",
     "/quota",
     "/runs",

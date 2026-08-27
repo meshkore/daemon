@@ -2,13 +2,21 @@
 reachable WITHOUT a token. Probed live, not read off the source.
 
 Why this file exists (DAH1, initiative `daemon-audit-hardening`): the two verb
-tables use OPPOSITE default policies.
+tables used to run OPPOSITE default policies.
 
-- `route_post` has ONE gate near the top (`if self._need_auth(): return`), so
-  every POST added below it is protected by default. Fail-closed.
-- `route_get` has no such gate. Each route opts in with its own
-  `if self._need_auth(): return` line, so a GET added without that line is
-  PUBLIC. Fail-open — and nothing failed when it happened.
+- `route_post` has ONE gate near the top, so every POST below it is protected
+  by default. Fail-closed.
+- `route_get` had no such gate. Each route opted in with its own
+  `if self._need_auth(): return`, so a GET added without that line was PUBLIC.
+  Fail-open — and nothing failed when it happened.
+
+**DAH2(a) closed that** (py-1.34.0): `route_get` now has a single gate too,
+driven by the `PUBLIC_GET_EXACT` / `PUBLIC_GET_PREFIXES` tables at the top of
+`routes_get.py`. A new GET is private unless someone deliberately adds it
+there. This file remains the runtime proof that the declared table and the
+observed behaviour agree — a table entry that does not match reality (a typo
+in a prefix, a route that authenticates inside its handler) still goes red
+here.
 
 `test_routes_auth.py` pins 18 routes by hand out of ~60. That is a spot-check,
 not a warranty: it can only catch a regression on a route someone remembered to
@@ -20,19 +28,17 @@ Read the assertion failure as a question, not a verdict: a new route showing up
 here means "is this one supposed to be public?" — answer it by adding the route
 to ANONYMOUS_OK (with the reason) or by adding its `_need_auth()` line.
 
-The listed anonymous routes are the CURRENT state, faithfully recorded —
-including the ones the audit flagged as questionable. Those are marked
-`# REVIEW` rather than quietly blessed, and are tracked as task DAH2:
+**DAH2(b) closed the content leak** (py-1.34.0). `/chat/snapshot`,
+`/chat/convs` and everything under `/chat/conv/` — including
+`/chat/conv/<id>/messages`, which returns message BODIES, i.e. the operator's
+full transcripts with the agents — were anonymous. They are now gated.
 
-  /chat/conv/<id>/messages   serves full transcript BODIES, not just ids
-  /chat/snapshot             boot hydrate, same content by another door
-  /chat/convs                conv list + previews
-
-The cockpit fetches all of them with `requireAuth: false` (see
-`architect/src/lib/daemon-client.ts`), so gating them daemon-side is a
-COORDINATED two-repo change — cockpit first (start sending the token, which is
-harmless against an ungated daemon), daemon second. That ordering hazard is why
-DAH1 did not flip them unilaterally.
+That took a coordinated two-repo change in a mandatory order, because the
+cockpit fetched them with `requireAuth: false`, a flag that SUPPRESSES the
+Authorization header even when a token is in hand. Cockpit first
+(architect@bdc8dd4 — starts sending the token, a no-op against an ungated
+daemon), daemon second. Reversed, every cockpit still on the old bundle would
+have lost its chat history until the Pages deploy landed.
 
 Note on coverage: the exercise table probes ONE path per route pattern, so
 `/chat/conv/<id>/meta` stands in for the whole `startswith("/chat/conv/")`
@@ -97,17 +103,8 @@ ANONYMOUS_OK = {
     #
     # ── chat ──
     ("GET", "/chat/archives"),  # archive flags: ids + booleans, no bodies
-    # REVIEW (task DAH2) — the three below serve conversation CONTENT to an
-    # anonymous caller. /chat/conv/<id>/messages returns message BODIES, i.e.
-    # full transcripts of the operator's conversations with the agents; the
-    # snapshot/convs pair reaches the same content by another door. The
-    # in-code justification ("conv ids are not secrets") holds for the ids and
-    # not for the bodies.
-    ("GET", "/chat/snapshot"),
-    ("GET", "/chat/convs"),
-    ("GET", "/chat/conv/general/meta"),
-    ("GET", "/chat/conv/general/messages"),
-    ("GET", "/chat/conv/general/queue"),
+    # NOTE: /chat/snapshot, /chat/convs and everything under /chat/conv/ are
+    # NOT here any more — DAH2(b) gated them, see the module docstring.
     #
     # ── opaque-URL reads ──
     # The filename carries a random suffix and every write path that mints one
@@ -121,8 +118,9 @@ ANONYMOUS_OK = {
 # Route patterns whose SUB-paths differ in sensitivity, so one probe per
 # pattern is not enough. Each is pinned on its own.
 EXTRA_PROBES = [
-    # REVIEW (DAH2) — message BODIES, i.e. the full transcript of the
-    # operator's conversations with the agents, to an anonymous caller.
+    # Message BODIES — the operator's full transcript with the agents. Probed
+    # separately from `/meta` because one exercise entry stands in for the
+    # whole `/chat/conv/` prefix, and these two are the sensitive members of it.
     ("GET", "/chat/conv/general/messages"),
     ("GET", "/chat/conv/general/queue"),  # the operator's typed pending prompts
 ]
@@ -214,3 +212,48 @@ def test_post_is_fail_closed() -> None:
         f"{sorted(pre_gate_routes)}. Anything there is UNAUTHENTICATED unless "
         "its handler does its own check."
     )
+
+
+def test_get_is_fail_closed() -> None:
+    """DAH2(a) — the structural invariant for GET, mirroring
+    `test_post_is_fail_closed`.
+
+    Two things must hold in `routes_get.py`:
+
+    1. There is exactly ONE `_need_auth()` call — the global gate. A second one
+       means a route grew its own opt-in again, which is the pattern that made
+       the surface fail-open in the first place (23 of them had accumulated).
+    2. Every route the endpoint warranty knows about is either matched by the
+       declared public tables or it is gated. There is no third state.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "routes_get.py").read_text()
+    calls = src.count("if self._need_auth():")
+    assert calls == 1, (
+        f"routes_get.py has {calls} `_need_auth()` gates; there must be exactly "
+        "one (the global gate). A per-route opt-in re-introduces the fail-open "
+        "policy DAH2(a) removed — add the route to PUBLIC_GET_* instead."
+    )
+
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from routes_get import _get_is_public  # type: ignore[import-not-found]
+
+    for method, path in MATRIX:
+        if method != "GET":
+            continue
+        bare = path.split("?", 1)[0]
+        declared_public = _get_is_public(bare)
+        recorded_public = (method, path) in ANONYMOUS_OK
+        # `/team/requests/<rid>` is the one route the table publishes while the
+        # HANDLER authenticates (member token / CPL-2 remote token), so it is
+        # declared-public but observed-401. That asymmetry is intentional.
+        if bare.startswith("/team/requests/"):
+            continue
+        assert declared_public == recorded_public, (
+            f"{path}: PUBLIC_GET_* says public={declared_public} but the "
+            f"observed record says public={recorded_public}. The declared "
+            "table and reality must agree."
+        )
