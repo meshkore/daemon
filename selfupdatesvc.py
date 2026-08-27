@@ -9,6 +9,8 @@ import os
 import threading
 from typing import Any, Dict, Tuple
 
+from pathlib import Path
+
 from bootupdate import (
     _refresh_tls_bundle_from_cdn,
     _rotate_daemon_backups,
@@ -70,7 +72,29 @@ class SelfUpdateMixin:
         import sys
         import subprocess as _sp
 
-        scripts_dir = self.paths.scripts_dir
+        # DAH2 — resolve the daemon's OWN install directory, NOT the request
+        # project's `.meshkore/scripts/`.
+        #
+        # This is a MACHINE-level operation: there is one daemon per machine
+        # (Standard v28) and it must replace the binary IT IS RUNNING. But
+        # `self.paths` is the DC-4 per-request accessor, resolved from the
+        # `X-MeshKore-Project` header — so the update landed in whichever
+        # project the caller happened to name. Observed live during the
+        # py-1.34.0 release (2026-08-27): a `/self-update` sent with
+        # `X-MeshKore-Project: meshkore-main` downloaded the new bundle into
+        # `meshkore/.meshkore/scripts/`, backed up THAT project's stale
+        # leftover (py-1.30.3) as the "rollback point" instead of the running
+        # py-1.33.0, re-exec'd from there, and left the real install dir in
+        # `meshkore-server/` orphaned one version behind. Three consequences:
+        # the rollback path pointed at the wrong bytes, the daemon's install
+        # location wandered between projects on every update, and a member
+        # project acquired daemon code the centralized model says it must not
+        # have.
+        #
+        # `sys.argv[0]` is the script this process was launched with, which is
+        # exactly the file that must be swapped. `self.paths` stays correct for
+        # the per-project bits (the response's relative path, the child cwd).
+        scripts_dir = Path(sys.argv[0]).resolve().parent
         scripts_dir.mkdir(parents=True, exist_ok=True)
         new_path = scripts_dir / "daemon.py.new"
         try:
@@ -134,7 +158,7 @@ class SelfUpdateMixin:
         #    boot path kept three (`_rotate_daemon_backups`). Two update routes
         #    to the same file had two different safety nets for no reason; both
         #    now rotate .bak → .bak.1 → .bak.2.
-        current = scripts_dir / "daemon.py"
+        current = Path(sys.argv[0]).resolve()
         backup = scripts_dir / "daemon.py.bak"  # newest rollback point
         try:
             if current.exists():
@@ -222,9 +246,10 @@ class SelfUpdateMixin:
             "new_port": new_port,
             "same_port": True,
             "shutdown_in_sec": SHUTDOWN_DELAY,
-            "old_backup": str(backup.relative_to(self.paths.root))
-            if backup.exists()
-            else None,
+            # Absolute: `backup` now lives in the daemon's install dir, which
+            # is not necessarily under the request project's root.
+            "old_backup": str(backup) if backup.exists() else None,
+            "install_dir": str(scripts_dir),
             "old_version": DAEMON_VERSION,
             "source_url": url,
         }

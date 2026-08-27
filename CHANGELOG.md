@@ -3,6 +3,26 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.34.1 — `/self-update` SWAPS THE RUNNING BINARY, not one in whatever project
+  the caller named. Found by triggering it during the py-1.34.0 release, which
+  is the only way this surfaces. `self_update` resolved its target through
+  `self.paths.scripts_dir`, and `self.paths` is the DC-4 PER-REQUEST accessor —
+  it follows the `X-MeshKore-Project` header. But there is one daemon per
+  machine (Standard v28), so a self-update is a MACHINE-level operation. Sent
+  with `X-MeshKore-Project: meshkore-main`, it downloaded the new bundle into
+  `meshkore/.meshkore/scripts/` — a member project that per the centralized
+  model must carry no daemon code at all — "backed up" that project's stale
+  months-old leftover (py-1.30.3) as the rollback point instead of the
+  py-1.33.0 that was actually running, re-exec'd from there, and left the real
+  install dir in `meshkore-server/` orphaned a version behind. So the install
+  location wandered between project folders on every update and the reported
+  `old_backup` pointed at the wrong bytes; it "worked" only because any
+  directory is a valid place to run a self-contained script from. Now resolved
+  from `sys.argv[0]` — the script this process was launched with, which is by
+  definition the file to replace — and the 202 reports `install_dir` so a
+  wandering swap is visible instead of silent. `tests/test_selfupdate_install_dir.py`
+  pins it.
+
 - 1.34.0 — GET IS FAIL-CLOSED (initiative `daemon-audit-hardening`, task DAH2).
   DAH1 measured the problem; this closes it. **(a)** `route_get` had no global
   auth gate: every route opted in with its own `if self._need_auth(): return`,
