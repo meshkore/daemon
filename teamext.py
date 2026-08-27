@@ -467,6 +467,23 @@ class TeamExtMixin:
             return 400, {"error": "text required"}
 
         # Per-member concurrent cap (queued|running requests).
+        #
+        # DAH6 — the slot is RESERVED here, inside the same lock that counts
+        # it. It used to be check-then-release-then-insert: two asks arriving
+        # together at `active == cap - 1` both read cap-1, both passed, and
+        # both inserted, so the member ran cap+1. Harmless at cap 6 with one
+        # local operator; not harmless once the external gateway is what it
+        # exists to be — an endpoint third parties drive, where concurrent
+        # asks are the normal case and the cap is the only rate limit there
+        # is (loopback is the perimeter, TEG-2 ships no other throttle).
+        #
+        # The reservation is a real entry, so the count that follows it sees
+        # it. It is invisible to everyone else: `rid` is only disclosed in the
+        # 202 below, so nothing can poll a request that has not been created
+        # yet, and `_teamext_reap_stale` would only ever flip an abandoned
+        # reservation to `error` — which is the correct outcome anyway.
+        rid = "req-" + secrets.token_urlsafe(9)
+        reserved_at = _iso_now()
         with self._teamext_lock:
             data = self._teamext_reap_stale(self._teamext_gc(self._teamext_load()))
             active = sum(
@@ -482,6 +499,14 @@ class TeamExtMixin:
                     "cap": EXT_ASK_CONCURRENT_CAP,
                     "hint": "poll your in-flight requests before asking again",
                 }
+            data[rid] = {
+                "request_id": rid,
+                "member": mid,
+                "conv": "",
+                "status": "queued",
+                "started_at": reserved_at,
+                "stream_id": None,
+            }
             self._teamext_save(data)
 
         # Conv slug resolution.
@@ -541,9 +566,14 @@ class TeamExtMixin:
         # model/effort, rail visibility, singleton rules all come for free.
         code, resp = self.chat_dispatch(dispatch_body)
         if code != 202:
+            # DAH6 — hand the reserved slot back; a failed dispatch must not
+            # cost the member a slot until the 24 h TTL reaps it.
+            with self._teamext_lock:
+                data = self._teamext_load()
+                data.pop(rid, None)
+                self._teamext_save(data)
             return code, resp
 
-        rid = "req-" + secrets.token_urlsafe(9)
         queued = bool(resp.get("queued"))
         status = "queued" if queued else "running"
         # Our own turn's identity — present only when the dispatch spawned
@@ -560,7 +590,7 @@ class TeamExtMixin:
         }
         with self._teamext_lock:
             data = self._teamext_gc(self._teamext_load())
-            data[rid] = entry
+            data[rid] = entry  # DAH6 — fills in the reservation made above
             self._teamext_save(data)
         self._teamext_broadcast("team.request.created", mid, rid)
         _debug_emit(
