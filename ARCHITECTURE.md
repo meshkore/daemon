@@ -48,7 +48,7 @@ is **one flat module namespace**. Consequences you must respect:
 ### Layer 1 — components (one class/concern each, depend only on leaves)
 | module | owns |
 |---|---|
-| `cluster.py` | `Cluster` (cluster.yaml + crons validation), `normalize_status`, `_patch_frontmatter` |
+| `cluster.py` | `Cluster` (cluster.yaml + crons validation), `normalize_status` (what the board renders) + `is_resolved_status` (whether work remains — NOT the same question; see DAH7), `_patch_frontmatter` |
 | `hub.py` | `Hub` / `WSClient` — the WebSocket broadcast hub. `WSClient` owns the per-connection send `RLock` (py-1.31.4: two threads in `SSL_write` on one socket is native heap corruption) and the send timeout; the frame encoding is `wsframe`'s |
 | `registries.py` / `protocols.py` | `LinksRegistry` / `ProtocolsRegistry` |
 | `integrity.py` / `integritycheck.py` | `ProjectState` / `StateIntegrityChecker` |
@@ -137,6 +137,9 @@ behaviour:
 - `tests/test_wsframe.py` — the frame codec: every length boundary masked and
   unmasked, mask symmetry, the payload ceiling refused before the body is
   read, control opcodes, fragmentation, truncation.
+- `tests/test_initiative_reconcile.py` — a task closed as `cancelled` must not
+  hold its initiative open, and an initiative whose tasks were ALL abandoned
+  must not archive as `done`.
 - Run `pytest daemon/tests/ -q`. Rebuild the bundle (`python daemon/bundle.py`)
   before parity runs. Coverage: `pytest --cov` (data confined to
   `tests/.coverage_cache/`).

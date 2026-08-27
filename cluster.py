@@ -160,6 +160,42 @@ def normalize_status(s: Any) -> str:
     return "backlog"
 
 
+# Statuses that CLOSE a task without it having been carried out — deliberately
+# abandoned, superseded by another task, or measured and found not worth doing.
+# They are terminal: the work will never become `done`.
+#
+# DAH7 — `normalize_status` collapses every unknown value to `backlog`, which
+# for these means "still pending". That is wrong in a way that compounds:
+# `_reconcile_initiative_archive` requires ALL children `done` before it will
+# archive an initiative, so ONE cancelled task pins its initiative `active`
+# forever. Reproduced on `daemon-audit-hardening` itself — set it to `done`,
+# and the next /state build reverted it to `active` within seconds, on the
+# strength of a task that had been deliberately closed.
+#
+# Kept separate from `normalize_status` on purpose: this predicate answers
+# "does this need more work?", which is not the same question as "what should
+# the board render?". Widening the wire vocabulary is a cockpit-coordinated
+# change — see task DAH8 for the survey of what the repo actually uses.
+TERMINAL_RESOLVED_STATUSES = frozenset(
+    {
+        "cancelled",
+        "canceled",
+        "dropped",
+        "wontfix",
+        "won't-fix",
+        "superseded",
+        "obsolete",
+    }
+)
+
+
+def is_resolved_status(s: Any) -> bool:
+    """True when a task needs NO further work — either it is `done`, or it was
+    closed on purpose and never will be."""
+    raw = str(s or "").strip().lower()
+    return normalize_status(raw) == "done" or raw in TERMINAL_RESOLVED_STATUSES
+
+
 # ── cluster.yaml `crons:` validation (DA-CLUSTER-01, moved from daemon.py) ──
 
 _CRON_RESTART_POLICIES = frozenset({"never", "on-failure", "always"})

@@ -49,4 +49,9 @@ FS_POLL_SEC = 1.5
 # ~20% of the 8 KB window those two Range readers get — one more paragraph
 # and a remote version check would silently start returning None. Release
 # notes belong in CHANGELOG.md; this line stays one short line forever.
-DAEMON_VERSION = "py-1.35.0"  # DAH4/DAH5 — WS upgrade authenticated; see CHANGELOG.md
+# py-1.35.1 — "short" is also a FORMATTER constraint, not just a budget:
+# past the line limit `ruff format` rewrites this as `DAEMON_VERSION = (\n
+#     "py-X.Y.Z"  # …\n)`, and all three regexes are anchored to the
+# single-line form. bundle.py refuses to build (loud, good) — but keep the
+# comment short enough that the formatter never wants to wrap it.
+DAEMON_VERSION = "py-1.35.1"  # DAH7 — cancelled tasks unblock archival; CHANGELOG.md

@@ -3,6 +3,34 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.1 — A task closed as `cancelled` pinned its initiative `active`
+  FOREVER (DAH7). `_reconcile_initiative_archive` runs on every `/state` build
+  and asked `all(normalize_status(k) == "done")` — and `normalize_status`
+  recognises exactly six values (`backlog`/`next`/`active`/`blocked`/`done`,
+  plus `in_progress` → `active`) and silently collapses everything else to
+  `backlog`, i.e. *pending*. So a deliberately-closed child made the
+  py-1.12.4 backward path revert its initiative to `active` on every build,
+  with no way out. Found by hitting it while closing
+  `daemon-audit-hardening`: set to `done`, reverted within seconds, and
+  toggling DAH3 between `done` and `cancelled` flipped the initiative on and
+  off on demand. The backward path itself is right and stays — it exists
+  because the architect declared victory on partial initiatives (field report
+  2026-05-31, "Visual identity v2" archived at 5/7); what was wrong is what
+  counts as pending. NEW `cluster.is_resolved_status()` — "is there work
+  left?", deliberately NOT folded into `normalize_status`, which answers a
+  different question ("what should the board render?"). True for `done` and
+  for the terminal vocabulary (`cancelled`, `canceled`, `dropped`, `wontfix`,
+  `superseded`, `obsolete`). The reconciler now needs every child resolved AND
+  at least one actually `done`, so an initiative whose tasks were ALL
+  abandoned is not auto-archived as if it had been completed; an unrecognised
+  status still reads as open, so a typo can never silently archive live work.
+  Tests: NEW `test_initiative_reconcile.py` (21), verified red against the
+  previous code. NOT fixed here and filed as DAH8 with the survey: the wire
+  vocabulary itself. The repo uses 17 distinct status values and the daemon
+  knows 6 — an initiative marked `shipped` currently renders as `backlog`, as
+  do 22 `draft` and 11 `planned` ones. Widening what `normalize_status`
+  returns changes the contract the cockpit consumes (it has no notion of
+  `cancelled` today), so it needs the cockpit half first, in that order.
 - 1.35.0 — **THE WEBSOCKET UPGRADE NOW AUTHENTICATES** (DAH4), and the RFC-6455
   frame codec is written once instead of three times (DAH5). `route_get`
   resolved the `/events` (and `/ws`) upgrade BEFORE the HTTP auth gate, on the

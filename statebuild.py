@@ -10,7 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from cluster import Cluster, _patch_frontmatter, normalize_status
+from cluster import (
+    Cluster,
+    _patch_frontmatter,
+    is_resolved_status,
+    normalize_status,
+)
 from constants import DAEMON_VERSION
 from paths import Paths
 from utils import _debug_emit, _iso_now, _log, parse_frontmatter
@@ -321,7 +326,17 @@ def _reconcile_initiative_archive(
         if not kids:
             continue
 
-        all_done = all(normalize_status(k.get("status")) == "done" for k in kids)
+        # DAH7 — "nothing left to do" is not the same as "every child says
+        # done". A task closed as `cancelled` / `dropped` / `superseded` is
+        # resolved: it will never become done, so counting it as pending pins
+        # the initiative `active` forever (reproduced on
+        # `daemon-audit-hardening`, whose DAH3 was cancelled after being
+        # measured). The `any(... done)` guard keeps the other direction
+        # honest: an initiative whose children were ALL abandoned was not
+        # completed, and must not be auto-archived as if it had been.
+        all_done = all(is_resolved_status(k.get("status")) for k in kids) and any(
+            normalize_status(k.get("status")) == "done" for k in kids
+        )
 
         # ── Forward path: active/next/in_progress → done ────────────
         if status != "done" and all_done:
@@ -362,7 +377,7 @@ def _reconcile_initiative_archive(
         # ── Backward path (py-1.12.4): done → active when partial ───
         if status == "done" and not all_done:
             pending = [
-                k.get("id") for k in kids if normalize_status(k.get("status")) != "done"
+                k.get("id") for k in kids if not is_resolved_status(k.get("status"))
             ]
             new_fields = {"status": "active"}
             # Wipe the completion markers — they're lying.
