@@ -3,6 +3,24 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.2 — py-1.35.1's fix DID NOTHING in production, and the tests said it
+  worked (DAH7b). `is_resolved_status` was handed `task["status"]` — the value
+  `build_state` has ALREADY normalised — so `cancelled` reached it as
+  `backlog` and the predicate could not see the distinction it exists to make.
+  The unit tests passed because they called `_reconcile_initiative_archive`
+  with raw frontmatter dicts, which is not how the build calls it: a test
+  whose fixtures are shaped more conveniently than production is a test that
+  cannot fail for the production reason. Caught by watching the live daemon
+  after publishing: the initiative kept reverting to `active`, and `/state`
+  showed the daemon's own view — `DAH3 → 'backlog'`. Task records now carry
+  `status_raw` (the frontmatter literal) alongside the normalised `status`,
+  and the reconciler judges by that, falling back to `status` for records
+  written by an older daemon. Additive field; a consumer that only knows
+  `status` is unaffected. The tests were rebuilt to construct records the way
+  `build_state` does — `status` normalised, `status_raw` literal — and now go
+  red against py-1.35.1. Verified live: `daemon-audit-hardening`
+  auto-archived with `completed_at` + `commit_sha`, its last open child being
+  cancelled rather than done.
 - 1.35.1 — A task closed as `cancelled` pinned its initiative `active`
   FOREVER (DAH7). `_reconcile_initiative_archive` runs on every `/state` build
   and asked `all(normalize_status(k) == "done")` — and `normalize_status`

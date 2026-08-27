@@ -76,7 +76,19 @@ def _write_initiative(root: Path, iid: str, status: str) -> dict:
 
 
 def _task(tid: str, iid: str, status: str) -> dict:
-    return {"id": tid, "initiative": iid, "status": status}
+    """A task record in the shape `build_state` actually produces: `status` is
+    the NORMALISED value (six possibilities), `status_raw` the frontmatter
+    literal. Getting this wrong is what let py-1.35.1 ship a fix that passed
+    its tests and did nothing in production — the tests handed the reconciler
+    raw frontmatter, the build hands it normalised records."""
+    from cluster import normalize_status
+
+    return {
+        "id": tid,
+        "initiative": iid,
+        "status": normalize_status(status),
+        "status_raw": status,
+    }
 
 
 def _status_on_disk(root: Path, it: dict) -> str:
@@ -131,4 +143,34 @@ def test_reconcile_is_idempotent(tmp_path: Path) -> None:
     tasks = [_task("T1", "aud", "done"), _task("T2", "aud", "cancelled")]
     for _ in range(3):
         _reconcile_initiative_archive([it], tasks, _Paths(tmp_path))
+    assert _status_on_disk(tmp_path, it) == "done"
+
+
+def test_reconciler_reads_the_raw_status_not_the_normalised_one(tmp_path: Path) -> None:
+    """The integration bug behind py-1.35.2, pinned directly: `cancelled`
+    normalises to `backlog`, so a reconciler judging by `status` alone sees
+    pending work that does not exist."""
+    it = _write_initiative(tmp_path, "aud", "active")
+    kid = _task("T2", "aud", "cancelled")
+    assert kid["status"] == "backlog", "precondition: normalisation loses it"
+    assert kid["status_raw"] == "cancelled"
+    _reconcile_initiative_archive(
+        [
+            it,
+        ],
+        [_task("T1", "aud", "done"), kid],
+        _Paths(tmp_path),
+    )
+    assert _status_on_disk(tmp_path, it) == "done"
+
+
+def test_records_without_status_raw_still_work(tmp_path: Path) -> None:
+    """A state.json written by a pre-py-1.35.2 daemon has no `status_raw`.
+    The fallback must keep those judgeable rather than crash."""
+    it = _write_initiative(tmp_path, "aud", "done")
+    kids = [
+        {"id": "T1", "initiative": "aud", "status": "done"},
+        {"id": "T2", "initiative": "aud", "status": "done"},
+    ]
+    _reconcile_initiative_archive([it], kids, _Paths(tmp_path))
     assert _status_on_disk(tmp_path, it) == "done"

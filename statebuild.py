@@ -62,6 +62,19 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                         "id": str(fm.get("id")),
                         "title": str(fm.get("title") or fm["id"]),
                         "status": normalize_status(fm.get("status")),
+                        # DAH7b — keep the ORIGINAL literal alongside the
+                        # normalised one. `normalize_status` is lossy by
+                        # design (six values out), and the archive reconciler
+                        # has to tell `cancelled` from `backlog`: the first is
+                        # resolved, the second is pending work. py-1.35.1
+                        # added `is_resolved_status` but fed it the ALREADY
+                        # normalised value, so it could never see the
+                        # difference and the fix did nothing in production —
+                        # the unit tests passed because they called the
+                        # reconciler with raw frontmatter, which is not how
+                        # the build calls it. Additive field: a consumer that
+                        # only knows `status` is unaffected.
+                        "status_raw": str(fm.get("status") or "").strip().lower(),
                         "priority": str(fm.get("priority") or "medium"),
                         "owner": str(fm.get("owner") or "unknown"),
                         "category": str(fm.get("category") or mid),
@@ -287,6 +300,14 @@ def _sortable_ts(v: Any) -> float:
             return 0.0
 
 
+def _child_status(task: Dict[str, Any]) -> Any:
+    """The status to JUDGE a child by: the raw frontmatter literal when the
+    record carries it (DAH7b), else the normalised one. The fallback keeps
+    callers that build records by hand — the tests, and any pre-py-1.35.2
+    state.json still on disk — working unchanged."""
+    return task.get("status_raw") or task.get("status")
+
+
 def _reconcile_initiative_archive(
     initiatives: List[Dict[str, Any]],
     tasks: List[Dict[str, Any]],
@@ -334,7 +355,7 @@ def _reconcile_initiative_archive(
         # measured). The `any(... done)` guard keeps the other direction
         # honest: an initiative whose children were ALL abandoned was not
         # completed, and must not be auto-archived as if it had been.
-        all_done = all(is_resolved_status(k.get("status")) for k in kids) and any(
+        all_done = all(is_resolved_status(_child_status(k)) for k in kids) and any(
             normalize_status(k.get("status")) == "done" for k in kids
         )
 
@@ -377,7 +398,7 @@ def _reconcile_initiative_archive(
         # ── Backward path (py-1.12.4): done → active when partial ───
         if status == "done" and not all_done:
             pending = [
-                k.get("id") for k in kids if not is_resolved_status(k.get("status"))
+                k.get("id") for k in kids if not is_resolved_status(_child_status(k))
             ]
             new_fields = {"status": "active"}
             # Wipe the completion markers — they're lying.
