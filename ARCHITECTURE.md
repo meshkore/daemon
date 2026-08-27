@@ -39,6 +39,7 @@ is **one flat module namespace**. Consequences you must respect:
 | `utils.py` | daemon logger `_log`, debug-stream singleton, TLS bundle discovery; **re-exports** timeutil/yamlparse/timeline so `from utils import …` still works |
 | `nethttp.py` | the ONE outbound HTTP fetch (`fetch_bytes`/`fetch_text`/`fetch_head_bytes`) — scheme allow-list + read ceiling + one User-Agent convention. Every CDN/TLS/standard/API call goes through it |
 | `sweeper.py` | `ProjectSweeper` — the per-project background loop (bind project → `tick()` → unbind) shared by `ChatSessionReaper` and `QuotaProber` |
+| `wsframe.py` | the ONE RFC-6455 frame codec (`encode`/`encode_text`/`close_frame`/`read_frame`) + the inbound payload ceiling. Shared by `hub.WSClient` (unmasked server writes), `routes._ws_read_frame` (masked server reads) and `verify._WS` (masking client) — three different halves of the protocol that each used to carry their own copy of the arithmetic |
 | `debuglog.py` | `DebugLog` ring stream (`/debug/tail`) |
 | `agent_prompts/` | the declarative `AGENT_PROMPTS` registry (split into per-role fragments + `_roadmap_architect` SOP) |
 | `agent_types.py` | agent-type resolution (`_agent_manifest`, `_agent_type_normalised`, `_agent_type_from_conv_slug`) |
@@ -48,7 +49,7 @@ is **one flat module namespace**. Consequences you must respect:
 | module | owns |
 |---|---|
 | `cluster.py` | `Cluster` (cluster.yaml + crons validation), `normalize_status`, `_patch_frontmatter` |
-| `hub.py` | `Hub` / `WSClient` — the WebSocket broadcast hub |
+| `hub.py` | `Hub` / `WSClient` — the WebSocket broadcast hub. `WSClient` owns the per-connection send `RLock` (py-1.31.4: two threads in `SSL_write` on one socket is native heap corruption) and the send timeout; the frame encoding is `wsframe`'s |
 | `registries.py` / `protocols.py` | `LinksRegistry` / `ProtocolsRegistry` |
 | `integrity.py` / `integritycheck.py` | `ProjectState` / `StateIntegrityChecker` |
 | `statebuild.py` | `build_state` — FS → state.json projection |
@@ -96,7 +97,7 @@ behaviour:
 ### Layer 3 — composition root
 | module | owns |
 |---|---|
-| `routes.py` (+ `routes_get`/`routes_post`) | the HTTP `make_handler` closure; `_do_GET`/`_do_POST` delegate to the route-table functions. NOTE: only GET and POST are extracted — the PUT/PATCH/DELETE tables are still inline in `routes.py`. **Auth is asymmetric**: POST has ONE global gate near the top of `route_post`, while GET declares `if self._need_auth(): return` per route, so a forgotten line publishes a GET. `tests/test_auth_matrix.py` is the guard — it probes every route anonymously against a live daemon and diffs it against an explicit record, so a new public GET goes red instead of unnoticed. Making GET default-deny by construction is task DAH2 of `daemon-audit-hardening` |
+| `routes.py` (+ `routes_get`/`routes_post`) | the HTTP `make_handler` closure; `_do_GET`/`_do_POST` delegate to the route-table functions. NOTE: only GET and POST are extracted — the PUT/PATCH/DELETE tables are still inline in `routes.py`. **Auth is fail-closed on all three wire surfaces** (it was not, until `daemon-audit-hardening`): POST has always had ONE global gate; GET got its own in py-1.34.0 (DAH2a), driven by the declarative `PUBLIC_GET_EXACT`/`PUBLIC_GET_PREFIXES` tables, so a new GET is private unless someone deliberately edits that table; and the **WebSocket upgrade** got `_ws_authorized` in py-1.35.0 (DAH4) — it is resolved before the HTTP gate and had no gate of its own, so `/events` streamed every hub broadcast, machine-wide, to anyone who could open a socket. The WS gate is separate rather than folded into `_need_auth` because a browser cannot set a header on a `new WebSocket(...)`: it reads `?token=`, and checks `Origin` too. `tests/test_auth_matrix.py` + `tests/test_ws_auth.py` are the guards — they probe every route (and both upgrade aliases) anonymously against a live daemon and diff against an explicit record, so a newly-public surface goes red instead of unnoticed |
 | `daemon.py` | imports every mixin, `class Daemon(…24 mixins…)`, `__init__` wiring, `main`/`_parse_args` |
 
 ## Where do I look for X?
@@ -129,6 +130,13 @@ behaviour:
   live and pinned with the reason each public route is public.
 - `tests/test_cors_allowlist.py` — the origin allowlist names OUR surfaces, not
   a hosting domain (adversarial near-misses included).
+- `tests/test_ws_auth.py` — the WebSocket upgrade refuses an anonymous caller,
+  a hostile `Origin` (even holding a valid token) and an empty `?token=`, on
+  both `/events` and `/ws`; and still upgrades for the three legitimate
+  channels (cockpit `?token=`, CLI Bearer, cockpit Origin).
+- `tests/test_wsframe.py` — the frame codec: every length boundary masked and
+  unmasked, mask symmetry, the payload ceiling refused before the body is
+  read, control opcodes, fragmentation, truncation.
 - Run `pytest daemon/tests/ -q`. Rebuild the bundle (`python daemon/bundle.py`)
   before parity runs. Coverage: `pytest --cov` (data confined to
   `tests/.coverage_cache/`).

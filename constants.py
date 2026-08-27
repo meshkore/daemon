@@ -49,4 +49,4 @@ FS_POLL_SEC = 1.5
 # ~20% of the 8 KB window those two Range readers get — one more paragraph
 # and a remote version check would silently start returning None. Release
 # notes belong in CHANGELOG.md; this line stays one short line forever.
-DAEMON_VERSION = "py-1.34.1"  # DAH2 — /self-update install-dir fix; see CHANGELOG.md
+DAEMON_VERSION = "py-1.35.0"  # DAH4/DAH5 — WS upgrade authenticated; see CHANGELOG.md

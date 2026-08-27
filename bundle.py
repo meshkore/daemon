@@ -44,6 +44,7 @@ MODULES = [
     "contextpolicy.py",
     "paths.py",
     "nethttp.py",  # DAH1 (daemon-audit-hardening) — the one outbound-fetch helper; stdlib-only leaf, no sibling deps.
+    "wsframe.py",  # DAH5 — the RFC-6455 frame codec; stdlib-only leaf. Before hub/verify/routes, its three callers.
     "crypto_ed25519.py",
     "fsatomic.py",
     "timeutil.py",

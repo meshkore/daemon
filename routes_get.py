@@ -86,8 +86,11 @@ def _get_is_public(path: str) -> bool:
 
 def route_get(self, daemon):  # noqa: N802
     p, q = self._path()
-    # WebSocket upgrade? Handled (and authenticated) by _handle_ws itself, so
-    # it is resolved before the HTTP auth gate below.
+    # WebSocket upgrade. Resolved before the HTTP gate below because it has
+    # its OWN gate — `_ws_authorized`, which checks Origin plus the portal
+    # token from `?token=` (browsers cannot set headers on a WebSocket, so the
+    # HTTP gate's Bearer-only check could never have served this route).
+    # DAH4: this comment used to claim that authentication and there was none.
     if (
         p in ("/events", "/ws")
         and self.headers.get("Upgrade", "").lower() == "websocket"

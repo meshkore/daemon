@@ -241,6 +241,18 @@ class QueryMixin:
             # against this daemon; it must reload to pick up the bundle that
             # sends the token. That is what this flag is for.
             "chat.reads.authed.v1",
+            # py-1.35.0 DAH4 — the WebSocket upgrade AUTHENTICATES. `GET /events`
+            # (and its `/ws` alias) used to answer 101 to anyone who could open
+            # a socket and then stream every hub broadcast — chat deltas and
+            # finals, timeline, anchors, verify results, for every project on
+            # the machine. WebSockets are exempt from the same-origin policy
+            # and get no CORS preflight, so the loopback bind was not a
+            # perimeter: any page in any tab could subscribe. Now the upgrade
+            # requires the portal token (`?token=`, which the cockpit has
+            # always sent, or a Bearer header) and an allowlisted `Origin`
+            # when one is present. No cockpit change was needed — unlike
+            # chat.reads.authed.v1, the client half already existed.
+            "ws.authed.v1",
             # py-1.6.0 → py-1.6.1 — session_resume opt-in only.
             # Set env MESHKORE_CLAUDE_SESSION_ID=1 to enable. Default
             # off after a production bug where claude-code exited

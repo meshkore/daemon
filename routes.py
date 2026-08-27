@@ -28,7 +28,6 @@ import hmac
 import json
 import os
 import socket
-import struct
 import threading
 import time
 import urllib.parse
@@ -37,12 +36,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hub import WSClient
+from wsframe import OP_CLOSE, Frame, FrameTooLarge, read_frame
 import traceback  # py-1.16.0 (D-HTTP-500-01) — handler exception guard
 
 from routes_get import route_get
 from routes_post import route_post
 from constants import MAX_BODY_BYTES
-from utils import _debug_emit, _iso_now  # DM7
+from utils import _debug_emit, _iso_now, _log  # DM7
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -151,6 +151,50 @@ def make_handler(daemon: Any):
                 return False
             self._json(401, {"error": "unauthorized"})
             return True
+
+        def _ws_authorized(self) -> bool:
+            """DAH4 — the WebSocket upgrade's own auth gate. It had none.
+
+            `route_get` resolves the upgrade BEFORE the HTTP gate, on the
+            stated grounds that `_handle_ws` authenticates itself. It did not:
+            it read `Sec-WebSocket-Key`, answered 101 and joined the Hub. So
+            `GET /events` streamed every broadcast — chat deltas and finals,
+            timeline events, anchors, verify results, across ALL projects on
+            the machine (`ProjectHub` tags the event and delegates to the ONE
+            global Hub; the per-project filtering is the cockpit's) — to
+            anyone who could open a socket.
+
+            The loopback bind is not a perimeter against this. WebSockets are
+            not subject to the same-origin policy and get no CORS preflight:
+            any page in any tab can dial `wss://daemon.meshkore.com:<port>/ws`
+            and read the stream. Textbook cross-site WebSocket hijacking, and
+            `_handle_ws` writes its 101 with raw `send_header` calls, so it
+            never passed through `_cors()` either.
+
+            Two checks, both cheap:
+
+            1. **Origin.** Browsers always send it on a WS handshake and
+               cannot forge it, so an allowlist miss is decisive. A non-browser
+               client (CLI, our own probes) sends none — allowed, matching the
+               stance `_cors` already takes for header-less callers.
+            2. **Portal token**, constant-time. From `Authorization: Bearer`
+               for clients that can set headers, or `?token=` for browsers,
+               which cannot set any header on a `new WebSocket(...)`.
+
+            The cockpit has sent `?token=` since it was written (`lib/ws.ts`:
+            "dial the /events endpoint with the cluster's bearer token") — the
+            emitter was always there, the receiver never looked. That is why
+            closing this needs no coordinated cockpit release, unlike DAH2(b).
+
+            Portal token only: the CPL-2 remote-control token is scoped to
+            `/projects` + the `architect-master` ask/poll pair, and a raw
+            firehose of every project's chat is not in that scope.
+            `daemon.token` is machine-global, so this never depends on the
+            `X-MeshKore-Project` routing a browser cannot participate in."""
+            if self.headers.get("Origin") and not self._allowed_origin():
+                return False
+            tok = self._bearer() or self._path()[1].get("token", "")
+            return bool(tok) and hmac.compare_digest(tok, daemon.token)
 
         def _drain_body(self, n: int) -> None:
             """Read and discard `n` bytes so an oversized/rejected request
@@ -491,6 +535,10 @@ def make_handler(daemon: Any):
 
         # ── WebSocket handshake + run-loop ─────────────────────────────
         def _handle_ws(self) -> None:
+            # DAH4 — FIRST, before anything is upgraded or joined to the Hub.
+            if not self._ws_authorized():
+                self._json(401, {"error": "unauthorized"})
+                return
             key = self.headers.get("Sec-WebSocket-Key")
             if not key:
                 self.send_error(400)
@@ -562,9 +610,13 @@ def _ws_pump(daemon, client, sock, server) -> None:
             )
         )
         while not daemon.stopping.is_set() and not client.closed:
-            op, _data = _ws_read_frame(sock)
-            if op is None or op == 0x8:  # close frame
+            frame = _ws_read_frame(sock)
+            if frame is None or frame.opcode == OP_CLOSE:
                 break
+    except FrameTooLarge as e:
+        # DAH4 — a peer announcing an absurd length is not a peer we keep.
+        # Refused before the body was read, so this costs one log line.
+        _log(f"ws: dropping client — {e}")
     except (OSError, ConnectionError):
         pass
     finally:
@@ -574,26 +626,12 @@ def _ws_pump(daemon, client, sock, server) -> None:
             reg.discard(id(sock))
 
 
-def _ws_read_frame(sock: socket.socket) -> Tuple[Optional[int], bytes]:
-    """Minimal inbound frame parser. Returns (opcode, payload) or (None, b'')."""
-    hdr = _recv_exact(sock, 2)
-    if not hdr or len(hdr) < 2:
-        return None, b""
-    b1, b2 = hdr[0], hdr[1]
-    opcode = b1 & 0x0F
-    masked = bool(b2 & 0x80)
-    length = b2 & 0x7F
-    if length == 126:
-        ext = _recv_exact(sock, 2)
-        length = struct.unpack(">H", ext)[0]
-    elif length == 127:
-        ext = _recv_exact(sock, 8)
-        length = struct.unpack(">Q", ext)[0]
-    mask_key = _recv_exact(sock, 4) if masked else b""
-    payload = _recv_exact(sock, length)
-    if masked and payload:
-        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    return opcode, payload
+def _ws_read_frame(sock: socket.socket) -> Optional[Frame]:
+    """Read one inbound frame, or None at EOF. DAH5 — the parsing itself now
+    lives in `wsframe.read_frame`; what is local is the socket adapter, and
+    the fact that `_recv_exact` signals EOF with a short read rather than an
+    exception. Raises `FrameTooLarge` above the codec's payload ceiling."""
+    return read_frame(lambda n: _recv_exact(sock, n))
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:

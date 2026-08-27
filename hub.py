@@ -26,6 +26,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict
 
+from wsframe import encode_text
+
 HEARTBEAT_SEC = 20.0
 SEND_TIMEOUT_SEC = 5.0  # py-1.16.0 (D-WS-02) — bound a send so a stalled client can't wedge a broadcaster
 
@@ -74,22 +76,14 @@ class WSClient:
             pass
 
     def send_text(self, payload: str) -> None:
-        """Send a single, unmasked, unfragmented text frame (server → client)."""
+        """Send a single, unmasked, unfragmented text frame (server → client).
+
+        DAH5 — the frame arithmetic moved to `wsframe.encode_text`; this
+        method keeps what is actually its own: the closed-check and the
+        per-connection send lock below."""
         if self.closed:
             return
-        data = payload.encode("utf-8")
-        header = bytearray()
-        header.append(0x81)  # FIN + text opcode
-        n = len(data)
-        if n < 126:
-            header.append(n)
-        elif n < 65536:
-            header.append(126)
-            header.extend(struct.pack(">H", n))
-        else:
-            header.append(127)
-            header.extend(struct.pack(">Q", n))
-        frame = bytes(header) + data
+        frame = encode_text(payload, mask=False)
         # Hold the per-connection lock across the WHOLE sendall so no other
         # thread can interleave an SSL_write on this socket (see __init__).
         with self._send_lock:

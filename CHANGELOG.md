@@ -3,6 +3,76 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.0 — **THE WEBSOCKET UPGRADE NOW AUTHENTICATES** (DAH4), and the RFC-6455
+  frame codec is written once instead of three times (DAH5). `route_get`
+  resolved the `/events` (and `/ws`) upgrade BEFORE the HTTP auth gate, on the
+  strength of an in-code comment reading "Handled (and authenticated) by
+  `_handle_ws` itself". `_handle_ws` authenticated NOTHING: it read
+  `Sec-WebSocket-Key`, answered 101, and joined the caller to the Hub. So the
+  daemon streamed every `hub.broadcast` — `chat.assistant.delta` /
+  `.final`, timeline events, anchors, `verify.result` — to anyone able to open
+  a socket, for ALL projects on the machine at once (`ProjectHub` tags the
+  event with `project_id` and delegates to the ONE global Hub; per-project
+  filtering is the cockpit's, not the wire's). Verified against the live
+  py-1.34.1 daemon with no token and `Origin: https://evil.example.com`: 101,
+  then the `hello` frame and live events. The loopback bind is not a perimeter
+  against this — WebSockets are exempt from the same-origin policy and get no
+  CORS preflight, so any page in any tab of the operator's browser could
+  subscribe; textbook cross-site WebSocket hijacking. It also never passed
+  through `_cors()`, because `_handle_ws` writes its 101 with raw
+  `send_header` calls. This is the push half of the same surface DAH2(b)
+  closed on the pull side, and the worse half: live, no conv id needed,
+  whole-machine. NEW `Handler._ws_authorized()`, called as the first statement
+  of `_handle_ws`: an `Origin`, when present, must pass the existing CORS
+  allowlist (a browser cannot forge it, so a miss is decisive), and the portal
+  token must match under `hmac.compare_digest` — from `Authorization: Bearer`
+  for header-capable clients, or `?token=` for browsers, which cannot set any
+  header on a `new WebSocket(...)`. **No coordinated cockpit release was
+  needed**, unlike DAH2(b): `lib/ws.ts` has always appended `?token=` (its own
+  docstring says so) — the emitter existed, the receiver never looked, which
+  is precisely why the false comment survived review. Portal token only; the
+  CPL-2 remote-control token is scoped to `/projects` + the `architect-master`
+  ask/poll pair, and a firehose of every project's chat is not in that scope.
+  `daemon.token` is machine-global, so the check never depends on the
+  `X-MeshKore-Project` routing a browser cannot participate in. NEW
+  `wsframe.py` (DAH5) — `encode`/`encode_text`/`close_frame`/`read_frame`, the
+  frame arithmetic that `hub.WSClient.send_text`, `routes._ws_read_frame` and
+  `verify._WS` each carried privately. The three classes STAY (they are three
+  different halves of the protocol: unmasked server writer with the py-1.31.4
+  per-connection `RLock`, masked-aware server reader, full masking client);
+  only the codec is shared. That buys a payload ceiling in ONE place: both
+  readers used to hand the wire-declared length straight to their
+  `recv_exact`, so a peer announcing 2**63 bytes had the process growing a
+  buffer until the socket died — `read_frame` refuses above `MAX_PAYLOAD_BYTES`
+  before reading a single body byte, and `_ws_pump` drops such a client with
+  one log line. NEW feature flag `ws.authed.v1`. DAH3 (move `verify.py` out of
+  the bundle) is CLOSED as `cancelled`: measured at 36.911 B of a 1.047.352 B
+  bundle — 3,5 %, inert at runtime — a lazily-fetched signed sidecar would add
+  a second versioned artefact and new offline/drift failure modes for no real
+  gain, and its one true finding (the triplicated WS code) is what DAH5 fixes
+  properly. Tests: NEW `test_ws_auth.py` (10 — anonymous, hostile origin with
+  and without a valid token, wrong token, empty `?token=`, both aliases, and
+  the three channels that must keep working) and `test_wsframe.py` (30 —
+  round-trips across the 125/126/65535/65536 length boundaries masked and
+  unmasked, multibyte UTF-8, mask symmetry and per-frame randomness, the
+  ceiling, control opcodes, fragmentation, truncation). `test_ws_pool.py`'s
+  helper now passes the token, which is itself the regression record: it used
+  to open a credential-free socket and that was accepted. Also DAH6 — the
+  external gateway's per-member concurrent cap could be exceeded: the check ran
+  under `_teamext_lock`, released it, dispatched, and inserted the record under
+  a SECOND acquisition, so two asks arriving at `active == cap - 1` both passed
+  and both inserted. The 2026-08-26 audit filed it as harmless (cap 6, one
+  local operator) — wrong frame: this cap is the ONLY rate limit TEG-2 ships
+  ("loopback binding is the perimeter; no rate limiting beyond this in v1"),
+  and the gateway exists to be driven by third parties, where simultaneous
+  asks are the normal shape. Measured at 8 admitted against a cap of 6 with 10
+  concurrent asks. The slot is now RESERVED inside the same lock that counts
+  it (the `rid` is minted first, the entry inserted with `conv: ""`, and the
+  post-dispatch write fills it in rather than creating it), and released
+  explicitly when the dispatch fails so a 503 does not cost the member a slot
+  until the 24 h TTL reaps it. NEW `test_teamext_cap_race.py` (3), which parks
+  every caller on a barrier inside `chat_dispatch` to force the interleaving
+  rather than hope for it — verified red against the previous code.
 - 1.34.1 — `/self-update` SWAPS THE RUNNING BINARY, not one in whatever project
   the caller named. Found by triggering it during the py-1.34.0 release, which
   is the only way this surfaces. `self_update` resolved its target through

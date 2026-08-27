@@ -36,7 +36,6 @@ import platform
 import shutil
 import socket
 import ssl
-import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +46,16 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from wsframe import (
+    OP_CLOSE,
+    OP_PING,
+    OP_PONG,
+    FrameTooLarge,
+    close_frame,
+    encode_text,
+    read_frame,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0. small helpers
@@ -332,49 +341,34 @@ class _WS:
         return out
 
     def send_text(self, text: str) -> None:
-        payload = text.encode("utf-8")
-        header = bytearray([0x81])  # FIN + text opcode
-        mask_bit = 0x80
-        n = len(payload)
-        if n < 126:
-            header.append(mask_bit | n)
-        elif n < 65536:
-            header.append(mask_bit | 126)
-            header += struct.pack(">H", n)
-        else:
-            header.append(mask_bit | 127)
-            header += struct.pack(">Q", n)
-        mask = os.urandom(4)
-        header += mask
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(bytes(header) + masked)
+        # DAH5 — client frames MUST be masked (RFC 6455 §5.3); the codec is
+        # shared with hub/routes now, which only differ in that flag.
+        self.sock.sendall(encode_text(text, mask=True))
 
     def recv_text(self) -> Optional[str]:
-        """Return the next text message, reassembling fragments; None on close."""
+        """Return the next text message, reassembling fragments; None on close.
+
+        DAH5 — frame parsing delegated to `wsframe.read_frame`, which also
+        applies the payload ceiling this reader never had. What stays here is
+        the CDP-specific policy: skip control frames, reassemble a fragmented
+        message, decode as UTF-8."""
         chunks: List[bytes] = []
         while True:
-            b0, b1 = self._recv_exact(2)
-            fin = b0 & 0x80
-            opcode = b0 & 0x0F
-            length = b1 & 0x7F
-            if length == 126:
-                length = struct.unpack(">H", self._recv_exact(2))[0]
-            elif length == 127:
-                length = struct.unpack(">Q", self._recv_exact(8))[0]
-            payload = self._recv_exact(length) if length else b""
-            if opcode == 0x8:  # close
+            try:
+                frame = read_frame(self._recv_exact)
+            except FrameTooLarge as e:
+                raise CDPError(f"browser sent an oversized frame: {e}") from e
+            if frame is None or frame.opcode == OP_CLOSE:
                 return None
-            if opcode == 0x9:  # ping → pong (no mask needed for our purpose)
+            if frame.opcode in (OP_PING, OP_PONG):
                 continue
-            if opcode == 0xA:  # pong
-                continue
-            chunks.append(payload)
-            if fin:
+            chunks.append(frame.payload)
+            if frame.fin:
                 return b"".join(chunks).decode("utf-8", "replace")
 
     def close(self) -> None:
         try:
-            self.sock.sendall(b"\x88\x80" + os.urandom(4))  # masked close
+            self.sock.sendall(close_frame(mask=True))
         except OSError:
             pass
         try:

@@ -18,7 +18,12 @@ import struct
 from conftest import Daemon
 
 
-def _ws_open(port: int) -> ssl.SSLSocket:
+def _ws_open(port: int, token: str) -> ssl.SSLSocket:
+    """DAH4 — `?token=` is now REQUIRED. The upgrade used to be ungated, so
+    this helper opened a socket with no credential at all; that is exactly the
+    hole `_ws_authorized` closes. A browser cannot set a header on a
+    `new WebSocket(...)`, so the query param is the cockpit's only channel and
+    the one this helper mirrors."""
     raw = socket.create_connection(("127.0.0.1", port), timeout=5)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -26,7 +31,7 @@ def _ws_open(port: int) -> ssl.SSLSocket:
     s = ctx.wrap_socket(raw, server_hostname="daemon.meshkore.com")
     key = base64.b64encode(os.urandom(16)).decode()
     req = (
-        "GET /events HTTP/1.1\r\n"
+        f"GET /events?token={token} HTTP/1.1\r\n"
         "Host: daemon.meshkore.com\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
@@ -65,7 +70,7 @@ def test_ws_does_not_starve_http(daemon: Daemon) -> None:
     socks: list[ssl.SSLSocket] = []
     try:
         for _ in range(5):
-            s = _ws_open(daemon.port)
+            s = _ws_open(daemon.port, daemon.token)
             op, payload = _read_frame(s)  # greeting
             assert op == 0x1, "hello should be a text frame"
             assert b"hello" in payload
@@ -135,7 +140,7 @@ def test_http_keep_alive_reuses_connection(daemon: Daemon) -> None:
 
 def test_ws_heartbeat_or_clean_close(daemon: Daemon) -> None:
     """A WS that the client closes is reaped without wedging the daemon."""
-    s = _ws_open(daemon.port)
+    s = _ws_open(daemon.port, daemon.token)
     op, _ = _read_frame(s)
     assert op == 0x1
     s.close()
