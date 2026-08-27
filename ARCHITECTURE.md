@@ -2,7 +2,7 @@
 
 > Read this first. It exists so an AI assistant (or a human) can walk into
 > `daemon/` and know **where to look for X** without reading every file.
-> The daemon is authored as ~60 small, single-responsibility modules and
+> The daemon is authored as ~80 small, single-responsibility modules and
 > **bundled** into one self-contained `dist/daemon.py` for distribution
 > (stdlib-only, no pip). Source you edit lives in `daemon/*.py`; never edit
 > `dist/daemon.py` — run `python daemon/bundle.py` instead.
@@ -34,9 +34,11 @@ is **one flat module namespace**. Consequences you must respect:
 | `constants.py` | `DAEMON_VERSION`, port range, FS-poll interval, registry paths |
 | `paths.py` | `Paths` (every `.meshkore/` path) + TLS filename constants |
 | `timeutil.py` | `_iso_now` / `_iso_at` (UTC ISO-8601) |
-| `yamlparse.py` | `parse_simple_yaml` + `parse_frontmatter` + `_FM_RE` |
+| `yamlparse.py` | `parse_simple_yaml` + `parse_frontmatter` + `split_frontmatter` + `_FM_RE` (`registries._split_frontmatter` re-exports the splitter) |
 | `timeline.py` | timeline JSONL iter/read/append |
 | `utils.py` | daemon logger `_log`, debug-stream singleton, TLS bundle discovery; **re-exports** timeutil/yamlparse/timeline so `from utils import …` still works |
+| `nethttp.py` | the ONE outbound HTTP fetch (`fetch_bytes`/`fetch_text`/`fetch_head_bytes`) — scheme allow-list + read ceiling + one User-Agent convention. Every CDN/TLS/standard/API call goes through it |
+| `sweeper.py` | `ProjectSweeper` — the per-project background loop (bind project → `tick()` → unbind) shared by `ChatSessionReaper` and `QuotaProber` |
 | `debuglog.py` | `DebugLog` ring stream (`/debug/tail`) |
 | `agent_prompts/` | the declarative `AGENT_PROMPTS` registry (split into per-role fragments + `_roadmap_architect` SOP) |
 | `agent_types.py` | agent-type resolution (`_agent_manifest`, `_agent_type_normalised`, `_agent_type_from_conv_slug`) |
@@ -80,14 +82,22 @@ behaviour:
 | `LifecycleMixin` (`lifecycle`) | `serve_forever` / `request_shutdown` / `cleanup` |
 | `SelfUpdateMixin` (`selfupdatesvc`) | `self_update` (download + validate + swap) |
 | `WallsMixin` (`walls`) | `/initiative/walls` + `/initiative/reorder` (roadmap wall ordering) |
+| `TeamMixin` (`teamsvc`) | `/team` CRUD + `_member_dispatch_prep` + `/team/draft` (LLM-backed) |
+| `TeamExtMixin` (`teamext`) | Team External Gateway: `/team/<id>/ask`, `/team/requests/<rid>`, member-token lifecycle, the A2A card, the per-request watcher |
+| `ClientsMixin` (`clidriverssvc`) | `GET /clients` — CLI-client catalog + local usability probes |
+| `ProvidersMixin` (`providersvc`) | `/config/providers` + the machine-global key store + `resolve_provider` |
+| `VerifyMixin` (`verifysvc`) | `POST /verify` — local CDP run or remote A2A verify agent |
+| `SnapshotsMixin` (`snapshots`) | Standard §20 file snapshots: `POST/GET/DELETE /snapshots*` |
+| `ProjectsMixin` (`projectsapi`) | `/projects` — the GLOBAL project registry (adopt / create / unregister) |
+| `RemoteControlMixin` (`remotectl`) | `/remote/token` — the machine-level remote-control credential (CPL-2) |
 | `StateManager` (`state.py`) | the FS-poll loop (a held object, not a mixin) |
 | `ProjectContext` (`projectctx.py`) | all PER-PROJECT state (paths, cluster, state_manager, runs, chat_sessions, queue, uploads, quota, registries, cron…) — a held object, not a mixin. DC-1 of `daemon-centralized`: the seam for one-daemon-many-projects. The Daemon holds one today (+ aliases `self.<attr> = ctx.<attr>`); DC-2 turns it into a registry keyed by project_id. GLOBAL services (hub, identity, token, port, http server, VersionWatcher) stay on the Daemon. |
 
 ### Layer 3 — composition root
 | module | owns |
 |---|---|
-| `routes.py` (+ `routes_get`/`routes_post`) | the HTTP `make_handler` closure; `_do_GET`/`_do_POST` delegate to the route-table functions |
-| `daemon.py` | imports every mixin, `class Daemon(…15 mixins…)`, `__init__` wiring, `main`/`_parse_args` |
+| `routes.py` (+ `routes_get`/`routes_post`) | the HTTP `make_handler` closure; `_do_GET`/`_do_POST` delegate to the route-table functions. NOTE: only GET and POST are extracted — the PUT/PATCH/DELETE tables are still inline in `routes.py`. **Auth is asymmetric**: POST has ONE global gate near the top of `route_post`, while GET declares `if self._need_auth(): return` per route, so a forgotten line publishes a GET. `tests/test_auth_matrix.py` is the guard — it probes every route anonymously against a live daemon and diffs it against an explicit record, so a new public GET goes red instead of unnoticed. Making GET default-deny by construction is task DAH2 of `daemon-audit-hardening` |
+| `daemon.py` | imports every mixin, `class Daemon(…24 mixins…)`, `__init__` wiring, `main`/`_parse_args` |
 
 ## Where do I look for X?
 - **A new HTTP route** → add the dispatch line in `routes_get.py`/`routes_post.py`,
@@ -111,13 +121,21 @@ behaviour:
   the gate that proves the refactor never breaks the current frontend.
 - `tests/test_chat_dispatch_integration.py` — the full dispatch→spawn→stream→
   finalise chain via a fake `claude` on the daemon PATH.
+- `tests/test_snapshots.py` — the Standard §20 contract (create/list/manifest/
+  raw-read/delete, traversal refusals, daily-log integration, auth).
+- `tests/test_teamext_stream_match.py` — an external ask resolves to ITS OWN
+  turn's final, never a neighbouring turn's.
+- `tests/test_auth_matrix.py` — every route's anonymous reachability, probed
+  live and pinned with the reason each public route is public.
+- `tests/test_cors_allowlist.py` — the origin allowlist names OUR surfaces, not
+  a hosting domain (adversarial near-misses included).
 - Run `pytest daemon/tests/ -q`. Rebuild the bundle (`python daemon/bundle.py`)
   before parity runs. Coverage: `pytest --cov` (data confined to
   `tests/.coverage_cache/`).
 
 ## Why mixins (Phase E2 decision)
 
-`Daemon` inherits ~15 mixins rather than composing ~15 service objects. This was
+`Daemon` inherits ~24 mixins rather than composing ~24 service objects. This was
 deliberate and is the **kept** end-state:
 
 - **Each mixin is already one cohesive concern** — the separation-of-

@@ -18,6 +18,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from constants import DAEMON_VERSION
+from nethttp import FetchError, fetch_head_bytes
 from utils import _debug_emit, _iso_now, _log
 
 if TYPE_CHECKING:
@@ -200,18 +201,14 @@ class VersionWatcher:
         non-200, missing version marker)."""
         url = self._source_url()
         try:
-            import urllib.request
-
-            req = urllib.request.Request(
+            head = fetch_head_bytes(
                 url,
-                headers={
-                    "User-Agent": f"meshcore-py/{DAEMON_VERSION} version-watcher",
-                    "Range": f"bytes=0-{self._FETCH_BYTES - 1}",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=8) as r:
-                head = r.read(self._FETCH_BYTES).decode("utf-8", errors="replace")
-        except Exception as e:
+                label="version-watcher",
+                version=DAEMON_VERSION,
+                n=self._FETCH_BYTES,
+                timeout=8,
+            ).decode("utf-8", errors="replace")
+        except FetchError as e:
             _log(f"version-watcher: fetch failed {url}: {e}")
             return None
         m = re.search(r'^DAEMON_VERSION\s*=\s*"([^"]+)"', head, re.MULTILINE)

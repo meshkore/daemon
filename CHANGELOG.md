@@ -3,6 +3,57 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.33.0 — DEEP-AUDIT PASS (initiative `daemon-audit-hardening`, task DAH1). A
+  full audit of the daemon as it stands after gaining three surfaces since the
+  last architecture pass (Team External Gateway, master-copilot remote control,
+  multi-provider/multi-CLI agents). Correctness: (a) an EXTERNAL ask could be
+  answered with ANOTHER turn's text — `_teamext_latest_final` matched on
+  `(conv, ts >= started_at)` only, so an ask queued behind a running turn (the
+  normal shape for a singleton like `architect-master`, i.e. the remote-control
+  path) resolved against that turn's final; it now matches on `stream_id`,
+  which every final emitter already stamped, and the watcher latches its own
+  stream the moment its turn goes live. A request still waiting for its own
+  turn also gets a queue-length grace instead of erroring after 20 s. (b) A
+  POST body over `MAX_BODY_BYTES` was left UNREAD on the socket — precisely the
+  keep-alive desync the up-front drain exists to prevent — and the handler then
+  ran against a silently empty body; it is now drained and answered 413. (c)
+  The portal token compares in constant time like the other two bearer classes.
+  NEW: Standard §20 file snapshots (`POST/GET/DELETE /snapshots*`) — mandated
+  since v19 and instructed in every project's CLAUDE.md, but never implemented,
+  so the endpoint 404'd. Dedup: one outbound-fetch helper (`nethttp.py`) behind
+  nine hand-rolled `urlopen` call-sites, with a scheme allow-list and a read
+  ceiling; one version comparator (two lived in `bootupdate.py` with different
+  semantics for malformed input); one TLS-bundle refresh and one backup policy
+  shared by the boot and HTTP update paths (the HTTP path kept 1 rollback point
+  vs the boot path's 3); one `ProjectSweeper` base behind `ChatSessionReaper` +
+  `QuotaProber`; one `_PollingRegistry` base behind `LinksRegistry` +
+  `WorkflowsRegistry`; one `_emit_final` behind the runner's three copies; one
+  `split_frontmatter` behind four frontmatter readers; one `MAX_BODY_BYTES`;
+  one credentials-write handler for PUT and POST. Removed dead code and ~20
+  orphaned section headings in `daemon.py` left over by the v2 refactor.
+  `ARCHITECTURE.md` re-synced (it documented 15 mixins; there are 24). Not
+  changed, deliberately, and written up in
+  `.meshkore/docs/architecture/daemon-audit-2026-08.md`: GET auth is still
+  per-route opt-in while POST is default-deny; `/chat/conv/<id>/messages`
+  serves transcripts anonymously; the CORS allowlist still accepts any
+  `*.pages.dev`. SECOND PASS, same session: rather than leave all three to a
+  blind decision, the cockpit client was read to find out what actually breaks.
+  The CORS one needed no decision at all — the cockpit deploys to the Pages
+  project `meshkore-portal`, so narrowing the allowlist from the whole hosting
+  domain to `meshkore-portal.pages.dev` + `*.meshkore-portal.pages.dev` keeps
+  every legitimate preview and drops every third party;
+  `MESHKORE_EXTRA_CORS_ORIGINS` is the escape hatch. The GET fail-open policy is
+  now MEASURED instead of argued: `tests/test_auth_matrix.py` probes every route
+  in the endpoint warranty's own table without a token against a live daemon and
+  diffs it against an explicit record where each public route carries the reason
+  it is public — it immediately surfaced 7 anonymous routes a manual read of the
+  543-line if-chain had missed. Closing `/chat/conv/<id>/messages` stays open on
+  purpose: the cockpit requests it with `requireAuth: false`, which suppresses
+  the header even when a token exists, so it is a coordinated two-repo change
+  with a mandatory deploy order (cockpit first) — a release call, not a code one.
+  Tests: 359 → 497 passing (new: snapshots, teamext stream matching, body limit,
+  auth matrix, CORS allowlist).
+
 - 1.32.2 — CONV-META MEMBER SURFACE FIX (operator field report 2026-07-13). Switching `architect-master` to `provider: zai` / `model: glm-4.6` had NO effect on normal chat turns to its own long-lived system conv (`_onboarding_v1`, created 2026-05-30) — verified end-to-end: the daemon-side provider/client/model resolution is correct and was proven working via a fresh `/team/architect-master/ask` test (conv_meta correctly showed `client: claude-code`, `provider: zai`, `model: glm-4.6` afterward), but the SAME conv dispatched from the cockpit's normal chat UI produced `model: opus` with no `client`/`provider` at all. Root cause: `chatread.py`'s `chat_convs()` (feeding `/chat/snapshot`) never surfaced the per-conv `member` field, so the cockpit's `hydrateFromSnapshot` had no way to learn/heal a pre-existing conv's member binding — every dispatch from the chat UI on such a conv silently omitted `member`, so `_member_dispatch_prep` never ran and the member's client/model/provider dial never applied (only the external ask/poll gateway, which always resolves the member fresh from the file, was actually honoring it). FIX: `chat_convs()` now includes `member` + `provider` in its per-conv entry (additive, no wire-format break). Companion cockpit fix (architect repo): `hydrateFromSnapshot` seeds both on a fresh conv AND heals `member` into any existing local convMeta entry missing it, mirroring the pre-existing `agentId`-healing pattern — this retroactively fixes already-stale entries (like `_onboarding_v1`) without requiring a localStorage wipe. Targeted tests (snapshot/chatread/member/conv_meta): 24 passed; full suite verified before deploy.
 - 1.31.2 — MULTI-CLI-CLIENTS FOLLOW-UP #2 (same live-smoke-test session as 1.31.1). PATCHing the codex smoke-test member's `model` to `""` (the correct empty-model sentinel per 1.31.1's own fix) round-tripped to `model: {}` on the very next GET. Root cause: `team.py:serialise_member()` wrote a bare `key:` with nothing after the colon for an empty string, and this project's simplified YAML parser reads "nothing on this line" as a nested block mapping (`{}`), matching real YAML's block-mapping heuristic — no prior field had ever legitimately held an empty string, so this never surfaced until the multi-cli-clients empty-model sentinel existed. Fixed: `serialise_member` explicitly quotes any empty value as `""` regardless of whether the field is in `_QUOTED_FIELDS`. New `test_serialise_roundtrip_preserves_empty_model_as_string`. Suite: 330 passed.
 - 1.31.1 — MULTI-CLI-CLIENTS FOLLOW-UP (live smoke test on py-1.31.0, same-day). Dispatching a real `client: codex` member through the FULL daemon path (not just DM-CLI-03's raw-CLI spike) surfaced two real bugs synthesized unit tests hadn't caught. **(a)** `CodexDriver.parse_stream_line` didn't recognize `{"type":"error"}`/`{"type":"turn.failed"}` at all — an invalid `-m <model>` produced a clean `exit=1` with COMPLETELY EMPTY final text and zero diagnostic. Fixed: both event types now surface their message as `Final(text="[codex error] ...")`, the same convention claude-code's own "API Error: ..." final text already uses (and it correctly does NOT trip the transient-retry shield for a 400 invalid-request). **(b)** `team.py`'s `_normalise_payload` unconditionally defaulted an omitted `model` to `opus` regardless of `client` — a `client: codex` member with no explicit model got `-m opus`, which Codex rejects ("not supported when using Codex with a ChatGPT account"). Fixed: the default is now driver-relative — a client whose own `models_catalog()` declares `""` as a legitimate "use account default" (codex, gemini) gets an empty model when omitted; claude-code (no such catalog entry) is unchanged. `validate_member`'s mandatory-model check gets the matching exemption. Also fixed 3 more hardcoded `claude(...)` log labels in `runnerloop.py` missed in 1.31.0 (cosmetic). New: `test_parse_error_and_turn_failed_surface_as_final_text` (real captured NDJSON) + `tests/test_team_client_model.py` (9 cases). Suite: 329 passed.

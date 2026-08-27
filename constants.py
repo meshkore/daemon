@@ -15,6 +15,11 @@ from pathlib import Path
 
 PORT_RANGE = (5570, 5589)
 
+# Largest request body the HTTP surface will read. DAH1 — this used to be
+# declared TWICE (routes.py + daemon.py) with the same value; the wire layer
+# now imports the one in this leaf, so there is a single number to change.
+MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
+
 # Release-signing PUBLIC key (Ed25519, hex). py-1.27.5. The daemon verifies
 # every self-update bundle's detached signature (`<url>.sig`) against this
 # pinned key before swapping + re-exec'ing — so a CDN compromise / MITM
@@ -36,4 +41,12 @@ _PORT_REGISTRY_FILE = Path(
 )
 _PORT_REGISTRY_DIR = _PORT_REGISTRY_FILE.parent
 FS_POLL_SEC = 1.5
-DAEMON_VERSION = "py-1.32.2"  # 1.32.2 — CONV-META MEMBER SURFACE FIX (operator field report 2026-07-13: switching architect-master to Z.AI/glm-4.6 had no effect on its normal chat turns). Root cause: `chat_snapshot`/`chat_convs` (chatread.py) never surfaced the per-conv `member` binding, so the cockpit could never learn/heal it for a conv that predates the field (notably `_onboarding_v1`, the master's own long-lived system conv, created 2026-05-30) — every dispatch from the normal chat UI on such a conv silently omitted `member`, so `_member_dispatch_prep` never ran and the member's client/model/provider dial (verified working end-to-end via the external ask/poll gateway, which always resolves the member fresh) had zero effect. FIX: `chat_convs()` now includes `member`/`provider` in its per-conv entry; the cockpit's `hydrateFromSnapshot` seeds BOTH on a fresh conv and — critically — HEALS `member` into any pre-existing local convMeta entry that's missing it, exactly mirroring the existing `agentId`-healing pattern. No schema/wire-format change beyond two additive fields.
+# DAH1 — the version literal is REGEX-PARSED by three separate code paths
+# (bundle.py's 8 KB version marker, selfupdate._fetch_remote_version's
+# Range-request over the first 8 KB of the published bundle, and
+# bootupdate's `^DAEMON_VERSION\s*=\s*"..."` match on the download). It used
+# to carry a ~1,600-character release note as a trailing comment, which is
+# ~20% of the 8 KB window those two Range readers get — one more paragraph
+# and a remote version check would silently start returning None. Release
+# notes belong in CHANGELOG.md; this line stays one short line forever.
+DAEMON_VERSION = "py-1.33.0"  # DAH1 audit pass — see CHANGELOG.md

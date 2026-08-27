@@ -35,7 +35,6 @@ import re
 import secrets
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,6 +66,11 @@ _WATCH_MAX_SECS = 60 * 60
 # timeline before the watcher declares the request errored (spawn died, turn
 # cancelled, …).
 _IDLE_GRACE_SECS = 20.0
+# DAH1 — the same grace, but for a request whose OWN turn hasn't started yet
+# (it was queued behind one that was already running). The hand-off from the
+# previous turn's exit to our spawn goes through the chat queue's flush, which
+# is prompt but not instantaneous; 20 s was tight enough to error a healthy ask.
+_QUEUE_GRACE_SECS = 120.0
 
 _SESSION_SAFE_RE = re.compile(r"[^a-z0-9-]+")
 
@@ -529,6 +533,10 @@ class TeamExtMixin:
             dispatch_body["context_docs"] = body["context_docs"]
 
         started_at = _iso_now()
+        # DAH1 — remember which turn (if any) already owns this conv BEFORE we
+        # dispatch. If our ask gets queued behind it, that turn's final must
+        # never be mistaken for our answer (see _teamext_latest_final).
+        exclude_stream = self._teamext_live_stream(conv)
         # Reuse the EXISTING dispatch path — init prompt on turn 1, member
         # model/effort, rail visibility, singleton rules all come for free.
         code, resp = self.chat_dispatch(dispatch_body)
@@ -536,13 +544,19 @@ class TeamExtMixin:
             return code, resp
 
         rid = "req-" + secrets.token_urlsafe(9)
-        status = "queued" if resp.get("queued") else "running"
+        queued = bool(resp.get("queued"))
+        status = "queued" if queued else "running"
+        # Our own turn's identity — present only when the dispatch spawned
+        # immediately. When queued we carry `exclude_stream` instead and the
+        # watcher latches the real one as soon as our turn goes live.
+        own_stream = None if queued else (resp.get("stream_id") or None)
         entry = {
             "request_id": rid,
             "member": mid,
             "conv": conv,
             "status": status,
             "started_at": started_at,
+            "stream_id": own_stream,
         }
         with self._teamext_lock:
             data = self._teamext_gc(self._teamext_load())
@@ -566,6 +580,7 @@ class TeamExtMixin:
         threading.Thread(
             target=self._teamext_watch,
             args=(project_id, rid, mid, conv, started_at, auto_archive),
+            kwargs={"stream_id": own_stream, "exclude_stream": exclude_stream},
             name=f"teamext-{rid}",
             daemon=True,
         ).start()
@@ -655,9 +670,49 @@ class TeamExtMixin:
         return 200, card
 
     # ── watcher: observe the turn to completion ─────────────────────────
-    def _teamext_latest_final(self, conv: str, after_ts: str) -> Optional[str]:
-        """Text of the newest `chat.assistant.final` for `conv` with
-        ts >= after_ts, or None. Timeline walk mirrors chatread.py."""
+    def _teamext_live_stream(self, conv: str) -> Optional[str]:
+        """stream_id of the turn running on `conv` right now, or None.
+        Reads the same SRL2 snapshot the cockpit rehydrates from."""
+        try:
+            snap = self.chat_sessions.turn_snapshot(conv) or {}
+            return (snap.get("current_turn") or {}).get("stream_id") or None
+        except Exception:
+            return None
+
+    def _teamext_latest_final(
+        self,
+        conv: str,
+        after_ts: str,
+        *,
+        stream_id: Optional[str] = None,
+        exclude_stream: Optional[str] = None,
+    ) -> Optional[str]:
+        """Text of the `chat.assistant.final` that belongs to THIS request,
+        or None. Timeline walk mirrors chatread.py.
+
+        DAH1 (daemon-audit-hardening) — matching on `(conv, ts >= after_ts)`
+        alone was wrong for the case the external gateway hits most: an ask
+        that lands while another turn is already running on that conv (the
+        normal shape for a `kind: singleton` like `architect-master`, which is
+        exactly what the remote-control token talks to). `chat_dispatch`
+        returns `queued: True`, the operator's in-flight turn finishes with a
+        ts NEWER than our `started_at`, and the old predicate handed THAT
+        turn's answer back to the external caller as if it were the reply to
+        its own question.
+
+        Every emitter of `chat.assistant.final` (runnerloop + both runnerspawn
+        error paths) stamps `stream_id`, so the turn identity is already on the
+        wire — we just never used it:
+
+        - `stream_id` set  → accept ONLY that stream's final (exact identity).
+        - `stream_id` None → the turn hasn't spawned yet (still queued); accept
+          any final EXCEPT one belonging to `exclude_stream`, the turn that was
+          already running when we asked. The watcher latches our real stream_id
+          the moment our turn goes live, so this branch is a short-lived
+          fallback, not the steady state.
+
+        Events with NO `stream_id` (pre-py-1.13 timelines) stay eligible under
+        the ts predicate — never regress an old cluster into a 1 h timeout."""
         best_ts, best_text = "", None
         try:
             if not self.paths.timeline_dir.exists():
@@ -667,6 +722,12 @@ class TeamExtMixin:
                     if ev.get("conv") != conv:
                         continue
                     if ev.get("type") != "chat.assistant.final":
+                        continue
+                    ev_stream = str(ev.get("stream_id") or "")
+                    if stream_id:
+                        if ev_stream and ev_stream != stream_id:
+                            continue
+                    elif exclude_stream and ev_stream == exclude_stream:
                         continue
                     ts = str(ev.get("ts") or "")
                     if ts >= after_ts and ts >= best_ts:
@@ -704,6 +765,8 @@ class TeamExtMixin:
         conv: str,
         after_ts: str,
         auto_archive: bool = False,
+        stream_id: Optional[str] = None,
+        exclude_stream: Optional[str] = None,
     ) -> None:
         """Background observer for one external request. Re-binds the
         originating project on THIS thread (FC-2 pattern — the request
@@ -715,7 +778,15 @@ class TeamExtMixin:
         is archived on either terminal state so it never appears in the
         chat rail's agents list — dispatch doesn't care about the archived
         flag, so a later ask on the same `session` still works (it just
-        re-archives on completion)."""
+        re-archives on completion).
+
+        DAH1 — `stream_id` is OUR turn's identity (present when the dispatch
+        spawned immediately) and `exclude_stream` is the turn that was already
+        running when we asked (present when it got queued behind one). Exactly
+        one of them is normally set. While queued we keep polling the live slot
+        and LATCH our own stream_id the instant a turn other than
+        `exclude_stream` goes live — from then on the match is exact, so a
+        neighbouring turn's final can never be reported as our answer."""
         try:
             self._set_req_project(project_id)
         except Exception:
@@ -730,6 +801,14 @@ class TeamExtMixin:
                     live = self.chat_sessions.has(conv)
                 except Exception:
                     pass
+                if live and not stream_id:
+                    # Still queued (or racing the spawn): latch our own turn as
+                    # soon as a stream that ISN'T the one we queued behind goes
+                    # live. After this the final match is by exact identity.
+                    current = self._teamext_live_stream(conv)
+                    if current and current != exclude_stream:
+                        stream_id = current
+                        exclude_stream = None
                 if live:
                     idle_since = None
                     if not marked_running:
@@ -739,7 +818,12 @@ class TeamExtMixin:
                             return
                         marked_running = True
                 else:
-                    final = self._teamext_latest_final(conv, after_ts)
+                    final = self._teamext_latest_final(
+                        conv,
+                        after_ts,
+                        stream_id=stream_id,
+                        exclude_stream=exclude_stream,
+                    )
                     if final is not None:
                         self._teamext_update(
                             rid,
@@ -751,9 +835,16 @@ class TeamExtMixin:
                         return
                     # No runner and no final (yet): allow a short grace for
                     # the timeline append / spawn hand-off, then declare error.
+                    # DAH1 — a request still waiting for its OWN turn (queued
+                    # behind another one, so `stream_id` hasn't latched yet)
+                    # gets the longer queue grace: the gap between the previous
+                    # turn's exit and our spawn is a queue-flush hand-off, not
+                    # a dead runner, and 20 s was tight enough to error a
+                    # perfectly healthy ask.
+                    grace = _IDLE_GRACE_SECS if stream_id else _QUEUE_GRACE_SECS
                     if idle_since is None:
                         idle_since = time.time()
-                    elif time.time() - idle_since > _IDLE_GRACE_SECS:
+                    elif time.time() - idle_since > grace:
                         self._teamext_update(
                             rid,
                             status="error",
@@ -784,9 +875,3 @@ class TeamExtMixin:
                 self._clear_req_project()
             except Exception:
                 pass
-
-
-# Re-exported for route modules that only need the path helper.
-def member_id_from_path(p: str, prefix: str, suffix: str) -> str:
-    """Extract `<id>` from `<prefix><id><suffix>` URL paths, unquoted."""
-    return urllib.parse.unquote(p[len(prefix) : len(p) - len(suffix)]).strip("/")

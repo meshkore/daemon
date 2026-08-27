@@ -17,13 +17,12 @@ import hashlib
 import struct
 from hub import Hub
 
-import threading
 from typing import Any, Dict, List, Optional
 
 from paths import Paths
 import re
 
-from registries import _split_frontmatter
+from registries import _PollingRegistry, _split_frontmatter
 
 # Accept the new W-prefix and the legacy P-prefix during/after the rename.
 _WF_FILE_RE = re.compile(r"^[WP](\d+)-[a-z0-9-]+\.md$")
@@ -31,7 +30,7 @@ _WF_FILE_RE = re.compile(r"^[WP](\d+)-[a-z0-9-]+\.md$")
 _WF_LOG_RE = re.compile(r"^([WP]\d+)-(\d{4}-\d{2}-\d{2})-[a-z0-9.-]+\.md$")
 
 
-class WorkflowsRegistry:
+class WorkflowsRegistry(_PollingRegistry):
     """Loads + watches .meshkore/workflows/ (legacy .meshkore/protocols/);
     broadcasts on change."""
 
@@ -43,9 +42,7 @@ class WorkflowsRegistry:
         # Each entry: { id, title, scope, status, updated, file, log_count }
         self.workflows: List[Dict[str, Any]] = []
         self._sig: str = ""
-        self._stop = threading.Event()
-        self.reload(broadcast=False)
-        threading.Thread(target=self._watch_loop, daemon=True).start()
+        self._start_watching()  # LAST — see _PollingRegistry
 
     # ── dir resolution (new workflows/, legacy protocols/ fallback) ──────
     def _dir(self):
@@ -55,16 +52,6 @@ class WorkflowsRegistry:
     def _log_dir(self):
         wf = self.paths.workflows_log
         return wf if wf.exists() else self.paths.protocols_log
-
-    def _watch_loop(self) -> None:
-        while not self._stop.wait(self.POLL_SEC):
-            try:
-                self.reload(broadcast=True)
-            except Exception:
-                pass
-
-    def shutdown(self) -> None:
-        self._stop.set()
 
     def _glob_files(self):
         d = self._dir()

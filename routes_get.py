@@ -508,6 +508,41 @@ def route_get(self, daemon):  # noqa: N802
         except Exception:
             pass
         return
+    # Standard §20 (v19) — file snapshots. ALL portal-gated: the standard's
+    # scope_exclusions are explicit that snapshots are never exposed to
+    # unauthenticated peers (they are verbatim source copies).
+    if p == "/snapshots":
+        if self._need_auth():
+            return
+        return self._json(*daemon.snapshot_list(q.get("limit") or 0))
+    if p.startswith("/snapshots/"):
+        if self._need_auth():
+            return
+        rest = p[len("/snapshots/") :]
+        if "/files/" in rest:
+            bucket, _, rel = rest.partition("/files/")
+            target = daemon.snapshot_file_path(
+                urllib.parse.unquote(bucket), urllib.parse.unquote(rel)
+            )
+            if target is None:
+                return self._json(404, {"error": "not found", "path": rest})
+            try:
+                payload = target.read_bytes()
+            except OSError as e:
+                return self._json(500, {"error": str(e)})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._cors()
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except Exception:
+                pass
+            return
+        return self._json(
+            *daemon.snapshot_manifest(urllib.parse.unquote(rest).strip("/"))
+        )
     # D-CRON-02..05: scheduler introspection.
     if p == "/cron/list":
         if self._need_auth():

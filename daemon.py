@@ -72,6 +72,7 @@ from coordwake import WakeMixin  # noqa: E402
 from pausemgr import PauseMixin  # noqa: E402
 from credapi import CredMixin  # noqa: E402
 from readapi import QueryMixin  # noqa: E402
+from snapshots import SnapshotsMixin  # noqa: E402
 from walls import WallsMixin  # noqa: E402
 from lifecycle import LifecycleMixin  # noqa: E402
 from selfupdatesvc import SelfUpdateMixin  # noqa: E402
@@ -178,7 +179,6 @@ from registries import LinksRegistry  # noqa: E402,F401 — re-exported (project
 # small enough to serve cheaply; everything older is still readable from
 # the per-day JSONL files in .meshkore/timeline/.
 TIMELINE_RECENT_LIMIT = 500
-MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB — protect against runaway POSTs
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Paths — moved to daemon/paths.py (DM3, py-1.12.25)
@@ -257,6 +257,7 @@ class Daemon(
     ClientsMixin,
     ProvidersMixin,
     VerifyMixin,
+    SnapshotsMixin,
     WallsMixin,
     ProjectsMixin,
     RemoteControlMixin,
@@ -449,12 +450,11 @@ class Daemon(
         # project like every other per-project store.
         return self._resolve_ctx().team_store
 
-    # ── U-DAEMON-06: chat coordinator ──────────────────────────────────
-
-    # py-1.7.0 — conv → (agent_type, agent_id) sidecar. Lets the daemon
-    # remember the specialisation across turns even if the cockpit
-    # forgets to re-send it (and gives offline/migrated clusters a stable
-    # store outside the cockpit's localStorage).
+    # ── class-level pattern tables shared by the mixins ────────────────
+    # Everything else that used to sit under this line moved out during
+    # daemon-architecture-v2; DAH1 removed the ~20 section headings it left
+    # behind, which advertised methods that live in mixins now (see the
+    # Layer-2 table in ARCHITECTURE.md for who owns which surface).
 
     # py-1.10.24 — Per-task unproductive-final counter (cavioca incident:
     # API2 went into plan-mode 3 times, architect kept retrying instead of
@@ -483,34 +483,10 @@ class Daemon(
         re.compile(r"Anthropic API .*\b(limit|quota)\b", re.IGNORECASE | re.DOTALL),
     )
 
-    # ── Agent-type pause state (py-1.10.27 — backed by QuotaState) ─────
-    # The per-agent_type API is preserved as a thin wrapper over
-    # QuotaState so existing callers (HTTP endpoints, wake hook) keep
-    # working without contortion. Under the hood every lookup goes
-    # through the (platform, model) quota_key derived from the
-    # agent manifest.
-
-    # ── py-1.10.0: story-run coordinator ────────────────────────────
-
-    # ── py-1.5.0: daemon-side archive lifecycle ───────────────────────
-
-    # ── py-1.2.0: self-update (standard v7 §10.4) ──────────────────────
-
-    # ── U-DAEMON-09: message append + version stubs ────────────────────
-
-    # ── U-DAEMON-04: task lifecycle ────────────────────────────────────
-
-    # ── U-DAEMON-03 finish: declare a new agent identity ───────────────
-
-    # ── HTTP body for /health and /info ────────────────────────────────
-
-    # ── lifecycle ──────────────────────────────────────────────────────
-
     # py-1.12.16+: graceful-drain default. Configurable via
     # `cluster.yaml.daemon.shutdown_grace_secs` (int, 0 = no drain).
+    # Read by LifecycleMixin.request_shutdown.
     DEFAULT_SHUTDOWN_GRACE_SECS = 30
-
-    # ── runtime files ─────────────────────────────────────────────────
 
 
 # ───────────────────────────────────────────────────────────────────────

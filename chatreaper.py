@@ -5,19 +5,19 @@ imported back where used."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
 
-import threading
 import time
 from typing import TYPE_CHECKING
 
+from sweeper import ProjectSweeper
 from utils import _debug_emit, _log
 
 if TYPE_CHECKING:
     pass
 
 
-class ChatSessionReaper:
+class ChatSessionReaper(ProjectSweeper):
+    NAME = "chat-reaper"
     TICK_SECS = 30
     # Grace before we declare a session stuck even if the subprocess
     # is still alive. Protects against a legitimately long-running
@@ -26,14 +26,7 @@ class ChatSessionReaper:
     # comes first.
     HARD_TIMEOUT_SECS = 60 * 30  # 30 minutes
 
-    def __init__(self, daemon: Any) -> None:
-        self.daemon = daemon
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
+    def on_start(self) -> None:
         # Initial sweep — covers the boot path where a previous kill -9
         # left state inconsistent (shouldn't happen with in-memory
         # ChatSessions, but defense in depth).
@@ -41,37 +34,14 @@ class ChatSessionReaper:
             self._sweep("boot")
         except Exception as e:
             _log(f"chat-reaper: boot sweep failed ({e})")
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        _log(f"chat-reaper: started (tick={self.TICK_SECS}s)")
 
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self.TICK_SECS):
-            # FC-2 (daemon-centralized) — sweep EVERY project's sessions, not
-            # just the default. Bind each project on this thread so
-            # self.daemon.chat_sessions / _flush_idle_chat_queues /
-            # _broadcast_conv_activity resolve to it. Without this, a stuck
-            # session in a non-default project is never reaped and its queue
-            # never idle-flushed (the conv looks dead forever).
-            reg = getattr(self.daemon, "_registry", None)
-            pids = (
-                [c.cluster.id for c in reg.built_contexts()]
-                if reg is not None
-                else [None]
-            )
-            for pid in pids:
-                try:
-                    if pid is not None:
-                        self.daemon._set_req_project(pid)
-                    self._sweep("tick")
-                except Exception as e:
-                    _log(f"chat-reaper: tick failed ({e})")
-                finally:
-                    if pid is not None:
-                        self.daemon._clear_req_project()
+    def tick(self) -> None:
+        # ProjectSweeper has already bound this project on this thread, so
+        # self.daemon.chat_sessions / _flush_idle_chat_queues /
+        # _broadcast_conv_activity resolve to it (FC-2: without the binding a
+        # stuck session in a non-default project is never reaped and its queue
+        # never idle-flushed, so the conv looks dead forever).
+        self._sweep("tick")
 
     def _sweep(self, source: str) -> None:
         # Phase 1: subprocess-died-without-done sweep.

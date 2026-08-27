@@ -81,3 +81,11 @@ class Paths:
         # of a member (ATM10). Seeded with the canonical 8-member team on
         # first boot / init when the folder is missing or empty.
         self.team_dir = self.meshkore / "team"
+        # Standard §20 (v19) — pre-modification file snapshots. One dated
+        # folder per day, one bucket per POST /snapshots call. Gitignored;
+        # retention via cluster.yaml.snapshots.retention_days (default 7),
+        # swept opportunistically on every create. DAH1 added this path: the
+        # standard has mandated the endpoint since v19 and every project's
+        # CLAUDE.md tells agents it is non-negotiable, but the daemon had no
+        # route and no path for it — every `POST /snapshots` 404'd.
+        self.snapshots_dir = self.meshkore / "snapshots"

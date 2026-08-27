@@ -144,8 +144,12 @@ class QuotaState:
                 e["platform"] = platform
             if model:
                 e["model"] = model
-            # Track consecutive lockouts so the prober can escalate
-            # the cooldown if the same key keeps coming back locked.
+            # Track consecutive lockouts. NOTE (DAH1 audit): this counter is
+            # currently REPORTING-ONLY — `pausemgr` surfaces it to the cockpit
+            # and nothing reads it to lengthen the cooldown, and
+            # `record_success` (the "a normal turn succeeded, reset the streak"
+            # half) has no caller either. The escalation this comment used to
+            # promise is not wired; see initiative `daemon-audit-hardening`.
             if e.get("paused") and (e.get("paused_until_epoch") or 0) > now:
                 e["consecutive_rate_limits"] = (
                     int(e.get("consecutive_rate_limits") or 0) + 1

@@ -48,11 +48,11 @@ from __future__ import annotations
 import datetime as _dtmod
 import os
 import re
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
 from constants import PORT_RANGE
+from nethttp import FetchError, fetch_text
 from paths import Paths
 from utils import _log
 
@@ -130,10 +130,8 @@ def _fetch(url: str) -> Optional[str]:
     if _offline():
         return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "meshcore-py init"})
-        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except Exception as e:
+        return fetch_text(url, label="init", timeout=_FETCH_TIMEOUT)
+    except FetchError as e:
         _log(f"init: fetch {url} failed ({e}) — using offline fallback")
         return None
 

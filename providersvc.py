@@ -124,12 +124,6 @@ class ProvidersMixin:
             "available": available,
         }
 
-    def provider_available(self, provider_id: Optional[str]) -> bool:
-        try:
-            return bool(self.resolve_provider(provider_id).get("available"))
-        except Exception:  # noqa: BLE001 — availability probe must not crash a spawn
-            return False
-
     # ── client-level API keys (Codex/Gemini) ─────────────────────────────
     def resolve_client_key(self, client_id: str) -> Optional[str]:
         """The daemon-managed API key for a non-claude-code CLIENT (codex,

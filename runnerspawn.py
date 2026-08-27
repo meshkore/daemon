@@ -22,6 +22,37 @@ from utils import _append_timeline, _iso_now, _log
 
 
 class RunnerSpawnMixin:
+    def _emit_final(self, text: str) -> None:
+        """Persist + broadcast THIS turn's one `chat.assistant.final`.
+
+        DAH1 (daemon-audit-hardening) — the same append-to-timeline-then-
+        broadcast block was written out three times (twice in `spawn`, once at
+        the end of `runnerloop._reader_loop`). It is more load-bearing than it
+        looks: `teamext._teamext_latest_final` resolves an EXTERNAL ask by
+        polling the timeline for exactly this event, matching on its
+        `stream_id`. A call-site that forgot the `stream_id` field would leave
+        every external caller polling until the 1 h watcher timeout, so there
+        should be exactly one place that builds it."""
+        self.hub.broadcast(
+            _append_timeline(
+                self.paths,
+                {
+                    "type": "chat.assistant.final",
+                    "author": self.identity,
+                    "conv": self.conv,
+                    "stream_id": self.stream_id,
+                    "text": text,
+                },
+            )
+        )
+
+    def _emit_runner_error(self, err: str) -> None:
+        """Terminal failure of this turn: log it, emit it as the turn's final
+        so no consumer is left waiting, and release the conv slot."""
+        _log(err)
+        self._emit_final(f"[runner error] {err}")
+        self.done.set()
+
     def spawn(self) -> None:
         import subprocess
 
@@ -29,21 +60,9 @@ class RunnerSpawnMixin:
         self._driver_id = driver.id
         binary = driver.find_binary()
         if not binary:
-            err = f"{driver.label} not found — {driver.install_hint()}"
-            _log(err)
-            self.hub.broadcast(
-                _append_timeline(
-                    self.paths,
-                    {
-                        "type": "chat.assistant.final",
-                        "author": self.identity,
-                        "conv": self.conv,
-                        "stream_id": self.stream_id,
-                        "text": f"[runner error] {err}",
-                    },
-                )
+            self._emit_runner_error(
+                f"{driver.label} not found — {driver.install_hint()}"
             )
-            self.done.set()
             return
         session_id = _session_id_for_conv(self.conv)
         # py-1.6.1 HOTFIX (claude-code specific, see ClaudeCodeDriver) —
@@ -89,24 +108,11 @@ class RunnerSpawnMixin:
             if provider_id != "anthropic" and not (
                 resolved and resolved.get("available")
             ):
-                err = (
-                    f"provider {provider_id!r} is not usable — set its API key in "
-                    "the cockpit's General settings (⚙, top-right) or disable it"
+                self._emit_runner_error(
+                    f"{driver.id}({self.conv}) provider {provider_id!r} is not "
+                    "usable — set its API key in the cockpit's General settings "
+                    "(⚙, top-right) or disable it"
                 )
-                _log(f"{driver.id}({self.conv}) {err}")
-                self.hub.broadcast(
-                    _append_timeline(
-                        self.paths,
-                        {
-                            "type": "chat.assistant.final",
-                            "author": self.identity,
-                            "conv": self.conv,
-                            "stream_id": self.stream_id,
-                            "text": f"[runner error] {err}",
-                        },
-                    )
-                )
-                self.done.set()
                 return
             # Thread the per-turn model in so build_launch_env can set
             # ANTHROPIC_MODEL alongside the --model argv (identical value).

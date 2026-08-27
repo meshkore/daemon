@@ -213,6 +213,21 @@ class QueryMixin:
             "chat.atomic_writes",  # fsync + atomic append
             "chat.archives",  # /chat/archives + /chat/archive[+un]
             "timeline.rotation",  # gzip > 90d into archive/
+            # py-1.33.0 DAH1 — Standard §20 (v19) file snapshots. POST
+            # /snapshots creates a bucket of verbatim pre-modification copies
+            # + a manifest; GET /snapshots[?limit=] lists newest-first, GET
+            # /snapshots/<bucket> the manifest, GET
+            # /snapshots/<bucket>/files/<repo-rel-path> a raw body, DELETE
+            # /snapshots/<bucket> removes one. All portal-gated (§20
+            # scope_exclusions). Config: cluster.yaml snapshots.{enabled,
+            # retention_days}. WS: snapshot.created / snapshot.removed.
+            # This flag matters: §20 has been MANDATED since standard v19 and
+            # every project's CLAUDE.md instructs agents to POST here before
+            # editing an existing file — but no daemon ever implemented it, so
+            # the route 404'd. An agent (or the cockpit) must be able to tell a
+            # daemon that HAS the endpoint from one that doesn't, rather than
+            # reading a 404 as "this file needs no snapshot".
+            "snapshots.v1",
             # py-1.6.0 → py-1.6.1 — session_resume opt-in only.
             # Set env MESHKORE_CLAUDE_SESSION_ID=1 to enable. Default
             # off after a production bug where claude-code exited

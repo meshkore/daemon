@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import os
 import socket
 import struct
 import threading
@@ -39,10 +41,19 @@ import traceback  # py-1.16.0 (D-HTTP-500-01) — handler exception guard
 
 from routes_get import route_get
 from routes_post import route_post
+from constants import MAX_BODY_BYTES
 from utils import _debug_emit, _iso_now  # DM7
 
-MAX_BODY_BYTES = 4 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _extra_cors_hosts() -> frozenset:
+    """Extra CORS hostnames from `MESHKORE_EXTRA_CORS_ORIGINS` (comma-separated).
+    DAH1 — the escape hatch that lets `_allowed_origin` stay narrow: a one-off
+    dev origin is an env var on the operator's own machine, not a widened
+    allowlist compiled into every daemon on the CDN."""
+    raw = os.environ.get("MESHKORE_EXTRA_CORS_ORIGINS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
 
 
 def make_handler(daemon: Any):
@@ -132,16 +143,55 @@ def make_handler(daemon: Any):
 
         def _need_auth(self) -> bool:
             tok = self._bearer()
-            if tok and tok == daemon.token:
+            # DAH1 — constant-time compare, matching RemoteTokenStore.matches
+            # and TeamTokenStore.matches. The other two bearer classes already
+            # used hmac; the portal token (the most privileged of the three)
+            # was the one still on `==`.
+            if tok and hmac.compare_digest(tok, daemon.token):
                 return False
             self._json(401, {"error": "unauthorized"})
             return True
+
+        def _drain_body(self, n: int) -> None:
+            """Read and discard `n` bytes so an oversized/rejected request
+            can't desync the next one on a keep-alive socket. Bounded
+            chunks — never materialise the payload we are refusing."""
+            remaining = n
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        # DAH1 — OUR Cloudflare Pages project, and only ours. The cockpit is
+        # deployed as `meshkore-portal`, so its preview URLs are
+        # `meshkore-portal.pages.dev` and `<branch-or-hash>.meshkore-portal.
+        # pages.dev`. The old rule allowed ANY `*.pages.dev`, i.e. a hosting
+        # domain where anyone can deploy — see _allowed_origin.
+        CF_PAGES_PROJECT = "meshkore-portal.pages.dev"
 
         def _allowed_origin(self) -> Optional[str]:
             """Reflect the request Origin only if it's a MeshKore cockpit
             surface or a loopback dev server. Returns the origin to echo,
             or None (→ omit Allow-Origin so the browser blocks the
-            cross-origin read). py-1.27.4 — replaces the blanket `*`."""
+            cross-origin read). py-1.27.4 — replaces the blanket `*`.
+
+            DAH1 (daemon-audit-hardening) — the allowlist used to end with
+            `host.endswith(".pages.dev")`, which is not an allowlist: *.pages.dev
+            is a public hosting domain where ANY third party can deploy a page.
+            Combined with the GET routes that carry no auth (/state,
+            /chat/snapshot, /chat/conv/<id>/messages), that let any pages.dev
+            site the operator happened to visit read this project's state and
+            chat transcripts cross-origin. The loopback bind is not a perimeter
+            here — the operator's browser IS on loopback.
+
+            Narrowed to OUR Pages project (`meshkore-portal`), which keeps every
+            legitimate cockpit preview working — production alias
+            `meshkore-portal.pages.dev` plus branch/deployment previews
+            `<branch-or-hash>.meshkore-portal.pages.dev` — and excludes
+            everything else on the domain. `MESHKORE_EXTRA_CORS_ORIGINS`
+            (comma-separated hostnames) is the escape hatch for a one-off dev
+            origin, so narrowing this never means editing the daemon."""
             origin = self.headers.get("Origin")
             if not origin:
                 return None
@@ -152,8 +202,10 @@ def make_handler(daemon: Any):
             if (
                 host == "meshkore.com"
                 or host.endswith(".meshkore.com")  # architect., www., etc.
-                or host.endswith(".pages.dev")  # Cloudflare Pages previews
+                or host == self.CF_PAGES_PROJECT  # our Pages production alias
+                or host.endswith("." + self.CF_PAGES_PROJECT)  # our previews
                 or host in ("localhost", "127.0.0.1", "::1")  # dev / diagnostic
+                or host in _extra_cors_hosts()
             ):
                 return origin
             return None
@@ -228,13 +280,37 @@ def make_handler(daemon: Any):
             # cockpit's debug-transport POSTs /debug/log before it holds a token
             # (→401), so this bit hard the moment one daemon served the HTTPS
             # cockpit. _read_json_body() now parses this cache. (daemon-centralized)
+            # DAH1 (daemon-audit-hardening) — an OVERSIZED body used to fall
+            # into the `else b""` branch, which skipped the read entirely and
+            # left the bytes on the socket: the exact keep-alive desync this
+            # drain exists to prevent (the next request parses the leftovers as
+            # its request line → "400 Bad request syntax" → the browser reports
+            # a CORS failure). It also let the handler run against a silently
+            # empty body instead of saying no. Now we drain what we can, cap
+            # what we keep, and answer 413 outright.
+            _oversized = False
             try:
                 _clen = int(self.headers.get("Content-Length") or 0)
-                self._raw_body = (
-                    self.rfile.read(_clen) if 0 < _clen <= MAX_BODY_BYTES else b""
-                )
+                if _clen > MAX_BODY_BYTES:
+                    _oversized = True
+                    self._drain_body(_clen)
+                    self._raw_body = b""
+                else:
+                    self._raw_body = self.rfile.read(_clen) if _clen > 0 else b""
             except Exception:
                 self._raw_body = b""
+            if _oversized:
+                try:
+                    self._json(
+                        413,
+                        {
+                            "error": "request body too large",
+                            "max_bytes": MAX_BODY_BYTES,
+                        },
+                    )
+                except Exception:
+                    pass
+                return
             # Project resolution: prefer the X-MeshKore-Project header, but fall
             # back to a ?project=<id> query param. The browser's <img> loader (and
             # any raw URL: download links, anchor hrefs) CANNOT send a custom
@@ -314,18 +390,25 @@ def make_handler(daemon: Any):
         def do_PUT(self):  # noqa: N802
             self._guard(self._do_PUT, "PUT")
 
+        def _credential_write(self, name: str) -> None:
+            """`{"value": "..."}` → write-or-create one credential.
+
+            DAH1 — PUT and POST route to the same behaviour (py-1.11.3 added
+            the POST alias for clients that can't send PUT) and each had its
+            own copy of the unwrap-and-write lines. One method, two verbs."""
+            body = self._read_json_body()
+            value = body.get("value") if isinstance(body, dict) else None
+            code, resp = daemon.credential_write(
+                name, value if isinstance(value, str) else ""
+            )
+            return self._json(code, resp)
+
         def _do_PUT(self):  # noqa: N802
             p, _ = self._path()
             if self._need_auth():
                 return
             if p.startswith("/credentials/"):
-                name = p[len("/credentials/") :]
-                body = self._read_json_body()
-                value = body.get("value") if isinstance(body, dict) else None
-                code, resp = daemon.credential_write(
-                    name, value if isinstance(value, str) else ""
-                )
-                return self._json(code, resp)
+                return self._credential_write(p[len("/credentials/") :])
             return self._json(404, {"error": "not found", "path": p})
 
         def do_PATCH(self):  # noqa: N802
@@ -356,6 +439,10 @@ def make_handler(daemon: Any):
                 name = p[len("/credentials/") :]
                 code, resp = daemon.credential_delete(name)
                 return self._json(code, resp)
+            # Standard §20 (v19) — operator-driven snapshot cleanup.
+            if p.startswith("/snapshots/"):
+                bucket = urllib.parse.unquote(p[len("/snapshots/") :]).strip("/")
+                return self._json(*daemon.snapshot_delete(bucket))
             # CPL-2 (master-copilot) — revoke the machine remote-control token
             # (PORTAL-gated). The file is deleted; the daemon then 401s every
             # remote call until re-minted from the cockpit.

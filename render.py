@@ -35,6 +35,7 @@ import threading
 from typing import List, Optional, Tuple
 
 from hub import Hub
+from nethttp import FetchError, fetch_head_bytes, fetch_text
 from paths import Paths
 from utils import _log
 
@@ -252,28 +253,24 @@ class AgentInstructionsRenderer:
 
     def _fetch_standard_version(self) -> Optional[int]:
         try:
-            import urllib.request
-
-            req = urllib.request.Request(
+            head = fetch_head_bytes(
                 STANDARD_VERSION_URL,
-                headers={"User-Agent": "meshcore-py standard-drift"},
+                label="standard-drift",
+                n=64,
+                timeout=self._FETCH_TIMEOUT,
             )
-            with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as r:
-                return int(r.read(64).decode("utf-8", errors="replace").strip())
-        except Exception as e:
+            return int(head.decode("utf-8", errors="replace").strip())
+        except (FetchError, ValueError) as e:
             _log(f"standard-drift: version fetch failed: {e}")
             return None
 
     def _fetch_canonical(self) -> Optional[str]:
         try:
-            import urllib.request
-
-            req = urllib.request.Request(
+            return fetch_text(
                 CANONICAL_PREAMBLE_URL,
-                headers={"User-Agent": "meshcore-py instructions-renderer"},
+                label="instructions-renderer",
+                timeout=self._FETCH_TIMEOUT,
             )
-            with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as r:
-                return r.read().decode("utf-8", errors="replace")
-        except Exception as e:
+        except FetchError as e:
             _log(f"instructions-renderer: canonical fetch failed: {e}")
             return None

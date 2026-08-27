@@ -5,16 +5,15 @@ imported back where used."""
 
 from __future__ import annotations
 
-import threading
 import time
-from typing import Any, Optional
 
 from agent_prompts import AGENT_PROMPTS
 from agent_types import _agent_manifest
+from sweeper import ProjectSweeper
 from utils import _debug_emit, _log
 
 
-class QuotaProber:
+class QuotaProber(ProjectSweeper):
     """py-1.10.27 — Background thread that probes paused quota keys.
 
     Every TICK_SECS, scans `QuotaState.keys_due_for_probe()` and
@@ -31,6 +30,7 @@ class QuotaProber:
     Cost: one ~10-token Claude Code invocation per paused key per
     hour. Negligible vs the cost of looping into a wall."""
 
+    NAME = "quota-prober"
     TICK_SECS = 60
     PROBE_PROMPT = (
         "This is an automated quota probe from the meshcore daemon. "
@@ -39,50 +39,15 @@ class QuotaProber:
     )
     PROBE_PROMPT_TIMEOUT_SECS = 90  # subprocess wall-clock cap
 
-    def __init__(self, daemon: Any) -> None:
-        self.daemon = daemon
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        _log(f"quota-prober: started (tick={self.TICK_SECS}s)")
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self.TICK_SECS):
-            # FC-2 (daemon-centralized) — probe paused quota in EVERY project,
-            # not just the default. Bind each project on this thread so
-            # self.daemon.quota / _spawn_chat_turn resolve to it (and the probe
-            # turn runs in the right cwd). Without this, a non-default project
-            # stays paused forever after one rate-limit.
-            reg = getattr(self.daemon, "_registry", None)
-            pids = (
-                [c.cluster.id for c in reg.built_contexts()]
-                if reg is not None
-                else [None]
-            )
-            for pid in pids:
-                if self._stop.is_set():
-                    break
-                try:
-                    if pid is not None:
-                        self.daemon._set_req_project(pid)
-                    due = self.daemon.quota.keys_due_for_probe()
-                    for key in due:
-                        if self._stop.is_set():
-                            break
-                        self._probe_one(key)
-                except Exception as e:
-                    _log(f"quota-prober: tick failed ({e})")
-                finally:
-                    if pid is not None:
-                        self.daemon._clear_req_project()
+    def tick(self) -> None:
+        # ProjectSweeper has already bound this project on this thread, so
+        # self.daemon.quota / _spawn_chat_turn resolve to it and the probe turn
+        # runs in the right cwd (FC-2: without the binding a non-default
+        # project stays paused forever after one rate-limit).
+        for key in self.daemon.quota.keys_due_for_probe():
+            if self._stop.is_set():
+                break
+            self._probe_one(key)
 
     def _probe_one(self, key: str) -> None:
         # Resolve an agent_type for this key (any type whose manifest

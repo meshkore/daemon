@@ -43,12 +43,14 @@ MODULES = [
     "constants.py",
     "contextpolicy.py",
     "paths.py",
+    "nethttp.py",  # DAH1 (daemon-audit-hardening) — the one outbound-fetch helper; stdlib-only leaf, no sibling deps.
     "crypto_ed25519.py",
     "fsatomic.py",
     "timeutil.py",
     "yamlparse.py",
     "timeline.py",
     "utils.py",
+    "sweeper.py",  # DAH1 — ProjectSweeper base for the per-project background loops (deps: utils).
     "debuglog.py",
     "cluster.py",
     "scaffold.py",
@@ -89,6 +91,7 @@ MODULES = [
     "readapi.py",
     "fsread.py",
     "walls.py",
+    "snapshots.py",  # Standard §20 (v19) file snapshots — DAH1; deps: fsatomic, utils, paths
     "chatread.py",
     "credapi.py",
     "runnerutil.py",

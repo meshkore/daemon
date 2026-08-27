@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hub import Hub
 from paths import Paths
 from utils import _log, parse_simple_yaml
+from yamlparse import split_frontmatter
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -86,7 +87,42 @@ def _validate_links_block(
     return out, errs
 
 
-class LinksRegistry:
+class _PollingRegistry:
+    """Shared poll-and-reload machinery for the file-backed registries.
+
+    DAH1 (daemon-audit-hardening) — `LinksRegistry` and `WorkflowsRegistry`
+    carried byte-identical `__init__` tails, `_watch_loop`s and `shutdown`s.
+    Each subclass still owns `POLL_SEC` and the interesting part (`reload`);
+    this base owns only the thread lifecycle, so a change to how watching
+    works (backoff, a shared timer, honouring `stopping`) lands once.
+
+    Contract for a subclass: define `POLL_SEC` and `reload(broadcast: bool)`,
+    then call `self._start_watching()` as the LAST line of its `__init__` —
+    the thread must not observe a half-built object."""
+
+    POLL_SEC = 3.0
+
+    def _start_watching(self) -> None:
+        self._stop = threading.Event()
+        self.reload(broadcast=False)
+        threading.Thread(
+            target=self._watch_loop,
+            name=f"{type(self).__name__}-watch",
+            daemon=True,
+        ).start()
+
+    def _watch_loop(self) -> None:
+        while not self._stop.wait(self.POLL_SEC):
+            try:
+                self.reload(broadcast=True)
+            except Exception as e:  # noqa: BLE001 — a bad file must not kill the watcher
+                _log(f"{type(self).__name__}: reload failed: {e}")
+
+    def shutdown(self) -> None:
+        self._stop.set()
+
+
+class LinksRegistry(_PollingRegistry):
     """Loads + watches .meshkore/public/links.yaml; broadcasts on change."""
 
     POLL_SEC = 3.0
@@ -97,19 +133,7 @@ class LinksRegistry:
         self.modules: List[Dict[str, Any]] = []
         self.errors: List[str] = []
         self._mtime: Optional[float] = None
-        self._stop = threading.Event()
-        self.reload(broadcast=False)
-        threading.Thread(target=self._watch_loop, daemon=True).start()
-
-    def _watch_loop(self) -> None:
-        while not self._stop.wait(self.POLL_SEC):
-            try:
-                self.reload(broadcast=True)
-            except Exception:
-                pass
-
-    def shutdown(self) -> None:
-        self._stop.set()
+        self._start_watching()
 
     def reload(self, broadcast: bool = True) -> bool:
         """Reread the file. Returns True if content changed."""
@@ -257,12 +281,8 @@ def _emit_scalar(v: Any) -> str:
 # kept as deprecated aliases).
 
 
-def _split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
-    if not text.startswith("---"):
-        return {}, text
-    end = text.find("\n---", 4)
-    if end == -1:
-        return {}, text
-    fm_text = text[4:end]
-    body = text[end + 4 :].lstrip("\n")
-    return parse_simple_yaml(fm_text), body
+# DAH1 — the implementation moved to `yamlparse.split_frontmatter` (the leaf
+# that owns _FM_RE). Re-exported under the old private name so the ~5 existing
+# importers (fsread, daemon) don't churn — the re-export convention from
+# ARCHITECTURE.md, "Re-exports keep call sites stable".
+_split_frontmatter = split_frontmatter

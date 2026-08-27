@@ -44,6 +44,7 @@ from utils import (
     _iter_timeline_files,
     _read_timeline_file,
 )
+from yamlparse import split_frontmatter
 
 # The daemon's ``Cluster`` type lives in daemon.py (loaded after this module
 # + after the bundle's prompts section), so it can't be imported here. Like
@@ -317,13 +318,7 @@ class BriefingPipeline:
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 return ""
-            if text.startswith("---"):
-                end = text.find("\n---", 3)
-                if end != -1:
-                    nl = text.find("\n", end + 1)
-                    if nl != -1:
-                        text = text[nl + 1 :]
-            return text.strip()
+            return split_frontmatter(text)[1].strip()
 
         map_lines: List[str] = []
         pinned: List[str] = []
@@ -397,13 +392,7 @@ class BriefingPipeline:
             except OSError:
                 return ""
             # Strip YAML frontmatter (only when both fences are present).
-            if text.startswith("---"):
-                end = text.find("\n---", 3)
-                if end != -1:
-                    nl = text.find("\n", end + 1)
-                    if nl != -1:
-                        text = text[nl + 1 :]
-            return text.strip()
+            return split_frontmatter(text)[1].strip()
 
         parts: List[str] = []
 

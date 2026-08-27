@@ -334,6 +334,12 @@ def route_post(self, daemon):  # noqa: N802
     if p == "/team":
         return self._json(*daemon.team_create_http(self._read_json_body()))
 
+    # Standard §20 (v19) — create a pre-modification snapshot bucket. DAH1:
+    # this route is what every project's CLAUDE.md has been instructing agents
+    # to call since v19; until now it 404'd.
+    if p == "/snapshots":
+        return self._json(*daemon.snapshot_create(self._read_json_body()))
+
     # D-CRON-04: trigger + cancel a cron job.
     if p.startswith("/cron/") and p.endswith("/trigger"):
         jid = p[len("/cron/") : -len("/trigger")]
@@ -383,13 +389,7 @@ def route_post(self, daemon):  # noqa: N802
     # send PUT; routing both verbs to the same handler keeps
     # the cockpit's `chatDispatch`-shaped fetch usable.
     if p.startswith("/credentials/"):
-        name = p[len("/credentials/") :]
-        body = self._read_json_body()
-        value = body.get("value") if isinstance(body, dict) else None
-        code, resp = daemon.credential_write(
-            name, value if isinstance(value, str) else ""
-        )
-        return self._json(code, resp)
+        return self._credential_write(p[len("/credentials/") :])
 
     # MeshKore Verify (VRF2) — run the local visual+functional verifier
     # against a public/preview URL and return evidence (shots + flows +

@@ -157,3 +157,28 @@ def parse_frontmatter(text: str) -> Dict[str, Any]:
     if not m:
         return {}
     return parse_simple_yaml(m.group(1))
+
+
+def split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
+    """`(frontmatter dict, body)` for a `---`-fenced markdown file. Returns
+    `({}, text)` when there is no complete frontmatter block.
+
+    DAH1 (daemon-audit-hardening) — moved here VERBATIM from `registries.py`
+    (where it was `_split_frontmatter`, which still re-exports it). It belongs
+    in the leaf that already owns `_FM_RE`, next to `parse_frontmatter`, and it
+    is the strictly better of the four frontmatter readers this codebase had
+    grown: `prompts.py` hand-rolled the same fence walk TWICE with a different
+    start offset, and unlike `parse_frontmatter`'s regex this one still parses
+    a file whose closing `---` has no trailing newline.
+
+    (`team.split_member_file` stays separate on purpose: it must return the
+    body byte-for-byte so a parse→serialise round-trip preserves a member's
+    init prompt exactly.)"""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}, text
+    fm_text = text[4:end]
+    body = text[end + 4 :].lstrip("\n")
+    return parse_simple_yaml(fm_text), body

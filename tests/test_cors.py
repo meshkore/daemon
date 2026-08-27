@@ -1,8 +1,13 @@
 """CORS origin allowlist (py-1.27.4). The open read routes (/state, /health,
 /agents …) must NOT be cross-origin-readable by an arbitrary website — the
 daemon reflects an Origin only when it's a MeshKore cockpit surface
-(*.meshkore.com / *.pages.dev) or loopback; everything else gets no
-Access-Control-Allow-Origin header so the browser blocks the read."""
+(*.meshkore.com, or our own Pages project *.meshkore-portal.pages.dev) or
+loopback; everything else gets no Access-Control-Allow-Origin header so the
+browser blocks the read.
+
+DAH1 narrowed the second clause from a bare `*.pages.dev` — a public hosting
+domain — to our own Pages project. The adversarial cases live in
+tests/test_cors_allowlist.py."""
 
 from __future__ import annotations
 

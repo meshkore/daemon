@@ -9,9 +9,14 @@ import os
 import threading
 from typing import Any, Dict, Tuple
 
-from bootupdate import verify_release_bundle
+from bootupdate import (
+    _refresh_tls_bundle_from_cdn,
+    _rotate_daemon_backups,
+    verify_release_bundle,
+)
 from constants import DAEMON_VERSION
-from utils import _iso_now, _log
+from nethttp import FetchError, fetch_bytes
+from utils import _iso_now
 
 
 class SelfUpdateMixin:
@@ -61,9 +66,7 @@ class SelfUpdateMixin:
                 "url": url,
             }
         # 3. Download to .new.
-        import urllib.request
         import ast
-        import shutil
         import sys
         import subprocess as _sp
 
@@ -71,13 +74,11 @@ class SelfUpdateMixin:
         scripts_dir.mkdir(parents=True, exist_ok=True)
         new_path = scripts_dir / "daemon.py.new"
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": f"meshcore-py/{DAEMON_VERSION} self-update"}
+            payload = fetch_bytes(
+                url, label="self-update", version=DAEMON_VERSION, timeout=10
             )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                payload = r.read()
             new_path.write_bytes(payload)
-        except Exception as e:
+        except (FetchError, OSError) as e:
             try:
                 new_path.unlink()
             except Exception:
@@ -129,11 +130,15 @@ class SelfUpdateMixin:
                 "url": url,
             }
         # 5. Backup current binary so the operator can roll back.
+        #    DAH1 — this path used to keep exactly ONE rollback point while the
+        #    boot path kept three (`_rotate_daemon_backups`). Two update routes
+        #    to the same file had two different safety nets for no reason; both
+        #    now rotate .bak → .bak.1 → .bak.2.
         current = scripts_dir / "daemon.py"
-        backup = scripts_dir / "daemon.py.bak"
+        backup = scripts_dir / "daemon.py.bak"  # newest rollback point
         try:
             if current.exists():
-                shutil.copy2(current, backup)
+                _rotate_daemon_backups(scripts_dir, current)
         except Exception as e:
             return 500, {"error": "backup failed — refusing to swap", "detail": str(e)}
         # 6. Atomic rename .new → daemon.py.
@@ -147,34 +152,17 @@ class SelfUpdateMixin:
         #      while the cockpit still expects HTTPS, and the
         #      switch-to-new-port handshake fails. Best-effort: if
         #      either file 404s, we keep the existing tls/ bundle.
+        #      DAH1 — was an inline duplicate of bootupdate's
+        #      `_refresh_tls_bundle_from_cdn`; now the one implementation
+        #      serves both update routes.
         if url.startswith("https://") and url.endswith("/daemon.py"):
-            tls_dir = scripts_dir / "tls"
-            tls_dir.mkdir(parents=True, exist_ok=True)
-            base_url = url[: -len("/daemon.py")] + "/tls"
-            for fname, mode in (("fullchain.pem", 0o644), ("privkey.pem", 0o600)):
-                try:
-                    treq = urllib.request.Request(
-                        f"{base_url}/{fname}",
-                        headers={
-                            "User-Agent": f"meshcore-py/{DAEMON_VERSION} self-update"
-                        },
-                    )
-                    with urllib.request.urlopen(treq, timeout=10) as tr:
-                        tls_payload = tr.read()
-                    if not tls_payload.startswith(b"-----BEGIN"):
-                        _log(f"self-update: skipped tls/{fname} — not a PEM payload")
-                        continue
-                    target = tls_dir / fname
-                    target.write_bytes(tls_payload)
-                    try:
-                        os.chmod(target, mode)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    # 404 / network / TLS error — keep whatever bundle
-                    # the operator already had on disk. The new daemon
-                    # will fall back to plain HTTP if neither lands.
-                    _log(f"self-update: tls/{fname} refresh skipped ({e})")
+            _refresh_tls_bundle_from_cdn(
+                scripts_dir,
+                url,
+                DAEMON_VERSION,
+                label="self-update",
+                timeout=10,
+            )
         # 7. Spawn the replacement on the SAME port (py-1.14.3).
         #    Previously we picked a NEW free port and let the cockpit
         #    re-discover the daemon — fragile (port hunting, WS fatal,

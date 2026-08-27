@@ -11,10 +11,11 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from constants import DAEMON_VERSION, RELEASE_PUBKEY_HEX
 from crypto_ed25519 import ed25519_verify
+from nethttp import FetchError, fetch_bytes
 from paths import Paths
 from utils import _iso_now, _log, parse_simple_yaml
 
@@ -39,14 +40,15 @@ def verify_release_bundle(
     if not pub_hex:
         return None  # enforcement disabled (empty pinned key)
     import base64
-    import urllib.request
 
     sig_url = daemon_url + ".sig"
     try:
-        req = urllib.request.Request(sig_url, headers={"User-Agent": ua})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            sig_raw = r.read(4096).decode("ascii", "replace").strip()
-    except Exception as e:
+        sig_raw = (
+            fetch_bytes(sig_url, label=ua, timeout=timeout, max_bytes=4096)
+            .decode("ascii", "replace")
+            .strip()
+        )
+    except FetchError as e:
         return f"signature unavailable at {sig_url} ({e})"
     try:
         sig = base64.b64decode(sig_raw)
@@ -65,7 +67,13 @@ _BOOT_BACKUPS_TO_KEEP = 3  # daemon.py.bak, .bak.1, .bak.2
 def _is_remote_newer(local: str, remote: str) -> bool:
     """Compare two `py-X.Y.Z` strings. Tolerates suffixes like
     `py-1.12.1-hotfix` — strips after the first non-numeric/dot char
-    in the version body for comparison purposes."""
+    in the version body for comparison purposes.
+
+    DAH1 — this file used to carry a SECOND comparator (`_version_is_newer`,
+    used by the boot path while the watcher used this one). The two agreed on
+    every real version string but disagreed on malformed ones, which is the
+    worst shape for a function that decides whether to overwrite the running
+    binary. Merged into this one; the boot path now calls it too."""
 
     def _tuple(v: str) -> Tuple[int, ...]:
         body = v[len("py-") :] if v.startswith("py-") else v
@@ -156,17 +164,16 @@ def _boot_self_update_if_needed(paths: Paths, args: Dict[str, Any]) -> None:
     if not (url.startswith("https://") or url.startswith("http://localhost")):
         _log(f"boot self-update: skipped (rejected URL scheme: {url[:40]!r})")
         return
-    import urllib.request
     import ast
 
     try:
-        req = urllib.request.Request(
+        payload = fetch_bytes(
             url,
-            headers={"User-Agent": f"meshcore-py/{DAEMON_VERSION} boot-self-update"},
+            label="boot-self-update",
+            version=DAEMON_VERSION,
+            timeout=_BOOT_PROBE_TIMEOUT_SECS,
         )
-        with urllib.request.urlopen(req, timeout=_BOOT_PROBE_TIMEOUT_SECS) as r:
-            payload = r.read()
-    except Exception as e:
+    except FetchError as e:
         _log(f"boot self-update: skipped (download failed: {e})")
         _boot_update_stamp(paths, outcome=f"download-failed: {e}"[:120])
         return
@@ -186,7 +193,7 @@ def _boot_self_update_if_needed(paths: Paths, args: Dict[str, Any]) -> None:
         _boot_update_stamp(paths, outcome="version-literal-not-found")
         return
     new_version = m.group(1).decode("ascii", errors="replace")
-    if not _version_is_newer(new_version, DAEMON_VERSION):
+    if not _is_remote_newer(local=DAEMON_VERSION, remote=new_version):
         _log(f"boot self-update: no update (CDN={new_version}, local={DAEMON_VERSION})")
         _boot_update_stamp(paths, outcome=f"no-update (cdn={new_version})")
         return
@@ -305,27 +312,35 @@ def _rotate_daemon_backups(scripts_dir: "Path", current: "Path") -> None:
 
 
 def _refresh_tls_bundle_from_cdn(
-    scripts_dir: "Path", daemon_url: str, ver: str
+    scripts_dir: "Path",
+    daemon_url: str,
+    ver: str,
+    *,
+    label: str = "boot-tls-refresh",
+    timeout: float = _BOOT_PROBE_TIMEOUT_SECS,
 ) -> None:
     """Pull `<daemon-dir>/tls/{fullchain.pem,privkey.pem}` to keep the
     cert in lockstep with daemon.py. py-1.8.0 introduced this for the
     HTTP /self-update path; py-1.10.23 mirrors it on boot. Failures
-    keep the existing on-disk bundle — never wedges the daemon."""
-    import urllib.request
+    keep the existing on-disk bundle — never wedges the daemon.
 
+    DAH1 — `selfupdatesvc.self_update` used to carry its OWN inline copy of
+    this loop (same two files, same PEM sniff, same chmod, different UA and
+    timeout). It now calls this function with `label`/`timeout` overrides, so
+    the boot path and the HTTP path can no longer drift apart."""
     tls_dir = scripts_dir / "tls"
     tls_dir.mkdir(parents=True, exist_ok=True)
     base_url = daemon_url[: -len("/daemon.py")] + "/tls"
     for fname, mode in (("fullchain.pem", 0o644), ("privkey.pem", 0o600)):
         try:
-            treq = urllib.request.Request(
+            payload = fetch_bytes(
                 f"{base_url}/{fname}",
-                headers={"User-Agent": f"meshcore-py/{ver} boot-tls-refresh"},
+                label=label,
+                version=ver,
+                timeout=timeout,
             )
-            with urllib.request.urlopen(treq, timeout=_BOOT_PROBE_TIMEOUT_SECS) as r:
-                payload = r.read()
             if not payload.startswith(b"-----BEGIN"):
-                _log(f"boot self-update: tls/{fname} skipped (not PEM)")
+                _log(f"{label}: tls/{fname} skipped (not PEM)")
                 continue
             target = tls_dir / fname
             target.write_bytes(payload)
@@ -333,33 +348,6 @@ def _refresh_tls_bundle_from_cdn(
                 os.chmod(target, mode)
             except OSError:
                 pass
-            _log(f"boot self-update: refreshed tls/{fname}")
-        except Exception as e:
-            _log(f"boot self-update: tls/{fname} refresh skipped ({e})")
-
-
-def _version_is_newer(a: str, b: str) -> bool:
-    """True iff version `a` is strictly newer than `b`. Both look like
-    `py-1.10.21`. Compares the dotted tuple after stripping the prefix;
-    any non-numeric chunk sorts last (so `py-1.10.21-rc1` < `py-1.10.21`
-    is intentional — release wins over pre-release)."""
-
-    def parse(v: str) -> Tuple[int, ...]:
-        core = v.strip()
-        if core.startswith("py-"):
-            core = core[3:]
-        # Drop any trailing -suffix
-        if "-" in core:
-            core = core.split("-", 1)[0]
-        out: List[int] = []
-        for chunk in core.split("."):
-            try:
-                out.append(int(chunk))
-            except ValueError:
-                out.append(-1)  # unknown chunks rank last
-        return tuple(out)
-
-    try:
-        return parse(a) > parse(b)
-    except Exception:
-        return False
+            _log(f"{label}: refreshed tls/{fname}")
+        except Exception as e:  # noqa: BLE001 — TLS refresh is best-effort
+            _log(f"{label}: tls/{fname} refresh skipped ({e})")

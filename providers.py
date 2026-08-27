@@ -130,10 +130,6 @@ def provider_models(provider_id: Optional[str]) -> List[Dict[str, Any]]:
     return list(provider_for(provider_id).get("models") or [])
 
 
-def is_default_provider(provider_id: Optional[str]) -> bool:
-    return (str(provider_id or DEFAULT_PROVIDER).strip().lower()) == DEFAULT_PROVIDER
-
-
 def build_launch_env(
     base_env: Dict[str, str],
     provider_id: Optional[str],

@@ -63,14 +63,36 @@ class CredMixin:
             )
         return out
 
+    @staticmethod
+    def _credential_gate(
+        name: str, *, mutating: bool
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """The name check every handler runs first, or None when the name is
+        usable. `mutating` additionally refuses the PROTECTED names — the
+        portal token is readable by the cockpit that already holds it, but a
+        write or delete would lock the cockpit out of its own daemon.
+
+        DAH1 — validate-then-refuse-protected was spelled out three times in
+        this file, which is three chances for a new handler to copy only the
+        first half."""
+        invalid = _validate_credential_name(name)
+        if invalid is not None:
+            return invalid
+        if mutating and name in CREDENTIAL_PROTECTED_NAMES:
+            return 403, {
+                "error": "protected credential — managed by daemon",
+                "name": name,
+            }
+        return None
+
     def credential_read(self, name: str) -> Tuple[int, Dict[str, Any]]:
         """Return the credential value for the operator-facing reveal
         action. The cockpit's CredentialsBlock keeps values masked by
         default and only fetches the raw via this endpoint when the
         operator clicks 'reveal'. Auth-required (handled upstream)."""
-        valid = _validate_credential_name(name)
-        if valid is not None:
-            return valid
+        blocked = self._credential_gate(name, mutating=False)
+        if blocked is not None:
+            return blocked
         path = self.paths.credentials / name
         if not path.exists() or not path.is_file():
             return 404, {"error": "credential not found", "name": name}
@@ -88,14 +110,9 @@ class CredMixin:
         """Create or overwrite a credential file under .meshkore/credentials/.
         Always chmod 600. Refuses protected names (portal-token) so the
         cockpit can't accidentally lock itself out of the daemon."""
-        valid = _validate_credential_name(name)
-        if valid is not None:
-            return valid
-        if name in CREDENTIAL_PROTECTED_NAMES:
-            return 403, {
-                "error": "protected credential — managed by daemon",
-                "name": name,
-            }
+        blocked = self._credential_gate(name, mutating=True)
+        if blocked is not None:
+            return blocked
         if not isinstance(value, str):
             return 400, {"error": "value must be a string"}
         self.paths.credentials.mkdir(parents=True, exist_ok=True)
@@ -109,14 +126,9 @@ class CredMixin:
         return 200, {"name": name, "size": len(value.encode("utf-8"))}
 
     def credential_delete(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        valid = _validate_credential_name(name)
-        if valid is not None:
-            return valid
-        if name in CREDENTIAL_PROTECTED_NAMES:
-            return 403, {
-                "error": "protected credential — managed by daemon",
-                "name": name,
-            }
+        blocked = self._credential_gate(name, mutating=True)
+        if blocked is not None:
+            return blocked
         path = self.paths.credentials / name
         if not path.exists():
             return 404, {"error": "credential not found", "name": name}

@@ -109,6 +109,12 @@ EXERCISE = [
     ("GET", "/workflows", True, {("==", "/workflows")}),
     ("GET", "/protocols", True, {("==", "/protocols")}),
     ("GET", "/cron/list", True, {("==", "/cron/list")}),
+    # ── Standard §20 (v19) — file snapshots (DAH1) ──
+    # GET list on an empty tree → 200 {buckets: []}; GET of an unknown bucket
+    # → 404 {"error": "unknown snapshot bucket"} — a resource-404, not the
+    # unknown-route fall-through, so it proves the handler ran.
+    ("GET", "/snapshots", True, {("==", "/snapshots")}),
+    ("GET", "/snapshots/__probe__", True, {("startswith", "/snapshots/")}),
     ("GET", "/debug/tail", True, {("==", "/debug/tail")}),
     ("GET", "/reload", True, {("==", "/reload")}),
     ("GET", "/auth/challenge?nonce=probe", False, {("==", "/auth/challenge")}),
@@ -179,6 +185,9 @@ EXERCISE = [
     ("POST", "/links/__probe__", True, {("startswith", "/links/")}),
     ("POST", "/admission/__probe__", True, {("startswith", "/admission/")}),
     ("POST", "/credentials/probecred", True, {("startswith", "/credentials/")}),
+    # §20 create with no `paths` → 400, and DELETE of an unknown bucket → 404.
+    ("POST", "/snapshots", True, {("==", "/snapshots")}),
+    ("DELETE", "/snapshots/__probe__", True, {("startswith", "/snapshots/")}),
     # ── DC-5 (daemon-centralized) — global /projects API ──
     # GET no-auth (boot discovery); POST {} → 400 path-required; DELETE of an
     # unknown id → 404 unknown-project. All prove "wired" (none is the

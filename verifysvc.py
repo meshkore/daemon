@@ -30,6 +30,7 @@ import json
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from nethttp import FetchError, fetch_bytes
 from utils import _iso_now, _log
 
 # Sibling module (VRF1). In the single-file bundle this `from verify import …`
@@ -102,18 +103,20 @@ class VerifyMixin:
         agent_url = cfg.get("agent_url")
         if not agent_url:
             return 400, {"error": "verify.mode=agent but verify.agent_url unset"}
-        import urllib.request
-
+        # DAH1 — via the shared fetch helper, which also enforces the http/https
+        # scheme allow-list. `agent_url` comes from cluster.yaml, i.e. exactly
+        # the config-derived URL that must never reach urlopen unchecked.
         try:
-            req = urllib.request.Request(
-                agent_url.rstrip("/") + "/verify",
-                data=json.dumps(body).encode(),
-                headers={"content-type": "application/json"},
-                method="POST",
+            result = json.loads(
+                fetch_bytes(
+                    agent_url.rstrip("/") + "/verify",
+                    label="verify-agent",
+                    timeout=120,
+                    data=json.dumps(body).encode(),
+                    headers={"content-type": "application/json"},
+                )
             )
-            with urllib.request.urlopen(req, timeout=120) as r:
-                result = json.loads(r.read())
-        except Exception as e:  # noqa: BLE001
+        except (FetchError, ValueError) as e:
             return 502, {"error": f"remote verify agent failed: {e}"}
         self._broadcast_verify(str(body.get("conv") or "adhoc"), result)
         return 200, result

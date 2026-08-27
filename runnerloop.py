@@ -167,18 +167,7 @@ class RunnerLoopMixin:
                 self._append_role_memory(harvested)
             except Exception as e:
                 _log(f"role memory append failed: {e}")
-        self.hub.broadcast(
-            _append_timeline(
-                self.paths,
-                {
-                    "type": "chat.assistant.final",
-                    "author": self.identity,
-                    "conv": self.conv,
-                    "stream_id": self.stream_id,
-                    "text": cleaned_text,
-                },
-            )
-        )
+        self._emit_final(cleaned_text)
         # CU1 (py-1.13.3) — Broadcast token usage + cost AFTER the
         # final lands. Cockpit ingests via `chat.usage` and updates
         # `chatStore.state.convs[conv].usage` so the operator sees
