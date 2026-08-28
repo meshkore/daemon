@@ -35,6 +35,7 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
         "active": 0,
         "blocked": 0,
         "done": 0,
+        "cancelled": 0,  # RSV1 — canonical since py-1.35.3
         "total": 0,
     }
 
@@ -148,7 +149,16 @@ def build_state(paths: Paths, cluster: Cluster) -> Dict[str, Any]:
                 {
                     "id": str(fm["id"]),
                     "title": str(fm.get("title") or fm["id"]),
-                    "status": str(fm.get("status") or "backlog"),
+                    # RSV1 — initiative status was published RAW while task
+                    # status was normalised. The cockpit's InitiativeCard only
+                    # tests done/backlog/next and treats anything else as
+                    # ACTIVE, so 36 `draft`/`planned`/`ready` initiatives (and
+                    # one `archived`) rendered as live work — three quarters of
+                    # the active roadmap. Normalise here like tasks, and keep
+                    # the literal in `status_raw` so nothing is lost and a
+                    # future draft column has something to read.
+                    "status": normalize_status(fm.get("status")),
+                    "status_raw": str(fm.get("status") or "").strip().lower(),
                     "priority": str(fm.get("priority") or "medium"),
                     "oneliner": str(fm.get("oneliner") or ""),
                     "modules": fm.get("modules")
@@ -341,7 +351,10 @@ def _reconcile_initiative_archive(
 
     for it in initiatives:
         status = normalize_status(it.get("status"))
-        if status == "backlog":
+        # RSV1 — `cancelled` joins `backlog` here. An initiative that was
+        # abandoned is not a candidate for auto-archival: flipping it to
+        # `done` would record work as delivered that never happened.
+        if status in ("backlog", "cancelled"):
             continue
         kids = children.get(it["id"], [])
         if not kids:

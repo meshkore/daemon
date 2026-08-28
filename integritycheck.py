@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from cluster import CANONICAL_STATUSES, STATUS_ALIASES
 from integrity import ProjectState
 from paths import Paths
 from utils import parse_frontmatter
@@ -179,6 +180,34 @@ class StateIntegrityChecker:
                         ),
                     }
                 )
+        # Rule (RSV1): a `status:` value the daemon has no alias for.
+        # `normalize_status` maps everything it does not recognise to
+        # `backlog` and says nothing, so a typo — or a new word someone
+        # invented — quietly becomes "pending work" and the board stops
+        # matching reality. That is how `shipped` and `archived` came to
+        # render as live initiatives. Surface it instead of swallowing it.
+        for f, kind in [
+            *((tf, "task") for tf in self.project.task_files()),
+            *((inif, "initiative") for inif in self.project.initiative_files()),
+        ]:
+            raw = (self._read_field(f, "status") or "").strip().lower()
+            if not raw or raw in CANONICAL_STATUSES or raw in STATUS_ALIASES:
+                continue
+            violations.append(
+                {
+                    "kind": "unknown_status",
+                    "path": str(f),
+                    "status": raw,
+                    "fix": (
+                        f"`{f.name}` has `status: {raw}`, which the daemon does"
+                        " not recognise — it is being treated as `backlog`."
+                        f" Use one of {list(CANONICAL_STATUSES)}, or add an"
+                        " alias for it in `cluster.STATUS_ALIASES` if the word"
+                        " is one this project means to keep using."
+                    ),
+                }
+            )
+
         # Rule: every initiative whose status is `active` or `next`
         # should have ≥1 child task. `backlog` / `done` are exempt.
         # This catches "I created an initiative and forgot the tasks".

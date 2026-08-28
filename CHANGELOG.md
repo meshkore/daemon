@@ -3,6 +3,44 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.3 — **THREE QUARTERS OF THE "ACTIVE" ROADMAP WAS SKETCHES** (RSV1).
+  Two bugs, the first hiding the second. (a) `normalize_status` recognised
+  five values and silently returned `backlog` for everything else; this repo's
+  roadmap files use 17. (b) TASK status was normalised before publication but
+  INITIATIVE status was not — it went out as the raw frontmatter literal, and
+  the cockpit's `InitiativeCard` tests `done`/`backlog`/`next` and treats
+  anything else as ACTIVE. Measured against the live daemon: **48 initiatives
+  rendered ACTIVE, of which 36 were `draft`/`planned`/`ready`** plus one
+  `archived`; only 12 were genuinely active. `cluster-admin-lifecycle`
+  (`shipped`) and `openclaw-marketplace` (`archived`) — both delivered — also
+  showed as live work. NEW `cluster.STATUS_ALIASES` + `CANONICAL_STATUSES`:
+  `shipped`/`archived`/`completed`/`complete` → `done`;
+  `draft`/`planned`/`ready`/`pending`/`todo`/`new` → `backlog`;
+  `cancelled`/`canceled`/`dropped`/`wontfix`/`superseded`/`obsolete` →
+  `cancelled` (now a SIXTH canonical value, published for the first time);
+  `doing`/`wip`/`in_progress` → `active` (`doing` is used in this repo's own
+  task files and was reading as untouched). Add an alias here rather than
+  teaching a consumer a new spelling. Initiatives now publish the normalised
+  `status` like tasks do, plus `status_raw` carrying the literal so nothing is
+  destroyed and a future draft column has something to read. An unrecognised
+  value still resolves to `backlog` — failing toward "there is work here",
+  never toward "this is finished" — but `StateIntegrityChecker` now raises
+  `unknown_status` for it instead of swallowing it, which is precisely how
+  `shipped` went unnoticed. The archive reconciler skips `cancelled`
+  initiatives alongside `backlog` ones: an abandoned initiative must not be
+  flipped to `done`, which would record work as delivered that never happened.
+  `stats` gains a `cancelled` bucket. Cockpit half shipped FIRST
+  (architect@HEAD, mandatory order): `lib/task-status.ts` — cancelled tasks
+  leave BOTH sides of the progress fraction, so an initiative with six
+  delivered and one cancelled reads 6/6 rather than 6/7 forever; `TaskRow`
+  gains a `cancelled` visual state (struck-through, the quietest on the row —
+  neither an achievement nor work owed). Two call sites in the cockpit already
+  tested for `'cancelled'` and had been dead code since they were written,
+  waiting for a daemon that would send it. Tests: NEW
+  `test_status_vocabulary.py` (28) — every alias that was actually wrong in
+  this repo, the table's own invariants (no alias shadows a canonical value,
+  every alias lands on one), fail-toward-pending, and the publication shape
+  asserted through `build_state` rather than the mapper alone.
 - 1.35.2 — py-1.35.1's fix DID NOTHING in production, and the tests said it
   worked (DAH7b). `is_resolved_status` was handed `task["status"]` — the value
   `build_state` has ALREADY normalised — so `cancelled` reached it as

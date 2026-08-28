@@ -146,20 +146,36 @@ def test_reconcile_is_idempotent(tmp_path: Path) -> None:
     assert _status_on_disk(tmp_path, it) == "done"
 
 
-def test_reconciler_reads_the_raw_status_not_the_normalised_one(tmp_path: Path) -> None:
-    """The integration bug behind py-1.35.2, pinned directly: `cancelled`
-    normalises to `backlog`, so a reconciler judging by `status` alone sees
-    pending work that does not exist."""
-    it = _write_initiative(tmp_path, "aud", "active")
-    kid = _task("T2", "aud", "cancelled")
-    assert kid["status"] == "backlog", "precondition: normalisation loses it"
-    assert kid["status_raw"] == "cancelled"
+def test_a_legacy_record_that_lost_cancelled_reads_as_pending(tmp_path: Path) -> None:
+    """py-1.35.2 and earlier normalised `cancelled` down to `backlog` before
+    publication and carried no `status_raw`, so a state.json written by one of
+    those daemons has genuinely lost the distinction. The reconciler cannot
+    recover it and must not guess: `backlog` means pending, so the initiative
+    stays open. Failing toward "there is work here" is the safe direction —
+    the alternative would archive live work on a hunch.
+
+    RSV1 removed the cause: `cancelled` is canonical on the wire now, so fresh
+    records never reach this branch."""
+    it = _write_initiative(tmp_path, "aud", "done")
+    legacy = {"id": "T2", "initiative": "aud", "status": "backlog"}  # no status_raw
     _reconcile_initiative_archive(
-        [
-            it,
-        ],
-        [_task("T1", "aud", "done"), kid],
+        [it],
+        [{"id": "T1", "initiative": "aud", "status": "done"}, legacy],
         _Paths(tmp_path),
+    )
+    assert _status_on_disk(tmp_path, it) == "active"
+
+
+def test_cancelled_survives_normalisation_since_rsv1(tmp_path: Path) -> None:
+    """The other half of the same story: `cancelled` is now a canonical value,
+    so a current record carries it in BOTH fields and the reconciler sees it
+    whichever one it reads."""
+    kid = _task("T2", "aud", "cancelled")
+    assert kid["status"] == "cancelled"
+    assert kid["status_raw"] == "cancelled"
+    it = _write_initiative(tmp_path, "aud", "active")
+    _reconcile_initiative_archive(
+        [it], [_task("T1", "aud", "done"), kid], _Paths(tmp_path)
     )
     assert _status_on_disk(tmp_path, it) == "done"
 

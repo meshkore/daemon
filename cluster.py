@@ -151,12 +151,56 @@ def _patch_frontmatter(fp: "Path", patch: Dict[str, Any]) -> bool:
     return True
 
 
+# RSV1 — the alias table. The roadmap files use 17 distinct `status` values;
+# this maps every one of them onto the six the rest of the system reasons
+# about. It used to be an `if` chain that recognised five values and silently
+# returned `backlog` for everything else, which was wrong in both directions:
+# a finished initiative marked `shipped` read as pending work, and 36 `draft`
+# / `planned` / `ready` initiatives reached the cockpit as their raw literal,
+# where its `done/backlog/next` test fell through to the ACTIVE branch — so
+# three quarters of the "active" roadmap were sketches.
+#
+# Add an alias here rather than teaching a consumer a new spelling.
+STATUS_ALIASES = {
+    # in flight
+    "in_progress": "active",
+    "in-progress": "active",
+    "doing": "active",
+    "wip": "active",
+    # finished
+    "shipped": "done",
+    "completed": "done",
+    "complete": "done",
+    "archived": "done",
+    # not started — a sketch is backlog, it is not work in progress
+    "planned": "backlog",
+    "pending": "backlog",
+    "draft": "backlog",
+    "ready": "backlog",
+    "todo": "backlog",
+    "new": "backlog",
+    # closed without being carried out (see is_resolved_status)
+    "canceled": "cancelled",
+    "dropped": "cancelled",
+    "wontfix": "cancelled",
+    "won't-fix": "cancelled",
+    "superseded": "cancelled",
+    "obsolete": "cancelled",
+}
+
+CANONICAL_STATUSES = ("backlog", "next", "active", "blocked", "done", "cancelled")
+
+
 def normalize_status(s: Any) -> str:
-    s = str(s or "backlog").lower()
-    if s in ("in_progress", "in-progress"):
-        return "active"
-    if s in ("backlog", "next", "active", "blocked", "done"):
+    s = str(s or "backlog").strip().lower()
+    if s in CANONICAL_STATUSES:
         return s
+    alias = STATUS_ALIASES.get(s)
+    if alias:
+        return alias
+    # Unrecognised: still `backlog` (fail toward "there is work here", never
+    # toward "this is finished"), but it is a typo or a value that wants an
+    # alias above — `StateIntegrityChecker` surfaces it rather than swallowing.
     return "backlog"
 
 
@@ -191,9 +235,15 @@ TERMINAL_RESOLVED_STATUSES = frozenset(
 
 def is_resolved_status(s: Any) -> bool:
     """True when a task needs NO further work — either it is `done`, or it was
-    closed on purpose and never will be."""
+    closed on purpose and never will be.
+
+    Accepts a raw frontmatter literal OR an already-normalised value: since
+    RSV1 `cancelled` is canonical, so both spellings land in the same place."""
     raw = str(s or "").strip().lower()
-    return normalize_status(raw) == "done" or raw in TERMINAL_RESOLVED_STATUSES
+    return (
+        normalize_status(raw) in ("done", "cancelled")
+        or raw in TERMINAL_RESOLVED_STATUSES
+    )
 
 
 # ── cluster.yaml `crons:` validation (DA-CLUSTER-01, moved from daemon.py) ──
