@@ -57,14 +57,23 @@ class ClaudeCodeDriver(ClientDriver):
         return None
 
     def models_catalog(self) -> List[Dict[str, Any]]:
-        # Mirrors architect/src/lib/models.ts MODEL_CATALOG (the frontend's
-        # existing hardcoded source of truth) until DM-CLI-06/07 make this
-        # driver-owned list the one both sides read from.
+        # Kept in step with `providers.PROVIDERS["anthropic"]["models"]` — the
+        # list the cockpit reads once a provider is selected. It cannot IMPORT
+        # that list (bundle.py inlines `clidrivers` BEFORE `providers.py`), so
+        # `test_clidrivers_claudecode.py::test_anthropic_catalogs_agree` fails
+        # the build on drift instead. It used to say it mirrored models.ts and
+        # then offered aliases only: `opus` cannot reach Fable, which has no
+        # alias, so the flagship was unreachable from every surface that read
+        # THIS list rather than the provider one.
         return [
             {"id": "auto", "label": "Auto"},
             {"id": "opus", "label": "Opus"},
             {"id": "sonnet", "label": "Sonnet"},
             {"id": "haiku", "label": "Haiku"},
+            {"id": "claude-fable-5-1", "label": "Fable 5.1"},
+            {"id": "claude-fable-5", "label": "Fable 5"},
+            {"id": "claude-opus-4-8", "label": "Opus 4.8"},
+            {"id": "claude-sonnet-5", "label": "Sonnet 5"},
         ]
 
     def efforts_catalog(self) -> List[Dict[str, Any]]:

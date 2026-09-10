@@ -54,4 +54,4 @@ FS_POLL_SEC = 1.5
 #     "py-X.Y.Z"  # …\n)`, and all three regexes are anchored to the
 # single-line form. bundle.py refuses to build (loud, good) — but keep the
 # comment short enough that the formatter never wants to wrap it.
-DAEMON_VERSION = "py-1.35.4"  # FM1/FM4 — flagship model ids; see CHANGELOG.md
+DAEMON_VERSION = "py-1.35.5"  # FM1b — catalog drift check; see CHANGELOG.md

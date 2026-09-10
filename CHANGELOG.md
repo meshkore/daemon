@@ -3,6 +3,19 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.5 — **A THIRD ANTHROPIC CATALOG, ALSO WITHOUT THE FLAGSHIP** (FM-1b).
+  Found while verifying 1.35.4 against the live daemon: `GET /clients` serves
+  TWO Anthropic lists — the provider registry (fixed in 1.35.4) and
+  `ClaudeCodeDriver.models_catalog`, which a picker reads when no provider is
+  selected. The driver's offered `auto/opus/sonnet/haiku` and nothing else,
+  under a comment claiming it mirrored `models.ts`. Since Fable has no ALIAS,
+  `opus` cannot reach it: the flagship stayed unreachable from that surface
+  even after 1.35.4 landed. The driver now carries the same eight ids as the
+  registry, and NEW `test_clidrivers_claudecode.py` asserts the two agree —
+  the drift check, because the driver cannot import the registry (bundle.py
+  inlines `clidrivers` BEFORE `providers.py`) and a comment promising a mirror
+  is what failed here twice. Suite 600 -> 601.
+
 - 1.35.4 — **THE MODEL CATALOG NEVER OFFERED THE FLAGSHIP** (FM-1, FM-4).
   `providers.py`'s Anthropic catalog stopped at `claude-opus-4-8` /
   `claude-sonnet-5`: it listed no Fable at all, not even the 5. Since there is
