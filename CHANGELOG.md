@@ -3,6 +3,35 @@
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 
+- 1.35.4 — **THE MODEL CATALOG NEVER OFFERED THE FLAGSHIP** (FM-1, FM-4).
+  `providers.py`'s Anthropic catalog stopped at `claude-opus-4-8` /
+  `claude-sonnet-5`: it listed no Fable at all, not even the 5. Since there is
+  no `fable` ALIAS — the family is reachable ONLY as a pinned id — every member
+  and every agent created through the daemon was capped below the strongest
+  model available on the account, and the comment claiming this list "mirrors
+  the cockpit's PROVIDER_CATALOG" was false (the cockpit had Fable 5). NEW:
+  `claude-fable-5-1` (flagship) and `claude-fable-5`. Verified on the operator's
+  machine with real `claude -p --model <id>` turns rather than from docs:
+  `claude-fable-5-1` answers on claude-code 2.1.267 and 400s on 2.1.212
+  ("version 2.1.251 or newer is required" — so an old CLI, not a wrong id, is
+  what a failure here usually means), and `claude-fable-5.1` with a dot does not
+  exist. `contextpolicy.py` gains explicit 1M entries for `claude-fable-5-1`
+  and its `[1m]` variant: the prefix fallback happens to land on 1M today, but
+  a Fable variant with a smaller window would silently inherit the wrong number
+  and misread the context gauge by 5x — the same bug the bare `claude-fable-5`
+  entry was added to fix. `clidrivers/codex.py#models_catalog` gains
+  `gpt-6-astra` and `gpt-5`, both probed against the operator's own key
+  (`gpt-6-astra` echoed its id back); `gpt-5-codex`, the obvious pick for a
+  Codex driver, is deliberately absent because that probe returned DEPRECATED,
+  and `gpt-5-pro` because it lives only on `v1/responses`. The empty
+  "Default (CLI config)" id stays first, so a fresh member still inherits
+  whatever `codex login` configured, and the client still reports itself
+  unavailable wherever the binary is missing. `STRONGEST_MODEL_ALIAS` stays
+  `opus` on purpose: it is the default for every new member, and a Fable
+  default has already cost a real session (`429 You've reached your Fable 5
+  limit`, 2026-09-06). Tests: `test_contextpolicy.py` covers the two new
+  windows; 600 pass.
+
 - 1.35.3 — **THREE QUARTERS OF THE "ACTIVE" ROADMAP WAS SKETCHES** (RSV1).
   Two bugs, the first hiding the second. (a) `normalize_status` recognised
   five values and silently returned `backlog` for everything else; this repo's

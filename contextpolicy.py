@@ -75,6 +75,13 @@ _CLAUDE_WINDOWS: Dict[str, int] = {
     # cockpit context gauge read 5× too full.
     "claude-fable-5": 1_000_000,
     "claude-fable-5[1m]": 1_000_000,
+    # Fable 5.1 — same native 1M. Listed explicitly rather than left to the
+    # prefix fallback: the fallback happens to be right here ("claude-fable-5"
+    # is a prefix of it) but it would be wrong the moment a Fable variant
+    # ships a smaller window, and a 5x-off gauge is exactly the bug the entry
+    # above was added to fix.
+    "claude-fable-5-1": 1_000_000,
+    "claude-fable-5-1[1m]": 1_000_000,
     # 1M-context variants (opt-in [1m] tier on Opus/Sonnet)
     "claude-opus-4-8[1m]": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,

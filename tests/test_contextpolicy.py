@@ -37,6 +37,9 @@ def test_claude_window_sizing() -> None:
     assert p.context_window("claude-sonnet-5[1m]") == 1_000_000
     assert p.context_window("claude-fable-5") == 1_000_000
     assert p.context_window("claude-fable-5[1m]") == 1_000_000
+    # flagship-models FM-1 — Fable 5.1 is the flagship pinned id.
+    assert p.context_window("claude-fable-5-1") == 1_000_000
+    assert p.context_window("claude-fable-5-1[1m]") == 1_000_000
     # unknown claude id → family default.
     assert p.context_window("claude-something-new") == 200_000
 

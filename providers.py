@@ -64,6 +64,16 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             {"id": "opus", "label": "Opus (latest)"},
             {"id": "sonnet", "label": "Sonnet (latest)"},
             {"id": "haiku", "label": "Haiku (latest)"},
+            # Claude 5 family, pinned. There is no `fable` ALIAS, so the
+            # flagship is only reachable as a pinned id — which is why its
+            # absence here silently capped every member at Opus 4.8.
+            # Verified on this machine 2026-09-10 with a real
+            # `claude -p --model <id>` turn, not read off a docs page:
+            # `claude-fable-5-1` answers on claude-code 2.1.267 and 400s on
+            # 2.1.212 ("version 2.1.251 or newer is required"), and
+            # `claude-fable-5.1` (with a dot) does not exist at all.
+            {"id": "claude-fable-5-1", "label": "Fable 5.1"},
+            {"id": "claude-fable-5", "label": "Fable 5"},
             {"id": "claude-opus-4-8", "label": "Opus 4.8"},
             {"id": "claude-sonnet-5", "label": "Sonnet 5"},
             {"id": "auto", "label": "Auto"},

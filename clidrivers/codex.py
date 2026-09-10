@@ -67,12 +67,27 @@ class CodexDriver(ClientDriver):
         return os.path.exists(os.path.expanduser("~/.codex/auth.json"))
 
     def models_catalog(self) -> List[Dict[str, Any]]:
-        # PROVISIONAL — verify against `codex exec --help` / the
-        # installed CLI's actual model list before relying on this for
-        # anything beyond a starting default; OpenAI's model lineup
-        # moves fast and this list will drift.
+        # What is VERIFIED here and what is not (flagship-models FM-4,
+        # 2026-09-10) — say it plainly, because the previous version of this
+        # comment said "PROVISIONAL" and then nobody ever checked:
+        #   VERIFIED: the operator's OpenAI key serves `gpt-6-astra` — a real
+        #   200 from `POST v1/chat/completions`, echoing its own id back — and
+        #   `gpt-5` (resolves to gpt-5-2025-08-07) as the step down. Two
+        #   plausible-looking neighbours are deliberately NOT here because the
+        #   same probe rejected them: `gpt-5-pro` exists only on
+        #   `v1/responses`, and `gpt-5-codex` — the obvious pick for a Codex
+        #   driver — is DEPRECATED and 400s.
+        #   NOT VERIFIED: that codex-cli accepts these ids via `-m`. The
+        #   binary is not installed on this machine, so `find_binary()`
+        #   already reports the whole client unavailable and no picker can
+        #   dispatch one of these yet. First machine with codex installed
+        #   should re-check `codex exec --help`.
+        # Empty id stays FIRST so the safe default (whatever `codex login`
+        # configured) is what a fresh member gets.
         return [
             {"id": "", "label": "Default (CLI config)"},
+            {"id": "gpt-6-astra", "label": "GPT-6 Astra"},
+            {"id": "gpt-5", "label": "GPT-5"},
         ]
 
     def efforts_catalog(self) -> List[Dict[str, Any]]:
