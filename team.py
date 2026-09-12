@@ -322,15 +322,18 @@ class TeamStore:
         self, mid: str, patch: Dict[str, Any], *, today: str
     ) -> Dict[str, Any]:
         cur = self.team_get(mid)
+        raw_before = self._path(mid).read_text(encoding="utf-8")
         fm = dict(cur["frontmatter"])
         body = cur["body"]
         # kind + required are immutable via update.
         for immut in ("kind", "required"):
             if immut in patch and str(patch[immut]) != str(fm.get(immut)):
                 raise TeamConflict(f"{immut} is immutable; cannot change via update")
-        # Apply frontmatter patch (ignore id changes — file name is the id).
+        # Apply frontmatter patch (ignore id changes — file name is the id —
+        # and `updated`, which is server-owned: the daemon stamps it, and
+        # only when something actually changed).
         for k, v in patch.items():
-            if k in ("body", "prompt", "id"):
+            if k in ("body", "prompt", "id", "updated"):
                 continue
             fm[k] = v
         # Body replace when provided.
@@ -339,6 +342,15 @@ class TeamStore:
             nb = str(new_body).strip()
             body = (nb + "\n") if nb else ""
         fm["id"] = mid
+        # Idempotency: render the candidate with the CURRENT `updated` stamp
+        # and compare against the bytes on disk. The cockpit PATCHes per
+        # section even when the operator changed nothing, and every such
+        # save used to bump `updated` + rewrite the file — leaving a dirty
+        # git diff under .meshkore/team/ on EVERY save. A no-op save now
+        # returns the member untouched (no write, no stamp bump).
+        candidate = serialise_member(fm, body)
+        if candidate == raw_before:
+            return cur
         fm["updated"] = today
         validate_member(fm)
         text = serialise_member(fm, body)

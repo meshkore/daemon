@@ -144,6 +144,13 @@ class TeamMixin:
             member = self.team_store.team_update(mid, patch, today=_iso_now()[:10])
         except TeamError as e:
             return self._team_err(e)
+        if member.get("frontmatter") == before.get("frontmatter") and member.get(
+            "body"
+        ) == before.get("body"):
+            # No-op save (the cockpit PATCHes per section even when nothing
+            # changed, and TeamStore now skips the write): no token, no
+            # broadcast — the roster already reflects this state.
+            return 200, member
         new_exposure = self._member_exposure(member.get("frontmatter") or {})
         tokens = TeamTokenStore(self.paths)
         if new_exposure == "external":
