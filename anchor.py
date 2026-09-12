@@ -123,6 +123,21 @@ class AnchorMixin:
                 )
             except Exception:
                 pass
+            # LAL11 — an info anchor is a valid anchor: clear the
+            # consecutive-miss counter so the briefing nudge stops.
+            try:
+                _meta_all = self._conv_meta_load()
+                _meta_entry = _meta_all.get(conv) or {}
+                if "anchor_missing" in _meta_entry:
+                    del _meta_entry["anchor_missing"]
+                    _meta_all[conv] = _meta_entry
+                    _p = self._conv_meta_path()
+                    _p.parent.mkdir(parents=True, exist_ok=True)
+                    from fsatomic import atomic_write_json as _atomic_write_json
+
+                    _atomic_write_json(_p, _meta_all, sort_keys=True)
+            except Exception as e:
+                _log(f"anchor: miss-counter reset (info) failed for {conv}: {e}")
             return
 
         is_new_init = False
@@ -216,6 +231,21 @@ class AnchorMixin:
                 _log(f"anchor: reactivate failed for #{init_id}: {e}")
 
         # --- Persist conv_meta + broadcast ---
+        # LAL10 — a successful anchor clears the consecutive-miss counter
+        # written by _handle_anchor_missing, so the briefing nudge stops.
+        try:
+            _meta_all = self._conv_meta_load()
+            _meta_entry = _meta_all.get(conv) or {}
+            if "anchor_missing" in _meta_entry:
+                del _meta_entry["anchor_missing"]
+                _meta_all[conv] = _meta_entry
+                _p = self._conv_meta_path()
+                _p.parent.mkdir(parents=True, exist_ok=True)
+                from fsatomic import atomic_write_json as _atomic_write_json
+
+                _atomic_write_json(_p, _meta_all, sort_keys=True)
+        except Exception as e:
+            _log(f"anchor: miss-counter reset failed for {conv}: {e}")
         existing_meta = self._conv_meta_load().get(conv) or {}
         agent_type = existing_meta.get("agent_type") or "custom"
         agent_id = existing_meta.get("agent_id")
