@@ -315,12 +315,34 @@ class AnchorProgressMixin:
 
     def _handle_anchor_missing(self, conv: str) -> None:
         """LAL2 stub — once per turn, broadcast that the agent skipped
-        the marker. Cockpit can dim the 'anchored' affordance."""
+        the marker. Cockpit can dim the 'anchored' affordance.
+        LAL10 — also persist a consecutive-miss counter in conv_meta so
+        the next briefing can nudge the agent (daemon-side enforcement
+        instead of pure LLM discipline). Client-agnostic: the counter
+        is written by the runner, not by the agent."""
+        misses = 1
+        try:
+            all_meta = self._conv_meta_load()
+            entry = all_meta.get(conv) or {}
+            try:
+                misses = int(entry.get("anchor_missing") or 0) + 1
+            except (TypeError, ValueError):
+                misses = 1
+            entry["anchor_missing"] = str(misses)
+            all_meta[conv] = entry
+            p = self._conv_meta_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            from fsatomic import atomic_write_json
+
+            atomic_write_json(p, all_meta, sort_keys=True)
+        except Exception as e:
+            _log(f"anchor.missing persist failed for {conv}: {e}")
         try:
             self.hub.broadcast(
                 {
                     "type": "conv.anchor_missing",
                     "conv": conv,
+                    "misses": misses,
                     "ts": _iso_now(),
                 }
             )

@@ -251,6 +251,7 @@ class BriefingPipeline:
             self._section_project_mode(),
             self._section_integrity(),
             self._section_cockpit_context(),
+            self._section_anchor_nudge(),
             self._section_history(),
             # py-1.10.8 — only non-empty when user_text starts with
             # `[architect-consult]` on the `_onboarding_v1` conv. Forces
@@ -611,6 +612,51 @@ class BriefingPipeline:
             ]
             return "\n".join(universal + general_coder_extras)
         return "\n".join(universal)
+
+    def _section_anchor_nudge(self) -> str:
+        """LAL10 — daemon-side anchor enforcement. When the previous turn(s)
+        on this conv produced no anchor marker, the runner persisted an
+        `anchor_missing` counter in conv_meta. Surface it here as a hard
+        reminder so the miss is corrected next turn even if the agent
+        skimmed the core rules. Empty (no section) when the conv is clean.
+        Client-agnostic: plain text, no tool-calls, identical for every
+        CLI driver (claude/codex/gemini/muse)."""
+        meta: Any = {}
+        try:
+            data = getattr(self.cluster, "data", None) or {}
+            meta = (data.get("conv_meta") or {}).get(self.conv) or {}
+        except Exception:
+            meta = {}
+        if not meta:
+            try:
+                import json as _json
+
+                mp = self.paths.runtime / "conv_meta.json"
+                if mp.is_file():
+                    meta = (_json.loads(mp.read_text() or "{}") or {}).get(
+                        self.conv
+                    ) or {}
+            except Exception:
+                meta = {}
+        try:
+            misses = int((meta or {}).get("anchor_missing") or 0)
+        except (TypeError, ValueError):
+            misses = 0
+        if misses <= 0:
+            return ""
+        return (
+            "## ⚠ ANCHOR MISSING — correct this turn\n\n"
+            f"Your previous {misses} turn(s) on this conv emitted NO anchor marker. "
+            "The queue is showing a stale initiative until you anchor.\n\n"
+            "Your FIRST line this turn MUST be one of:\n"
+            '  `⟦anchor⟧ {"i":"<slug>","t":"<task_id>"}` (reuse — prefer this, check '
+            "the archive `initiatives/log/` too)\n"
+            '  `⟦anchor⟧ {"new_t":{"id":"<ID>","title":"<t>","category":"<module>",'
+            '"initiative":"<slug>"}}` (small follow-up: create a TEMPORAL task, do '
+            "the fix, then mark it done with "
+            '`⟦anchor-progress⟧ {"t":"<ID>","status":"done"}`)\n'
+            '  `⟦anchor⟧ {"info":true}` (ONLY if this turn truly touches no work)\n'
+        )
 
     def _section_agent_focus(self) -> str:
         # py-1.7.0 — Service agents get their narrow focus block. The
