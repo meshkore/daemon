@@ -87,8 +87,16 @@ class GeminiDriver(ClientDriver):
         # PROVISIONAL — verify against the installed CLI / Google's
         # current model docs before relying on this; not observed from
         # a real successful call (no auth on this machine).
+        # Catalog refresh 2026-09-12 (DM-CLI-12): Gemini 3 is the current
+        # generation (CLI upgrades to "Auto (Gemini 3)"; `-m` aliases are
+        # auto/pro/flash/flash-lite, concrete `gemini-3-*-preview` ids
+        # accepted — corroborated by the CLI's own model docs). The 2.5
+        # entries are KEPT, not dropped: Google still serves them and a
+        # member pinned to one must keep dispatching.
         return [
             {"id": "", "label": "Default (CLI config)"},
+            {"id": "gemini-3-pro-preview", "label": "Gemini 3 Pro"},
+            {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash"},
             {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
             {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
         ]

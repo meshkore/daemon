@@ -30,6 +30,9 @@ def test_anthropic_catalogs_agree():
     assert sorted(driver_ids) == sorted(registry_ids), (
         f"driver {sorted(driver_ids)} != registry {sorted(registry_ids)}"
     )
-    # The flagship is only reachable as a PINNED id (no `fable` alias exists),
-    # so its presence is the property worth pinning, not just set equality.
+    # The flagship stays reachable as a PINNED id (DM-CLI-12: the `fable`
+    # alias now exists too), so its presence is the property worth pinning,
+    # not just set equality.
     assert "claude-fable-5-1" in driver_ids
+    assert "fable" in driver_ids
+    assert "claude-opus-5" in driver_ids

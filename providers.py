@@ -64,16 +64,21 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             {"id": "opus", "label": "Opus (latest)"},
             {"id": "sonnet", "label": "Sonnet (latest)"},
             {"id": "haiku", "label": "Haiku (latest)"},
-            # Claude 5 family, pinned. There is no `fable` ALIAS, so the
-            # flagship is only reachable as a pinned id — which is why its
-            # absence here silently capped every member at Opus 4.8.
+            # Claude 5 family, pinned. (Until 2026-09-12 there was no
+            # `fable` ALIAS, so the flagship was only reachable as a pinned
+            # id — which is why its absence here silently capped every
+            # member at Opus 4.8. Local `claude --help` now lists
+            # fable/opus/sonnet aliases; both paths are offered.)
             # Verified on this machine 2026-09-10 with a real
             # `claude -p --model <id>` turn, not read off a docs page:
             # `claude-fable-5-1` answers on claude-code 2.1.267 and 400s on
             # 2.1.212 ("version 2.1.251 or newer is required"), and
             # `claude-fable-5.1` (with a dot) does not exist at all.
+            # Refresh 2026-09-12 (DM-CLI-12): `fable` alias + `claude-opus-5`.
+            {"id": "fable", "label": "Fable (latest)"},
             {"id": "claude-fable-5-1", "label": "Fable 5.1"},
             {"id": "claude-fable-5", "label": "Fable 5"},
+            {"id": "claude-opus-5", "label": "Opus 5"},
             {"id": "claude-opus-4-8", "label": "Opus 4.8"},
             {"id": "claude-sonnet-5", "label": "Sonnet 5"},
             {"id": "auto", "label": "Auto"},
@@ -85,7 +90,17 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "requires_key": True,
         "default_base_url": ZAI_DEFAULT_BASE_URL,
         "default_small_model": ZAI_DEFAULT_SMALL_MODEL,
+        # Refresh 2026-09-12 (DM-CLI-12): GLM 5.x added — 5.3 newest on
+        # the Coding Plan (multi-source), 5.2/5.1 + 5-turbo corroborated
+        # on the Anthropic-compatible endpoint; 4.7 is the plan default
+        # since Dec 2025. 4.6 + 4.5-air KEPT (still served; 4.5-air stays
+        # the small/fast default below).
         "models": [
+            {"id": "glm-5.3", "label": "GLM-5.3"},
+            {"id": "glm-5.2", "label": "GLM-5.2"},
+            {"id": "glm-5.1", "label": "GLM-5.1"},
+            {"id": "glm-5-turbo", "label": "GLM-5 Turbo"},
+            {"id": "glm-4.7", "label": "GLM-4.7"},
             {"id": "glm-4.6", "label": "GLM-4.6"},
             {"id": "glm-4.5-air", "label": "GLM-4.5 Air"},
         ],

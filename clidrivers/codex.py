@@ -82,11 +82,17 @@ class CodexDriver(ClientDriver):
         #   already reports the whole client unavailable and no picker can
         #   dispatch one of these yet. First machine with codex installed
         #   should re-check `codex exec --help`.
+        # Catalog refresh 2026-09-12 (DM-CLI-12): `gpt-5.6-sol` added —
+        # OpenAI's rollout-safe default while GPT-6 Astra (needs Codex CLI
+        # ≥ 0.153.1, enabled per account over days) lands; corroborated by
+        # independent third-party Codex catalogs. `gpt-5` kept (still
+        # resolves). `gpt-5-codex` stays excluded (deprecated, 400s).
         # Empty id stays FIRST so the safe default (whatever `codex login`
         # configured) is what a fresh member gets.
         return [
             {"id": "", "label": "Default (CLI config)"},
             {"id": "gpt-6-astra", "label": "GPT-6 Astra"},
+            {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
             {"id": "gpt-5", "label": "GPT-5"},
         ]
 

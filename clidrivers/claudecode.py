@@ -65,13 +65,20 @@ class ClaudeCodeDriver(ClientDriver):
         # then offered aliases only: `opus` cannot reach Fable, which has no
         # alias, so the flagship was unreachable from every surface that read
         # THIS list rather than the provider one.
+        # Catalog refresh 2026-09-12 (DM-CLI-12): `fable` alias added
+        # (verified in local `claude --help`: aliases are fable/opus/
+        # sonnet) + pinned `claude-opus-5` (cheaper SOTA coding flagship
+        # alongside Fable; on Bedrock + press). Older pins KEPT — Anthropic
+        # still serves them and members may be pinned to one.
         return [
             {"id": "auto", "label": "Auto"},
+            {"id": "fable", "label": "Fable"},
             {"id": "opus", "label": "Opus"},
             {"id": "sonnet", "label": "Sonnet"},
             {"id": "haiku", "label": "Haiku"},
             {"id": "claude-fable-5-1", "label": "Fable 5.1"},
             {"id": "claude-fable-5", "label": "Fable 5"},
+            {"id": "claude-opus-5", "label": "Opus 5"},
             {"id": "claude-opus-4-8", "label": "Opus 4.8"},
             {"id": "claude-sonnet-5", "label": "Sonnet 5"},
         ]
