@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Tuple
 
 from scaffold import ScaffoldError, scaffold_cluster, slugify_id
 from paths import Paths
-from utils import _log
+from utils import _log, parse_simple_yaml
 
 # ── HARDCODED server-home backstop (FC-2 / operator-directed 2026-07-07) ─────
 # The central daemon's OWN home (its `.meshkore` is the machine-global store:
@@ -311,6 +311,55 @@ class ProjectsMixin:
                     "path": str(root),
                 }
         name = name_in or root.name
+        # ── DUP-GUARD (AX23) — one folder, one registry entry. Without this,
+        # `register_root()` below silently overwrites `_roots[pid]`, so adding
+        # a second entry for an already-served folder (or a second folder
+        # carrying an already-registered cluster id) corrupts the first entry
+        # instead of warning. Operator field report 2026-09-12 (harbee/zaelar).
+        try:
+            resolved = root.expanduser().resolve()
+        except Exception:  # noqa: BLE001 — unresolvable path falls through
+            resolved = root.expanduser().absolute()
+        for pid in self._registry.ids():
+            other = self._registry.root_of(pid)
+            if not other:
+                continue
+            try:
+                other_resolved = Path(other).expanduser().resolve()
+            except Exception:  # noqa: BLE001
+                continue
+            if other_resolved == resolved:
+                # Idempotent re-add: same folder → return the existing entry
+                # (200, no rewrite) instead of a duplicate row.
+                meta = self._projects_meta()
+                return 200, {
+                    "id": pid,
+                    "name": (meta.get(pid) or {}).get("name") or pid,
+                    "path": str(other),
+                    "already_registered": True,
+                }
+        if not creating:
+            # Same cluster id, different folder → refuse: registering would
+            # repoint the live entry at the new path (covers nested cases like
+            # `<repo>/.meshkore` vs `<repo>/engine/.meshkore` sharing one id).
+            cy = Paths(root).cluster_yaml
+            if cy.exists():
+                try:
+                    claimed = parse_simple_yaml(cy.read_text()).get("id")
+                except Exception:  # noqa: BLE001 — unreadable yaml: no signal
+                    claimed = None
+                if claimed and self._registry.has(claimed):
+                    other = self._registry.root_of(claimed)
+                    return 409, {
+                        "error": (
+                            f"cluster id {claimed!r} is already registered at "
+                            "a different folder — unregister it first or fix "
+                            "the folder's cluster.yaml"
+                        ),
+                        "id": claimed,
+                        "path": str(other) if other else "",
+                        "claimed_path": str(root),
+                    }
         # Scaffold the cluster ledger if this folder has none yet (the daemon
         # owns the schema — same path the `init` CLI uses).
         paths = Paths(root)

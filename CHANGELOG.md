@@ -7,6 +7,8 @@
 
 # daemon — version changelog
 
+- 1.35.10 — **DUP-PATH GUARD ON POST /projects** (AX23, initiative `multi-project-parallel`). Operator field report 2026-09-12: two rail entries (harbee + zaelar) for overlapping folders. `project_register` now (a) returns the existing entry (200 + `already_registered`) when the folder is already served — idempotent re-add, no second row; (b) refuses with 409 when a different folder claims an already-registered cluster id (covers nested `<repo>/.meshkore` vs `<repo>/engine/.meshkore` sharing one id). Cleanup for the report itself was a runtime `DELETE /projects/harbee` (registry-only, disk untouched; zaelar at `zaelar/engine` verified intact). Tests: `test_register_same_folder_twice_is_idempotent` + `test_register_same_cluster_id_elsewhere_is_rejected` in `tests/test_multiproject.py` (13/13 green).
+
 Moved out of daemon.py (Phase E4) so the composition root stays clean.
 Newest first. Canonical version = `constants.DAEMON_VERSION`.
 

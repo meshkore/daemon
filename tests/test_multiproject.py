@@ -387,3 +387,48 @@ def test_register_create_from_scratch_parent_name_and_allowlist(
     )
     assert r.status_code == 403, r.text
     assert not Path("/opt/cpl-not-allowed-xyz").exists()
+
+
+@pytest.mark.cluster("populated")
+def test_register_same_folder_twice_is_idempotent(daemon, tmp_path: Path) -> None:
+    # AX23 (harbee/zaelar field report): re-adding an already-served folder
+    # must NOT create a second row — it returns the existing entry (200).
+    close = {"Connection": "close"}
+    b_root = tmp_path / "project-dup"
+    b_root.mkdir(parents=True, exist_ok=True)
+    r = daemon.post(
+        "/projects", headers={**daemon.auth, **close}, json={"path": str(b_root)}
+    )
+    assert r.status_code == 201, r.text
+    b_id = r.json()["id"]
+    before = len(daemon.get("/projects").json()["projects"])
+    r = daemon.post(
+        "/projects", headers={**daemon.auth, **close}, json={"path": str(b_root)}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == b_id
+    assert r.json().get("already_registered") is True
+    after = len(daemon.get("/projects").json()["projects"])
+    assert after == before
+
+
+@pytest.mark.cluster("populated")
+def test_register_same_cluster_id_elsewhere_is_rejected(daemon, tmp_path: Path) -> None:
+    # AX23: a second folder carrying an already-registered cluster id
+    # (e.g. `<repo>/.meshkore` vs `<repo>/engine/.meshkore` sharing one id)
+    # is refused with 409 — registering would silently repoint the live entry.
+    close = {"Connection": "close"}
+    a_id = daemon.get("/projects").json()["default"]
+    clash = tmp_path / "project-clash"
+    (clash / ".meshkore" / "public").mkdir(parents=True, exist_ok=True)
+    (clash / ".meshkore" / "public" / "cluster.yaml").write_text(
+        f"id: {a_id}\nname: Clash\n"
+    )
+    r = daemon.post(
+        "/projects", headers={**daemon.auth, **close}, json={"path": str(clash)}
+    )
+    assert r.status_code == 409, r.text
+    assert a_id in r.text
+    # The live entry still points at the original folder.
+    health = daemon.get("/health", headers={"X-MeshKore-Project": a_id}).json()
+    assert health["cluster_id"] == a_id

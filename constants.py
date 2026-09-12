@@ -54,4 +54,4 @@ FS_POLL_SEC = 1.5
 #     "py-X.Y.Z"  # …\n)`, and all three regexes are anchored to the
 # single-line form. bundle.py refuses to build (loud, good) — but keep the
 # comment short enough that the formatter never wants to wrap it.
-DAEMON_VERSION = "py-1.35.9"  # ATM13 — no-op team save skips write
+DAEMON_VERSION = "py-1.35.10"  # AX23 — dup-path guard on POST /projects
