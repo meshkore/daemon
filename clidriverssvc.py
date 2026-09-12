@@ -57,5 +57,8 @@ class ClientsMixin:
                 entry["keyPresent"] = key is not None
                 if key is not None:
                     entry["authConfigured"] = True
+            if driver.id == "muse" and hasattr(self, "client_enabled"):
+                if not self.client_enabled(driver.id):
+                    entry["authConfigured"] = False
             out.append(entry)
         return out

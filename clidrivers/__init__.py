@@ -19,11 +19,13 @@ from .base import ClientDriver
 from .claudecode import ClaudeCodeDriver
 from .codex import CodexDriver
 from .gemini import GeminiDriver
+from .muse import MuseDriver
 
 DRIVERS: Dict[str, ClientDriver] = {
     "claude-code": ClaudeCodeDriver(),
     "gemini": GeminiDriver(),
     "codex": CodexDriver(),
+    "muse": MuseDriver(),
 }
 
 _DEFAULT = DRIVERS["claude-code"]

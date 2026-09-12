@@ -224,7 +224,7 @@ def test_unified_listing_includes_codex_and_gemini(tmp_path: Path) -> None:
     code, body = d.provider_config_get_http()
     assert code == 200
     ids = {p["id"] for p in body["providers"]}
-    assert ids == {"anthropic", "zai", "codex", "gemini"}
+    assert ids == {"anthropic", "zai", "codex", "gemini", "muse"}
     codex = next(p for p in body["providers"] if p["id"] == "codex")
     gemini = next(p for p in body["providers"] if p["id"] == "gemini")
     # Codex/Gemini have no base-url swap — the cockpit shouldn't render

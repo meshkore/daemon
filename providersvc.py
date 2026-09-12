@@ -34,6 +34,7 @@ from providers import (
     provider_for,
 )
 from utils import _log
+from clidrivers import driver_for
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
@@ -135,6 +136,12 @@ class ProvidersMixin:
             return None
         return self._provider_key_store().get(client_id)
 
+    def client_enabled(self, client_id: str) -> bool:
+        cfg = self.global_ledger.load_clients_config()
+        return (cfg.get("providers", {}).get(client_id) or {}).get(
+            "enabled", True
+        ) is not False
+
     # ── public listing (no secrets) — embedded in GET /clients ───────────
     def providers_public_listing(self) -> list:
         """[{id, label, requiresKey, available, defaultModel, models}] for
@@ -207,7 +214,10 @@ class ProvidersMixin:
             # Codex/Gemini also work via their own native login (`codex
             # login` / `gcloud auth`) — the daemon key is an optional
             # convenience, so "available" doesn't require it, unlike ZAI.
-            "available": enabled,
+            "available": enabled
+            and (key_present or bool(driver_for(slot_id).auth_configured()))
+            if slot_id == "muse"
+            else enabled,
             "models": [],
         }
 

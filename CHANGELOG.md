@@ -1,3 +1,10 @@
+## py-1.35.6 — 2026-09-12
+
+- Add Meta Muse Code CLI dispatch, native OAuth/Keychain or managed API-key authentication, Spark model catalog and all reasoning efforts.
+- Normalize verified Muse JSONL text, tool and terminal events. Deliver long briefings through a temporary regular stdin file, without argv limits or persistent prompt files.
+- Reject unavailable/disabled Muse dispatches; expose configuration state to Architect. Preserve driver-specific effort values through conversation metadata.
+- Verified against Muse Code 1.1.1 with real account login, model discovery, response and shell-tool probes.
+
 # daemon — version changelog
 
 Moved out of daemon.py (Phase E4) so the composition root stays clean.

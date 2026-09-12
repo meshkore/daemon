@@ -110,6 +110,7 @@ def known_provider_ids() -> List[str]:
 # list in Config → General settings so the operator has ONE place for every
 # daemon-managed AI credential (capped at a handful, not a sprawling list).
 CLIENT_KEY_SPECS: Dict[str, Dict[str, Any]] = {
+    "muse": {"id": "muse", "label": "Muse Code (Meta)", "env_var": "META_API_KEY"},
     "codex": {
         "id": "codex",
         "label": "Codex (OpenAI)",

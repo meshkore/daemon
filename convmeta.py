@@ -6,6 +6,7 @@ every self.* resolves on the combined instance -> byte-identical."""
 from __future__ import annotations
 
 from fsatomic import atomic_write_json
+from clidrivers import driver_for
 
 import json
 from typing import Any, Dict, Optional, Tuple
@@ -79,7 +80,10 @@ class ConvMetaMixin:
         e = str(meta.get("effort") or "").strip().lower()
         if not e or e == "default":
             return None
-        if e not in ("low", "medium", "high", "xhigh", "max"):
+        valid = {
+            item["id"] for item in driver_for(meta.get("client")).efforts_catalog()
+        }
+        if e not in valid:
             return None
         return e
 

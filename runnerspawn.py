@@ -139,6 +139,17 @@ class RunnerSpawnMixin:
                     if key:
                         env = dict(env)
                         env[CLIENT_KEY_SPECS[driver.id]["env_var"]] = key
+        if driver.id == "muse":
+            daemon = getattr(self, "daemon", None)
+            enabled = not (
+                daemon is not None and hasattr(daemon, "client_enabled")
+            ) or daemon.client_enabled(driver.id)
+            if not enabled or not (env.get("META_API_KEY") or driver.auth_configured()):
+                self._emit_runner_error(
+                    "Muse is not authenticated or is disabled — run muse login on the "
+                    "daemon host, or enable Muse and set its API key in General settings"
+                )
+                return
         env["MESHKORE_IDENTITY"] = self.identity
         env["MESHKORE_CONV"] = self.conv
         env["MESHKORE_SESSION_ID"] = session_id
@@ -163,15 +174,28 @@ class RunnerSpawnMixin:
             )
         except Exception:  # best-effort telemetry — never break the spawn
             self._turn_start_sha = None
-        self.proc = subprocess.Popen(
-            args,
-            cwd=str(self.paths.root),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        prompt_file = None
+        try:
+            if driver.prompt_file_stdin:
+                import tempfile
+
+                prompt_file = tempfile.TemporaryFile()
+                prompt_file.write(briefing.encode("utf-8"))
+                prompt_file.seek(0)
+            self.proc = subprocess.Popen(
+                args,
+                cwd=str(self.paths.root),
+                env=env,
+                stdin=prompt_file if prompt_file is not None else subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        finally:
+            # Child fd 0 keeps its own reference until exit; no named prompt
+            # file or shared driver state survives cancellation/concurrency.
+            if prompt_file is not None:
+                prompt_file.close()
         self.pid = self.proc.pid
         # Deliver the briefing (stdin-pipe by default; a driver may
         # override for a client that wants it delivered differently).

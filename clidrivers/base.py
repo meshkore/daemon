@@ -56,6 +56,7 @@ class ClientDriver:
     override the methods they need; the defaults here keep a minimal
     driver (e.g. one with no catalog yet) safe to register."""
 
+    prompt_file_stdin: bool = False
     id: str = "base"
     label: str = "Base"
 
